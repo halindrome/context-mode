@@ -1,16 +1,40 @@
 name: Bug Report
-description: Report a bug or unexpected behavior
+description: Report a bug — but read the manifesto first. PRs are strongly preferred over issues.
 title: "[Bug]: "
 labels: ["bug"]
 body:
   - type: markdown
     attributes:
       value: |
-        Thanks for reporting! context-mode is in a fast release cycle -- please make sure you're on the latest version before filing.
+        ## 🛑 Stop. Read this first.
+
+        **This project is maintained by one person across Windows, macOS, Linux, and 5+ agent adapters (Claude Code, Gemini CLI, VS Code Copilot, OpenCode, Codex CLI). It is not feasible to reproduce, debug, and fix every platform-specific edge case alone.**
+
+        ### PRs > Issues
+
+        If you can open an issue, you can open a PR. context-mode is built for agentic engineering — use it:
+
+        1. **Install the [TDD skill](https://www.aihero.dev/skill-test-driven-development-claude-code):** `claude install-skill https://www.aihero.dev/skill-test-driven-development-claude-code`
+        2. **RED — Write a failing test** that reproduces the bug. If you can describe the bug, you can write a test for it. Let your AI agent help.
+        3. **GREEN — Fix the bug.** The codebase is straightforward TypeScript. Your AI agent can navigate it.
+        4. **Open a PR** following the [PR template](https://github.com/mksglu/claude-context-mode/blob/main/.github/PULL_REQUEST_TEMPLATE.md) — red/green output required.
+
+        Our CI runs on **Ubuntu, macOS, and Windows**. Your PR will be automatically verified across all three.
+
+        ### When to open an issue instead
+
+        Only open an issue if **all of these are true:**
+        - You genuinely tried to fix it and couldn't
+        - The bug is in core architecture (not a platform-specific path/encoding edge case)
+        - You can provide a minimal, reproducible test case
+
+        Issues without reproduction steps or doctor output will be closed.
+
+        ---
 
         **Before you file:**
-        1. [Search existing issues](https://github.com/mksglu/context-mode/issues) to make sure this hasn't been reported already
-        2. Run `/context-mode:ctx-upgrade` to pull the latest version (Claude Code only)
+        1. [Search existing issues](https://github.com/mksglu/claude-context-mode/issues) to make sure this hasn't been reported already
+        2. Run `/context-mode:ctx-upgrade` to pull the latest version
         3. Restart your agent session
         4. Run `/context-mode:ctx-doctor` or ask the model to call the `stats` tool
         5. If the issue persists on the latest version, file this report

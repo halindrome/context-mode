@@ -1,8 +1,16 @@
 name: Feature Request
-description: Suggest a new feature or improvement
+description: Suggest a feature — but consider opening a PR with a prototype instead.
 title: "[Feature]: "
 labels: ["enhancement"]
 body:
+  - type: markdown
+    attributes:
+      value: |
+        **PRs with working prototypes are reviewed faster than feature requests.**
+
+        If you have an idea, try building it. The codebase is straightforward TypeScript — your AI agent can help you prototype it in minutes. Open a PR with tests and a before/after comparison, and it will get merged fast.
+
+        Feature requests without a clear problem statement or proposed implementation will be deprioritized.
   - type: dropdown
     id: platform
     attributes:
