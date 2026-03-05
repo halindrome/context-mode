@@ -4,7 +4,7 @@ This project is licensed under the Elastic License 2.0 (ELv2) and moves forward 
 
 Don't overthink it. Don't ask yourself "is my PR good enough?" or "is this issue too small?" -- just send it. A rough draft beats a perfect plan that never ships. If you found a bug, report it. If you have an idea, open an issue. If you wrote a fix, submit the PR.
 
-That said, I'm a solo maintainer with limited time. The best way to help me help you: follow the templates, include your `/context-mode:ctx-doctor` output, and write tests for your changes. The more context you give me, the faster I can review.
+That said, I'm a solo maintainer with limited time. The best way to help me help you: follow the templates, include your `/context-mode:doctor` output, and write tests for your changes. The more context you give me, the faster I can review.
 
 I genuinely love open source and I'm grateful to have you here. Don't hesitate to reach out -- whether it's a question, a suggestion, or just to say hi. Let's build this together.
 
@@ -275,7 +275,7 @@ When your change affects tool output (execute, search, fetch_and_index, etc.), a
 When filing a bug, **always include your prompt**. The exact message you sent to Claude Code is critical for reproduction. Without it, we can't debug the issue.
 
 Required information:
-- `/context-mode:ctx-doctor` output (must be latest version)
+- `/context-mode:doctor` output (must be latest version)
 - The prompt that triggered the bug
 - Debug logs from `Ctrl+O` (background tool calls and MCP communication)
 
@@ -294,9 +294,9 @@ Required information:
 
 | Task | Command |
 |---|---|
-| Check version | `/context-mode:ctx-doctor` |
-| Upgrade plugin | `/context-mode:ctx-upgrade` |
-| View session stats | `/context-mode:ctx-stats` |
+| Check version | `/context-mode:doctor` |
+| Upgrade plugin | `/context-mode:upgrade` |
+| View session stats | `/context-mode:stats` |
 | See background steps | `Ctrl+O` |
 | Kill cached server | `pkill -f "context-mode.*start.mjs"` |
 | Rebuild after changes | `npm run build` |
