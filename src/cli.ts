@@ -238,8 +238,9 @@ async function doctor(): Promise<number> {
       p.log.success(color.green("Server test: PASS"));
     } else {
       criticalFails++;
+      const detail = result.stderr?.trim() ? ` (${result.stderr.trim().slice(0, 200)})` : "";
       p.log.error(
-        color.red("Server test: FAIL") + ` — exit ${result.exitCode}`,
+        color.red("Server test: FAIL") + ` — exit ${result.exitCode}${detail}`,
       );
     }
   } catch (err: unknown) {
