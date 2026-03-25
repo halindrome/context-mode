@@ -377,6 +377,42 @@ export function extractSnippet(
   return parts.join("\n\n");
 }
 
+export function formatBatchQueryResults(
+  store: ContentStore,
+  queries: string[],
+  source: string,
+  maxOutput = 80 * 1024,
+): string[] {
+  const sections: string[] = [];
+  let outputSize = 0;
+
+  for (const query of queries) {
+    if (outputSize > maxOutput) {
+      sections.push(`## ${query}\n(output cap reached — use search(queries: ["${query}"]) for details)\n`);
+      continue;
+    }
+
+    const results = store.searchWithFallback(query, 3, source);
+    sections.push(`## ${query}`);
+    sections.push("");
+    if (results.length > 0) {
+      for (const result of results) {
+        const snippet = extractSnippet(result.content, query, 3000, result.highlighted);
+        sections.push(`### ${result.title}`);
+        sections.push(snippet);
+        sections.push("");
+        outputSize += snippet.length + result.title.length;
+      }
+      continue;
+    }
+
+    sections.push("No matching sections found.");
+    sections.push("");
+  }
+
+  return sections;
+}
+
 // ─────────────────────────────────────────────────────────
 // Tool: execute
 // ─────────────────────────────────────────────────────────
@@ -1458,50 +1494,9 @@ server.registerTool(
         sectionTitles.push(s.title);
       }
 
-      // Run all search queries — 3 results each, smart snippets
-      // Three-tier fallback: scoped → boosted → global
-      const MAX_OUTPUT = 80 * 1024; // 80KB total output cap
-      const queryResults: string[] = [];
-      let outputSize = 0;
-
-      for (const query of queries) {
-        if (outputSize > MAX_OUTPUT) {
-          queryResults.push(`## ${query}\n(output cap reached — use search(queries: ["${query}"]) for details)\n`);
-          continue;
-        }
-
-        // Tier 1: scoped search with fallback (porter → trigram → fuzzy)
-        let results = store.searchWithFallback(query, 3, source);
-        let crossSource = false;
-
-        // Tier 2: global fallback (no source filter) — warn about cross-source (Issue #61)
-        if (results.length === 0) {
-          results = store.searchWithFallback(query, 3);
-          crossSource = results.length > 0;
-        }
-
-        queryResults.push(`## ${query}`);
-        if (crossSource) {
-          queryResults.push(
-            `> **Note:** No results in current batch output. Showing results from previously indexed content.`,
-          );
-        }
-        queryResults.push("");
-        if (results.length > 0) {
-          for (const r of results) {
-            // Use larger snippet (3KB) for batch_execute to reduce tiny-fragment issue (Issue #61)
-            const snippet = extractSnippet(r.content, query, 3000, r.highlighted);
-            const sourceTag = crossSource ? ` _(source: ${r.source})_` : "";
-            queryResults.push(`### ${r.title}${sourceTag}`);
-            queryResults.push(snippet);
-            queryResults.push("");
-            outputSize += snippet.length + r.title.length;
-          }
-        } else {
-          queryResults.push("No matching sections found.");
-          queryResults.push("");
-        }
-      }
+      // Run all search queries — source scoped only.
+      // Cross-source search remains available via explicit search().
+      const queryResults = formatBatchQueryResults(store, queries, source);
 
       // Get searchable terms for edge cases where follow-up is needed
       const distinctiveTerms = store.getDistinctiveTerms
