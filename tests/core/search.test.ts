@@ -721,6 +721,25 @@ describe("Multi-source isolation (batch_execute path)", () => {
 
     store.close();
   });
+
+  test("batch_execute formatter does not leak overlapping batch labels", () => {
+    const store = createStore();
+
+    store.index({
+      content: "# Current Build\n\nCurrent batch contains only build timing details.",
+      source: "batch:Build",
+    });
+    store.index({
+      content: "# Older Build and Test\n\nJWT tokens expire after 24 hours.",
+      source: "batch:Build,Test",
+    });
+
+    const output = formatBatchQueryResults(store, ["JWT tokens"], "batch:Build").join("\n");
+    assert.ok(output.includes("No matching sections found."), "Expected exact batch label filtering");
+    assert.ok(!output.includes("JWT tokens expire after 24 hours"), "Should not leak overlapping older batch label content");
+
+    store.close();
+  });
 });
 
 describe("getDistinctiveTerms consistency (fix #9)", () => {

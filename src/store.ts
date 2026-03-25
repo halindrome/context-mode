@@ -233,13 +233,17 @@ export class ContentStore {
   // Search path (hot)
   #stmtSearchPorter!: PreparedStatement;
   #stmtSearchPorterFiltered!: PreparedStatement;
+  #stmtSearchPorterExact!: PreparedStatement;
   #stmtSearchTrigram!: PreparedStatement;
   #stmtSearchTrigramFiltered!: PreparedStatement;
+  #stmtSearchTrigramExact!: PreparedStatement;
   #stmtFuzzyVocab!: PreparedStatement;
   #stmtSearchPorterContentType!: PreparedStatement;
   #stmtSearchPorterFilteredContentType!: PreparedStatement;
+  #stmtSearchPorterExactContentType!: PreparedStatement;
   #stmtSearchTrigramContentType!: PreparedStatement;
   #stmtSearchTrigramFilteredContentType!: PreparedStatement;
+  #stmtSearchTrigramExactContentType!: PreparedStatement;
 
   // Read path
   #stmtListSources!: PreparedStatement;
@@ -362,6 +366,20 @@ export class ContentStore {
       ORDER BY rank
       LIMIT ?
     `);
+    this.#stmtSearchPorterExact = this.#db.prepare(`
+      SELECT
+        chunks.title,
+        chunks.content,
+        chunks.content_type,
+        sources.label,
+        bm25(chunks, 5.0, 1.0) AS rank,
+        highlight(chunks, 1, char(2), char(3)) AS highlighted
+      FROM chunks
+      JOIN sources ON sources.id = chunks.source_id
+      WHERE chunks MATCH ? AND sources.label = ?
+      ORDER BY rank
+      LIMIT ?
+    `);
     this.#stmtSearchTrigram = this.#db.prepare(`
       SELECT
         chunks_trigram.title,
@@ -387,6 +405,20 @@ export class ContentStore {
       FROM chunks_trigram
       JOIN sources ON sources.id = chunks_trigram.source_id
       WHERE chunks_trigram MATCH ? AND sources.label LIKE ?
+      ORDER BY rank
+      LIMIT ?
+    `);
+    this.#stmtSearchTrigramExact = this.#db.prepare(`
+      SELECT
+        chunks_trigram.title,
+        chunks_trigram.content,
+        chunks_trigram.content_type,
+        sources.label,
+        bm25(chunks_trigram, 5.0, 1.0) AS rank,
+        highlight(chunks_trigram, 1, char(2), char(3)) AS highlighted
+      FROM chunks_trigram
+      JOIN sources ON sources.id = chunks_trigram.source_id
+      WHERE chunks_trigram MATCH ? AND sources.label = ?
       ORDER BY rank
       LIMIT ?
     `);
@@ -420,6 +452,20 @@ export class ContentStore {
       ORDER BY rank
       LIMIT ?
     `);
+    this.#stmtSearchPorterExactContentType = this.#db.prepare(`
+      SELECT
+        chunks.title,
+        chunks.content,
+        chunks.content_type,
+        sources.label,
+        bm25(chunks, 5.0, 1.0) AS rank,
+        highlight(chunks, 1, char(2), char(3)) AS highlighted
+      FROM chunks
+      JOIN sources ON sources.id = chunks.source_id
+      WHERE chunks MATCH ? AND sources.label = ? AND chunks.content_type = ?
+      ORDER BY rank
+      LIMIT ?
+    `);
     this.#stmtSearchTrigramContentType = this.#db.prepare(`
       SELECT
         chunks_trigram.title,
@@ -445,6 +491,20 @@ export class ContentStore {
       FROM chunks_trigram
       JOIN sources ON sources.id = chunks_trigram.source_id
       WHERE chunks_trigram MATCH ? AND sources.label LIKE ? AND chunks_trigram.content_type = ?
+      ORDER BY rank
+      LIMIT ?
+    `);
+    this.#stmtSearchTrigramExactContentType = this.#db.prepare(`
+      SELECT
+        chunks_trigram.title,
+        chunks_trigram.content,
+        chunks_trigram.content_type,
+        sources.label,
+        bm25(chunks_trigram, 5.0, 1.0) AS rank,
+        highlight(chunks_trigram, 1, char(2), char(3)) AS highlighted
+      FROM chunks_trigram
+      JOIN sources ON sources.id = chunks_trigram.source_id
+      WHERE chunks_trigram MATCH ? AND sources.label = ? AND chunks_trigram.content_type = ?
       ORDER BY rank
       LIMIT ?
     `);
@@ -703,6 +763,67 @@ export class ContentStore {
     }));
   }
 
+  searchExactSourceLabel(
+    query: string,
+    limit: number = 3,
+    source: string,
+    mode: "AND" | "OR" = "AND",
+    contentType?: "code" | "prose",
+  ): SearchResult[] {
+    const sanitized = sanitizeQuery(query, mode);
+
+    const rows = (contentType
+      ? this.#stmtSearchPorterExactContentType.all(sanitized, source, contentType, limit)
+      : this.#stmtSearchPorterExact.all(sanitized, source, limit)) as Array<{
+      title: string;
+      content: string;
+      content_type: string;
+      label: string;
+      rank: number;
+      highlighted: string;
+    }>;
+
+    return rows.map((r) => ({
+      title: r.title,
+      content: r.content,
+      source: r.label,
+      rank: r.rank,
+      contentType: r.content_type as "code" | "prose",
+      highlighted: r.highlighted,
+    }));
+  }
+
+  searchTrigramExactSourceLabel(
+    query: string,
+    limit: number = 3,
+    source: string,
+    mode: "AND" | "OR" = "AND",
+    contentType?: "code" | "prose",
+  ): SearchResult[] {
+    const sanitized = sanitizeTrigramQuery(query, mode);
+    if (!sanitized) return [];
+
+    const rows = (contentType
+      ? this.#stmtSearchTrigramExactContentType.all(sanitized, source, contentType, limit)
+      : this.#stmtSearchTrigramExact.all(sanitized, source, limit)) as Array<{
+      title: string;
+      content: string;
+      content_type: string;
+      label: string;
+      rank: number;
+      highlighted: string;
+    }>;
+
+    return rows.map((r) => ({
+      title: r.title,
+      content: r.content,
+      source: r.label,
+      rank: r.rank,
+      contentType: r.content_type as "code" | "prose",
+      highlighted: r.highlighted,
+    }));
+  }
+
   // ── Fuzzy Correction (Layer 3) ──
 
   fuzzyCorrect(query: string): string | null {
@@ -833,6 +954,63 @@ export class ContentStore {
 
     if (correctedQuery !== original) {
       const fuzzyResults = this.#rrfSearch(correctedQuery, limit, source, contentType);
+      if (fuzzyResults.length > 0) {
+        const reranked = this.#applyProximityReranking(fuzzyResults, correctedQuery);
+        return reranked.map((r) => ({ ...r, matchLayer: "rrf-fuzzy" as const }));
+      }
+    }
+
+    return [];
+  }
+
+  searchWithFallbackExactSourceLabel(
+    query: string,
+    limit: number = 3,
+    source: string,
+    contentType?: "code" | "prose",
+  ): SearchResult[] {
+    const K = 60;
+    const fetchLimit = Math.max(limit * 2, 10);
+    const porterResults = this.searchExactSourceLabel(query, fetchLimit, source, "OR", contentType);
+    const trigramResults = this.searchTrigramExactSourceLabel(query, fetchLimit, source, "OR", contentType);
+    const scoreMap = new Map<string, { result: SearchResult; score: number }>();
+    const key = (r: SearchResult) => `${r.source}::${r.title}`;
+
+    for (const [i, r] of porterResults.entries()) {
+      const k = key(r);
+      const existing = scoreMap.get(k);
+      if (existing) existing.score += 1 / (K + i + 1);
+      else scoreMap.set(k, { result: r, score: 1 / (K + i + 1) });
+    }
+
+    for (const [i, r] of trigramResults.entries()) {
+      const k = key(r);
+      const existing = scoreMap.get(k);
+      if (existing) existing.score += 1 / (K + i + 1);
+      else scoreMap.set(k, { result: r, score: 1 / (K + i + 1) });
+    }
+
+    const rrfResults = Array.from(scoreMap.values())
+      .sort((a, b) => b.score - a.score)
+      .slice(0, limit)
+      .map(({ result, score }) => ({ ...result, rank: -score }));
+
+    if (rrfResults.length > 0) {
+      const reranked = this.#applyProximityReranking(rrfResults, query);
+      return reranked.map((r) => ({ ...r, matchLayer: "rrf" as const }));
+    }
+
+    const words = query
+      .toLowerCase()
+      .trim()
+      .split(/\s+/)
+      .filter((w) => w.length >= 3);
+    const original = words.join(" ");
+    const correctedWords = words.map((w) => this.fuzzyCorrect(w) ?? w);
+    const correctedQuery = correctedWords.join(" ");
+
+    if (correctedQuery !== original) {
+      const fuzzyResults = this.searchExactSourceLabel(correctedQuery, limit, source, "OR", contentType);
       if (fuzzyResults.length > 0) {
         const reranked = this.#applyProximityReranking(fuzzyResults, correctedQuery);
         return reranked.map((r) => ({ ...r, matchLayer: "rrf-fuzzy" as const }));
