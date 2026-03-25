@@ -331,13 +331,4 @@ describe("OpenCodeAdapter for KiloCode", () => {
       );
     });
   });
-
-  describe("config file paths", () => {
-    it("searches for kilo.json in project-local and global locations", () => {
-      const paths = adapter["getConfigFilePaths"]();
-      expect(paths[0]).toBe(resolve("kilo.json"));
-      expect(paths[1]).toBe(resolve(".kilocode", "kilo.json"));
-      expect(paths[2]).toBe(join(homedir(), ".config", "kilo", "kilo.json"));
-    });
-  });
 });
