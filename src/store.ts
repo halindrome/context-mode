@@ -25,6 +25,17 @@ interface Chunk {
   hasCode: boolean;
 }
 
+type SourceMatchMode = "like" | "exact";
+
+type SearchRow = {
+  title: string;
+  content: string;
+  content_type: string;
+  label: string;
+  rank: number;
+  highlighted: string;
+};
+
 import type { IndexResult, SearchResult, StoreStats } from "./types.js";
 export type { IndexResult, SearchResult, StoreStats } from "./types.js";
 
@@ -304,6 +315,8 @@ export class ContentStore {
       CREATE TABLE IF NOT EXISTS vocabulary (
         word TEXT PRIMARY KEY
       );
+
+      CREATE INDEX IF NOT EXISTS idx_sources_label ON sources(label);
     `);
   }
 
@@ -670,41 +683,7 @@ export class ContentStore {
 
   // ── Search ──
 
-  search(
-    query: string,
-    limit: number = 3,
-    source?: string,
-    mode: "AND" | "OR" = "AND",
-    contentType?: "code" | "prose",
-  ): SearchResult[] {
-    const sanitized = sanitizeQuery(query, mode);
-
-    let stmt: PreparedStatement;
-    let params: unknown[];
-
-    if (source && contentType) {
-      stmt = this.#stmtSearchPorterFilteredContentType;
-      params = [sanitized, `%${source}%`, contentType, limit];
-    } else if (source) {
-      stmt = this.#stmtSearchPorterFiltered;
-      params = [sanitized, `%${source}%`, limit];
-    } else if (contentType) {
-      stmt = this.#stmtSearchPorterContentType;
-      params = [sanitized, contentType, limit];
-    } else {
-      stmt = this.#stmtSearchPorter;
-      params = [sanitized, limit];
-    }
-
-    const rows = stmt.all(...params) as Array<{
-      title: string;
-      content: string;
-      content_type: string;
-      label: string;
-      rank: number;
-      highlighted: string;
-    }>;
-
+  #mapSearchRows(rows: SearchRow[]): SearchResult[] {
     return rows.map((r) => ({
       title: r.title,
       content: r.content,
@@ -713,6 +692,44 @@ export class ContentStore {
       contentType: r.content_type as "code" | "prose",
       highlighted: r.highlighted,
     }));
+  }
+
+  #sourceFilterParam(source: string, sourceMatchMode: SourceMatchMode): string {
+    return sourceMatchMode === "exact" ? source : `%${source}%`;
+  }
+
+  search(
+    query: string,
+    limit: number = 3,
+    source?: string,
+    mode: "AND" | "OR" = "AND",
+    contentType?: "code" | "prose",
+    sourceMatchMode: SourceMatchMode = "like",
+  ): SearchResult[] {
+    const sanitized = sanitizeQuery(query, mode);
+
+    let stmt: PreparedStatement;
+    let params: unknown[];
+
+    if (source && contentType) {
+      stmt = sourceMatchMode === "exact"
+        ? this.#stmtSearchPorterExactContentType
+        : this.#stmtSearchPorterFilteredContentType;
+      params = [sanitized, this.#sourceFilterParam(source, sourceMatchMode), contentType, limit];
+    } else if (source) {
+      stmt = sourceMatchMode === "exact"
+        ? this.#stmtSearchPorterExact
+        : this.#stmtSearchPorterFiltered;
+      params = [sanitized, this.#sourceFilterParam(source, sourceMatchMode), limit];
+    } else if (contentType) {
+      stmt = this.#stmtSearchPorterContentType;
+      params = [sanitized, contentType, limit];
+    } else {
+      stmt = this.#stmtSearchPorter;
+      params = [sanitized, limit];
+    }
+
+    return this.#mapSearchRows(stmt.all(...params) as SearchRow[]);
   }
 
   // ── Trigram Search (Layer 2) ──
@@ -723,6 +740,7 @@ export class ContentStore {
     source?: string,
     mode: "AND" | "OR" = "AND",
     contentType?: "code" | "prose",
+    sourceMatchMode: SourceMatchMode = "like",
   ): SearchResult[] {
     const sanitized = sanitizeTrigramQuery(query, mode);
     if (!sanitized) return [];
@@ -731,11 +749,15 @@ export class ContentStore {
     let params: unknown[];
 
     if (source && contentType) {
-      stmt = this.#stmtSearchTrigramFilteredContentType;
-      params = [sanitized, `%${source}%`, contentType, limit];
+      stmt = sourceMatchMode === "exact"
+        ? this.#stmtSearchTrigramExactContentType
+        : this.#stmtSearchTrigramFilteredContentType;
+      params = [sanitized, this.#sourceFilterParam(source, sourceMatchMode), contentType, limit];
     } else if (source) {
-      stmt = this.#stmtSearchTrigramFiltered;
-      params = [sanitized, `%${source}%`, limit];
+      stmt = sourceMatchMode === "exact"
+        ? this.#stmtSearchTrigramExact
+        : this.#stmtSearchTrigramFiltered;
+      params = [sanitized, this.#sourceFilterParam(source, sourceMatchMode), limit];
     } else if (contentType) {
       stmt = this.#stmtSearchTrigramContentType;
       params = [sanitized, contentType, limit];
@@ -744,84 +766,7 @@ export class ContentStore {
       params = [sanitized, limit];
     }
 
-    const rows = stmt.all(...params) as Array<{
-      title: string;
-      content: string;
-      content_type: string;
-      label: string;
-      rank: number;
-      highlighted: string;
-    }>;
-
-    return rows.map((r) => ({
-      title: r.title,
-      content: r.content,
-      source: r.label,
-      rank: r.rank,
-      contentType: r.content_type as "code" | "prose",
-      highlighted: r.highlighted,
-    }));
-  }
-
-  searchExactSourceLabel(
-    query: string,
-    limit: number = 3,
-    source: string,
-    mode: "AND" | "OR" = "AND",
-    contentType?: "code" | "prose",
-  ): SearchResult[] {
-    const sanitized = sanitizeQuery(query, mode);
-
-    const rows = (contentType
-      ? this.#stmtSearchPorterExactContentType.all(sanitized, source, contentType, limit)
-      : this.#stmtSearchPorterExact.all(sanitized, source, limit)) as Array<{
-      title: string;
-      content: string;
-      content_type: string;
-      label: string;
-      rank: number;
-      highlighted: string;
-    }>;
-
-    return rows.map((r) => ({
-      title: r.title,
-      content: r.content,
-      source: r.label,
-      rank: r.rank,
-      contentType: r.content_type as "code" | "prose",
-      highlighted: r.highlighted,
-    }));
-  }
-
-  searchTrigramExactSourceLabel(
-    query: string,
-    limit: number = 3,
-    source: string,
-    mode: "AND" | "OR" = "AND",
-    contentType?: "code" | "prose",
-  ): SearchResult[] {
-    const sanitized = sanitizeTrigramQuery(query, mode);
-    if (!sanitized) return [];
-
-    const rows = (contentType
-      ? this.#stmtSearchTrigramExactContentType.all(sanitized, source, contentType, limit)
-      : this.#stmtSearchTrigramExact.all(sanitized, source, limit)) as Array<{
-      title: string;
-      content: string;
-      content_type: string;
-      label: string;
-      rank: number;
-      highlighted: string;
-    }>;
-
-    return rows.map((r) => ({
-      title: r.title,
-      content: r.content,
-      source: r.label,
-      rank: r.rank,
-      contentType: r.content_type as "code" | "prose",
-      highlighted: r.highlighted,
-    }));
+    return this.#mapSearchRows(stmt.all(...params) as SearchRow[]);
   }
 
   // ── Fuzzy Correction (Layer 3) ──
@@ -859,12 +804,13 @@ export class ContentStore {
     limit: number,
     source?: string,
     contentType?: "code" | "prose",
+    sourceMatchMode: SourceMatchMode = "like",
   ): SearchResult[] {
     const K = 60; // Standard RRF constant
     const fetchLimit = Math.max(limit * 2, 10);
 
-    const porterResults = this.search(query, fetchLimit, source, "OR", contentType);
-    const trigramResults = this.searchTrigram(query, fetchLimit, source, "OR", contentType);
+    const porterResults = this.search(query, fetchLimit, source, "OR", contentType, sourceMatchMode);
+    const trigramResults = this.searchTrigram(query, fetchLimit, source, "OR", contentType, sourceMatchMode);
 
     const scoreMap = new Map<string, { result: SearchResult; score: number }>();
     const key = (r: SearchResult) => `${r.source}::${r.title}`;
@@ -934,9 +880,10 @@ export class ContentStore {
     limit: number = 3,
     source?: string,
     contentType?: "code" | "prose",
+    sourceMatchMode: SourceMatchMode = "like",
   ): SearchResult[] {
     // Step 1: RRF fusion (porter OR + trigram OR → merge)
-    const rrfResults = this.#rrfSearch(query, limit, source, contentType);
+    const rrfResults = this.#rrfSearch(query, limit, source, contentType, sourceMatchMode);
     if (rrfResults.length > 0) {
       const reranked = this.#applyProximityReranking(rrfResults, query);
       return reranked.map((r) => ({ ...r, matchLayer: "rrf" as const }));
@@ -953,64 +900,7 @@ export class ContentStore {
     const correctedQuery = correctedWords.join(" ");
 
     if (correctedQuery !== original) {
-      const fuzzyResults = this.#rrfSearch(correctedQuery, limit, source, contentType);
-      if (fuzzyResults.length > 0) {
-        const reranked = this.#applyProximityReranking(fuzzyResults, correctedQuery);
-        return reranked.map((r) => ({ ...r, matchLayer: "rrf-fuzzy" as const }));
-      }
-    }
-
-    return [];
-  }
-
-  searchWithFallbackExactSourceLabel(
-    query: string,
-    limit: number = 3,
-    source: string,
-    contentType?: "code" | "prose",
-  ): SearchResult[] {
-    const K = 60;
-    const fetchLimit = Math.max(limit * 2, 10);
-    const porterResults = this.searchExactSourceLabel(query, fetchLimit, source, "OR", contentType);
-    const trigramResults = this.searchTrigramExactSourceLabel(query, fetchLimit, source, "OR", contentType);
-    const scoreMap = new Map<string, { result: SearchResult; score: number }>();
-    const key = (r: SearchResult) => `${r.source}::${r.title}`;
-
-    for (const [i, r] of porterResults.entries()) {
-      const k = key(r);
-      const existing = scoreMap.get(k);
-      if (existing) existing.score += 1 / (K + i + 1);
-      else scoreMap.set(k, { result: r, score: 1 / (K + i + 1) });
-    }
-
-    for (const [i, r] of trigramResults.entries()) {
-      const k = key(r);
-      const existing = scoreMap.get(k);
-      if (existing) existing.score += 1 / (K + i + 1);
-      else scoreMap.set(k, { result: r, score: 1 / (K + i + 1) });
-    }
-
-    const rrfResults = Array.from(scoreMap.values())
-      .sort((a, b) => b.score - a.score)
-      .slice(0, limit)
-      .map(({ result, score }) => ({ ...result, rank: -score }));
-
-    if (rrfResults.length > 0) {
-      const reranked = this.#applyProximityReranking(rrfResults, query);
-      return reranked.map((r) => ({ ...r, matchLayer: "rrf" as const }));
-    }
-
-    const words = query
-      .toLowerCase()
-      .trim()
-      .split(/\s+/)
-      .filter((w) => w.length >= 3);
-    const original = words.join(" ");
-    const correctedWords = words.map((w) => this.fuzzyCorrect(w) ?? w);
-    const correctedQuery = correctedWords.join(" ");
-
-    if (correctedQuery !== original) {
-      const fuzzyResults = this.searchExactSourceLabel(correctedQuery, limit, source, "OR", contentType);
+      const fuzzyResults = this.#rrfSearch(correctedQuery, limit, source, contentType, sourceMatchMode);
       if (fuzzyResults.length > 0) {
         const reranked = this.#applyProximityReranking(fuzzyResults, correctedQuery);
         return reranked.map((r) => ({ ...r, matchLayer: "rrf-fuzzy" as const }));

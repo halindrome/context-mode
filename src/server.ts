@@ -392,7 +392,7 @@ export function formatBatchQueryResults(
       continue;
     }
 
-    const results = store.searchWithFallbackExactSourceLabel(query, 3, source);
+    const results = store.searchWithFallback(query, 3, source, undefined, "exact");
     sections.push(`## ${query}`);
     sections.push("");
     if (results.length > 0) {

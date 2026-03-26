@@ -740,6 +740,26 @@ describe("Multi-source isolation (batch_execute path)", () => {
 
     store.close();
   });
+
+  test("batch_execute formatter returns matches from the current batch", () => {
+    const store = createStore();
+
+    store.index({
+      content: "# Current Batch\n\nJWT tokens expire after 12 hours for the current batch.",
+      source: "batch: current",
+    });
+    store.index({
+      content: "# Older Indexed Content\n\nJWT tokens expire after 24 hours.",
+      source: "docs: auth",
+    });
+
+    const output = formatBatchQueryResults(store, ["JWT tokens"], "batch: current").join("\n");
+    assert.ok(output.includes("Current Batch"), "Expected current batch heading in formatter output");
+    assert.ok(output.includes("12 hours for the current batch"), "Expected current batch content in formatter output");
+    assert.ok(!output.includes("24 hours"), "Should not leak older source content when current batch matches");
+
+    store.close();
+  });
 });
 
 describe("getDistinctiveTerms consistency (fix #9)", () => {
