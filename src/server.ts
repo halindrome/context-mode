@@ -1890,7 +1890,7 @@ server.registerTool(
       // Write inline script to a temp .mjs file — avoids quote-escaping issues
       // across cmd.exe, PowerShell, and bash (node -e '...' breaks on Windows).
       const scriptLines = [
-        `import{execSync}from"node:child_process";`,
+        `import{execFileSync}from"node:child_process";`,
         `import{cpSync,rmSync,existsSync,mkdtempSync}from"node:fs";`,
         `import{join}from"node:path";`,
         `import{tmpdir}from"node:os";`,
@@ -1898,10 +1898,10 @@ server.registerTool(
         `const T=mkdtempSync(join(tmpdir(),"ctx-upgrade-"));`,
         `try{`,
         `console.log("- [x] Starting inline upgrade (no CLI found)");`,
-        `execSync("git clone --depth 1 ${repoUrl} \\""+T+"\\"",{stdio:"inherit"});`,
+        `execFileSync("git",["clone","--depth","1","${repoUrl}",T],{stdio:"inherit"});`,
         `console.log("- [x] Cloned latest source");`,
-        `execSync("npm install",{cwd:T,stdio:"inherit"});`,
-        `execSync("npm run build",{cwd:T,stdio:"inherit"});`,
+        `execFileSync("npm",["install"],{cwd:T,stdio:"inherit"});`,
+        `execFileSync("npm",["run","build"],{cwd:T,stdio:"inherit"});`,
         `console.log("- [x] Built from source");`,
         ...copyDirs.map(
           (d) =>
@@ -1912,7 +1912,7 @@ server.registerTool(
             `if(existsSync(join(T,${JSON.stringify(f)})))cpSync(join(T,${JSON.stringify(f)}),join(P,${JSON.stringify(f)}),{force:true});`,
         ),
         `console.log("- [x] Copied build artifacts");`,
-        `execSync("npm install --production",{cwd:P,stdio:"inherit"});`,
+        `execFileSync("npm",["install","--production"],{cwd:P,stdio:"inherit"});`,
         `console.log("- [x] Installed production dependencies");`,
         `console.log("## context-mode upgrade complete");`,
         `}catch(e){`,
