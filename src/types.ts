@@ -54,6 +54,8 @@ export interface ExecResult {
   timedOut: boolean;
   /** Process was detached and continues running in the background. */
   backgrounded?: boolean;
+  /** Path to temp file containing full untruncated stdout (set when truncation occurred). */
+  rawOutputPath?: string;
 }
 
 // ─────────────────────────────────────────────────────────
