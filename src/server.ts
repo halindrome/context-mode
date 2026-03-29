@@ -1471,6 +1471,7 @@ server.registerTool(
       if (denied) return denied;
     }
 
+    const rawPaths: string[] = [];
     try {
       // Execute each command individually so every command gets its own
       // smartTruncate budget (~100KB). Previously, all commands were
@@ -1497,8 +1498,16 @@ server.registerTool(
           timeout: remaining,
         });
 
-        const output = result.stdout || "(no output)";
-        perCommandOutputs.push(`# ${cmd.label}\n\n${output}\n`);
+        // Use full raw content for FTS5 indexing when available; fall back to truncated stdout
+        let cmdOutput = result.stdout || "(no output)";
+        if (result.rawOutputPath) {
+          const raw = readRawOutput(result.rawOutputPath);
+          if (raw) {
+            cmdOutput = raw;
+          }
+          rawPaths.push(result.rawOutputPath);
+        }
+        perCommandOutputs.push(`# ${cmd.label}\n\n${cmdOutput}\n`);
 
         if (result.timedOut) {
           timedOut = true;
@@ -1531,6 +1540,9 @@ server.registerTool(
 
       // Track indexed bytes (raw data that stays in sandbox)
       trackIndexed(totalBytes);
+
+      // Sweep orphaned ctx-raw-* temp files older than 1h before indexing
+      sweepOrphanedRawFiles();
 
       // Index into knowledge base — markdown heading chunking splits by # labels
       const store = getStore();
@@ -1585,6 +1597,11 @@ server.registerTool(
         ],
         isError: true,
       });
+    } finally {
+      // Clean up all raw temp files collected during the batch
+      for (const p of rawPaths) {
+        try { rmSync(p, { force: true }); } catch { /* already gone */ }
+      }
     }
   },
 );
