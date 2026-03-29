@@ -815,8 +815,9 @@ server.registerTool(
       if (codeDenied) return codeDenied;
     }
 
+    let result: Awaited<ReturnType<typeof executor.executeFile>> | undefined;
     try {
-      const result = await executor.executeFile({
+      result = await executor.executeFile({
         path,
         language,
         code,
@@ -840,10 +841,12 @@ server.registerTool(
           language, exitCode: result.exitCode, stdout: result.stdout, stderr: result.stderr,
         });
         if (intent && intent.trim().length > 0 && Buffer.byteLength(output) > INTENT_SEARCH_THRESHOLD) {
-          trackIndexed(Buffer.byteLength(output));
+          // Use full raw content for FTS5 indexing when available; agent sees truncated output
+          const indexContent = readRawOutput(result.rawOutputPath) || output;
+          trackIndexed(Buffer.byteLength(indexContent));
           return trackResponse("ctx_execute_file", {
             content: [
-              { type: "text" as const, text: intentSearch(output, intent, isError ? `file:${path}:error` : `file:${path}`) },
+              { type: "text" as const, text: intentSearch(indexContent, intent, isError ? `file:${path}:error` : `file:${path}`) },
             ],
             isError,
           });
@@ -859,10 +862,12 @@ server.registerTool(
       const stdout = result.stdout || "(no output)";
 
       if (intent && intent.trim().length > 0 && Buffer.byteLength(stdout) > INTENT_SEARCH_THRESHOLD) {
-        trackIndexed(Buffer.byteLength(stdout));
+        // Use full raw content for FTS5 indexing when available; agent sees truncated output
+        const indexContent = readRawOutput(result.rawOutputPath) || stdout;
+        trackIndexed(Buffer.byteLength(indexContent));
         return trackResponse("ctx_execute_file", {
           content: [
-            { type: "text" as const, text: intentSearch(stdout, intent, `file:${path}`) },
+            { type: "text" as const, text: intentSearch(indexContent, intent, `file:${path}`) },
           ],
         });
       }
@@ -880,6 +885,11 @@ server.registerTool(
         ],
         isError: true,
       });
+    } finally {
+      // Clean up raw temp file — server owns the lifecycle
+      if (result?.rawOutputPath) {
+        try { rmSync(result.rawOutputPath, { force: true }); } catch { /* already gone */ }
+      }
     }
   },
 );
