@@ -510,6 +510,7 @@ server.registerTool(
       if (denied) return denied;
     }
 
+    let result: Awaited<ReturnType<typeof executor.execute>> | undefined;
     try {
       // For JS/TS: wrap in async IIFE with fetch + http/https interceptors to track network bytes
       let instrumentedCode = code;
@@ -565,7 +566,7 @@ ${code}
 __cm_main().catch(e=>{console.error(e);process.exitCode=1});${background ? '\nsetInterval(()=>{},2147483647);' : ''}
 })(typeof require!=='undefined'?require:null);`;
       }
-      const result = await executor.execute({ language, code: instrumentedCode, timeout, background });
+      result = await executor.execute({ language, code: instrumentedCode, timeout, background });
 
       // Parse sandbox network metrics from stderr
       const netMatch = result.stderr?.match(/__CM_NET__:(\d+)/);
@@ -615,10 +616,12 @@ __cm_main().catch(e=>{console.error(e);process.exitCode=1});${background ? '\nse
           language, exitCode: result.exitCode, stdout: result.stdout, stderr: result.stderr,
         });
         if (intent && intent.trim().length > 0 && Buffer.byteLength(output) > INTENT_SEARCH_THRESHOLD) {
-          trackIndexed(Buffer.byteLength(output));
+          // Use full raw content for FTS5 indexing when available; agent sees truncated output
+          const indexContent = readRawOutput(result.rawOutputPath) || output;
+          trackIndexed(Buffer.byteLength(indexContent));
           return trackResponse("ctx_execute", {
             content: [
-              { type: "text" as const, text: intentSearch(output, intent, isError ? `execute:${language}:error` : `execute:${language}`) },
+              { type: "text" as const, text: intentSearch(indexContent, intent, isError ? `execute:${language}:error` : `execute:${language}`) },
             ],
             isError,
           });
@@ -635,10 +638,12 @@ __cm_main().catch(e=>{console.error(e);process.exitCode=1});${background ? '\nse
 
       // Intent-driven search: if intent provided and output is large enough
       if (intent && intent.trim().length > 0 && Buffer.byteLength(stdout) > INTENT_SEARCH_THRESHOLD) {
-        trackIndexed(Buffer.byteLength(stdout));
+        // Use full raw content for FTS5 indexing when available; agent sees truncated output
+        const indexContent = readRawOutput(result.rawOutputPath) || stdout;
+        trackIndexed(Buffer.byteLength(indexContent));
         return trackResponse("ctx_execute", {
           content: [
-            { type: "text" as const, text: intentSearch(stdout, intent, `execute:${language}`) },
+            { type: "text" as const, text: intentSearch(indexContent, intent, `execute:${language}`) },
           ],
         });
       }
@@ -656,6 +661,11 @@ __cm_main().catch(e=>{console.error(e);process.exitCode=1});${background ? '\nse
         ],
         isError: true,
       });
+    } finally {
+      // Clean up raw temp file — server owns the lifecycle
+      if (result?.rawOutputPath) {
+        try { rmSync(result.rawOutputPath, { force: true }); } catch { /* already gone */ }
+      }
     }
   },
 );
