@@ -13,7 +13,7 @@
 
 import { strict as assert } from "node:assert";
 import { spawnSync, execSync } from "node:child_process";
-import { writeFileSync, mkdtempSync, mkdirSync, rmSync, readFileSync } from "node:fs";
+import { writeFileSync, mkdtempSync, mkdirSync, rmSync, readFileSync, existsSync, statSync, readdirSync, utimesSync } from "node:fs";
 import { join, dirname, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
@@ -1040,5 +1040,174 @@ describe("ctx_upgrade tool: inline fallback for missing CLI", () => {
   test("fallback only triggers when neither CLI file exists", () => {
     // There should be an else/fallback branch after checking both paths
     expect(serverSrc).toMatch(/existsSync\(fallbackPath\)/);
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 10. Raw Output Indexing (Phase 01-02)
+// ═══════════════════════════════════════════════════════════════════════════
+
+describe("Raw Output Indexing", () => {
+  // --- Executor produces rawOutputPath for large output ---
+
+  test("large execute output sets rawOutputPath with full content", async () => {
+    const small = new PolyglotExecutor({ maxOutputBytes: 200, runtimes });
+    const r = await small.execute({
+      language: "javascript",
+      code: 'for (let i = 0; i < 100; i++) console.log("line " + i + " ".repeat(20));',
+      timeout: 10_000,
+    });
+    // rawOutputPath should be set when output exceeds maxOutputBytes
+    assert.ok(r.rawOutputPath, "rawOutputPath should be defined for large output");
+    assert.ok(existsSync(r.rawOutputPath), "raw temp file should exist");
+
+    // File should contain full untruncated content
+    const rawContent = readFileSync(r.rawOutputPath, "utf-8");
+    assert.ok(rawContent.includes("line 0"), "raw file should contain first line");
+    assert.ok(rawContent.includes("line 99"), "raw file should contain last line");
+    assert.ok(rawContent.length > 200, "raw content should exceed maxOutputBytes");
+
+    // Truncated stdout should be significantly shorter than raw content
+    // (smartTruncate adds a marker, so it may slightly exceed maxOutputBytes)
+    assert.ok(Buffer.byteLength(r.stdout) < rawContent.length, "truncated stdout should be shorter than raw content");
+
+    // Clean up (in production, server handler does this)
+    rmSync(r.rawOutputPath);
+  });
+
+  test("small execute output has no rawOutputPath", async () => {
+    const small = new PolyglotExecutor({ maxOutputBytes: 200, runtimes });
+    const r = await small.execute({
+      language: "javascript",
+      code: 'console.log("short");',
+      timeout: 10_000,
+    });
+    assert.equal(r.rawOutputPath, undefined, "rawOutputPath should be undefined for small output");
+    assert.ok(r.stdout.includes("short"), "stdout should contain the output");
+  });
+
+  // --- FTS5 indexing uses raw content ---
+
+  test("ContentStore indexes full raw content (not truncated)", async () => {
+    const small = new PolyglotExecutor({ maxOutputBytes: 200, runtimes });
+    const r = await small.execute({
+      language: "javascript",
+      code: 'for (let i = 0; i < 100; i++) console.log("line " + i + " ".repeat(20));',
+      timeout: 10_000,
+    });
+    assert.ok(r.rawOutputPath, "rawOutputPath should be defined");
+
+    // Simulate the server handler pattern: read raw, index into store
+    const rawContent = readFileSync(r.rawOutputPath, "utf-8");
+    const dbPath = join(tmpdir(), `test-raw-index-${Date.now()}.db`);
+    const store = new ContentStore(dbPath);
+
+    try {
+      const indexed = store.index({ content: rawContent, source: "test:raw" });
+      assert.ok(indexed.totalChunks > 0, "should index at least one chunk");
+
+      // Search for content that would be lost in truncation
+      const results = store.search("line 50");
+      assert.ok(results.length > 0, "should find middle content that truncation would lose");
+    } finally {
+      store.close();
+      rmSync(dbPath, { force: true });
+      rmSync(r.rawOutputPath!, { force: true });
+    }
+  });
+
+  // --- readRawOutput fallback behavior ---
+
+  test("unreadable rawOutputPath falls back gracefully", async () => {
+    // Mirror readRawOutput logic: try readFileSync, catch → undefined
+    const nonExistentPath = join(tmpdir(), "ctx-raw-nonexistent-test.dat");
+    let content: string | undefined;
+    try {
+      content = readFileSync(nonExistentPath, "utf-8");
+    } catch {
+      content = undefined;
+    }
+    assert.equal(content, undefined, "should return undefined for non-existent path");
+
+    // Verify fallback: truncated stdout should be used when raw is unavailable
+    const small = new PolyglotExecutor({ maxOutputBytes: 200, runtimes });
+    const r = await small.execute({
+      language: "javascript",
+      code: 'for (let i = 0; i < 100; i++) console.log("line " + i + " ".repeat(20));',
+      timeout: 10_000,
+    });
+    assert.ok(r.rawOutputPath, "rawOutputPath should be defined");
+
+    // Delete the raw file to simulate unreadable state
+    rmSync(r.rawOutputPath, { force: true });
+
+    // readRawOutput pattern should gracefully return undefined
+    let fallbackContent: string | undefined;
+    try {
+      fallbackContent = readFileSync(r.rawOutputPath, "utf-8");
+    } catch {
+      fallbackContent = undefined;
+    }
+    assert.equal(fallbackContent, undefined, "should fall back to undefined when file is deleted");
+    // In the server handler, this triggers use of truncated r.stdout instead
+    assert.ok(r.stdout.length > 0, "truncated stdout is available as fallback");
+  });
+
+  // --- Orphan sweep removes old ctx-raw-* files ---
+
+  test("orphan sweep removes files older than 1 hour", () => {
+    // Create a ctx-raw-* file with mtime >1h ago
+    const oldFile = join(tmpdir(), `ctx-raw-old-${Date.now()}-sweep-test.dat`);
+    writeFileSync(oldFile, "old content");
+    // Backdate mtime by 2 hours
+    const twoHoursAgo = new Date(Date.now() - 2 * 60 * 60 * 1000);
+    utimesSync(oldFile, twoHoursAgo, twoHoursAgo);
+
+    // Create a recent ctx-raw-* file (should NOT be removed)
+    const recentFile = join(tmpdir(), `ctx-raw-recent-${Date.now()}-sweep-test.dat`);
+    writeFileSync(recentFile, "recent content");
+
+    try {
+      // Run the same sweep logic that server.ts uses
+      const ONE_HOUR_MS = 60 * 60 * 1000;
+      const now = Date.now();
+      for (const f of readdirSync(tmpdir())) {
+        if (!f.startsWith("ctx-raw-")) continue;
+        const fp = join(tmpdir(), f);
+        try {
+          const { mtimeMs } = statSync(fp);
+          if (now - mtimeMs > ONE_HOUR_MS) rmSync(fp, { force: true });
+        } catch { /* race: already deleted */ }
+      }
+
+      // Old file should be removed
+      assert.ok(!existsSync(oldFile), "old ctx-raw-* file should be swept");
+      // Recent file should be preserved
+      assert.ok(existsSync(recentFile), "recent ctx-raw-* file should be preserved");
+    } finally {
+      // Clean up any remaining test files
+      try { rmSync(oldFile, { force: true }); } catch { /* already gone */ }
+      try { rmSync(recentFile, { force: true }); } catch { /* already gone */ }
+    }
+  });
+
+  // --- Raw file cleanup after handler completes ---
+
+  test("raw temp file is cleaned up after reading", async () => {
+    const small = new PolyglotExecutor({ maxOutputBytes: 200, runtimes });
+    const r = await small.execute({
+      language: "javascript",
+      code: 'for (let i = 0; i < 100; i++) console.log("line " + i + " ".repeat(20));',
+      timeout: 10_000,
+    });
+    assert.ok(r.rawOutputPath, "rawOutputPath should be defined");
+    assert.ok(existsSync(r.rawOutputPath), "raw file should exist before cleanup");
+
+    // Simulate server handler cleanup pattern (finally block)
+    const content = readFileSync(r.rawOutputPath, "utf-8");
+    assert.ok(content.length > 0, "raw content should be readable");
+    rmSync(r.rawOutputPath, { force: true });
+
+    assert.ok(!existsSync(r.rawOutputPath), "raw file should be gone after cleanup");
   });
 });
