@@ -616,8 +616,12 @@ __cm_main().catch(e=>{console.error(e);process.exitCode=1});${background ? '\nse
           language, exitCode: result.exitCode, stdout: result.stdout, stderr: result.stderr,
         });
         if (intent && intent.trim().length > 0 && Buffer.byteLength(output) > INTENT_SEARCH_THRESHOLD) {
-          // Use full raw content for FTS5 indexing when available; agent sees truncated output
-          const indexContent = readRawOutput(result.rawOutputPath) || output;
+          // Use full raw stdout for FTS5 indexing when available, preserving stderr context.
+          // classifyNonZeroExit combines stdout+stderr+exitCode; reconstruct with raw stdout.
+          const rawStdout = readRawOutput(result.rawOutputPath);
+          const indexContent = rawStdout
+            ? `Exit code: ${result.exitCode}\n\nstdout:\n${rawStdout}\n\nstderr:\n${result.stderr}`
+            : output;
           trackIndexed(Buffer.byteLength(indexContent));
           return trackResponse("ctx_execute", {
             content: [
@@ -841,8 +845,11 @@ server.registerTool(
           language, exitCode: result.exitCode, stdout: result.stdout, stderr: result.stderr,
         });
         if (intent && intent.trim().length > 0 && Buffer.byteLength(output) > INTENT_SEARCH_THRESHOLD) {
-          // Use full raw content for FTS5 indexing when available; agent sees truncated output
-          const indexContent = readRawOutput(result.rawOutputPath) || output;
+          // Use full raw stdout for FTS5 indexing when available, preserving stderr context.
+          const rawStdout = readRawOutput(result.rawOutputPath);
+          const indexContent = rawStdout
+            ? `Exit code: ${result.exitCode}\n\nstdout:\n${rawStdout}\n\nstderr:\n${result.stderr}`
+            : output;
           trackIndexed(Buffer.byteLength(indexContent));
           return trackResponse("ctx_execute_file", {
             content: [
