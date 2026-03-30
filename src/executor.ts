@@ -294,7 +294,7 @@ export class PolyglotExecutor {
         // Write full untruncated stdout to a temp file when truncation will occur.
         // Skip when capExceeded — process was killed mid-stream, output is incomplete.
         let rawOutputPath: string | undefined;
-        if (rawStdout.length > this.#maxOutputBytes && !capExceeded) {
+        if (Buffer.byteLength(rawStdout) > this.#maxOutputBytes && !capExceeded) {
           try {
             rawOutputPath = join(tmpdir(), `ctx-raw-${Date.now()}-${Math.random().toString(36).slice(2)}.dat`);
             writeFileSync(rawOutputPath, rawStdout);
