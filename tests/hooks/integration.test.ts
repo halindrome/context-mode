@@ -17,6 +17,7 @@ import {
   readFileSync,
   rmSync,
   existsSync,
+  unlinkSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 
@@ -32,8 +33,17 @@ const HOOK_PATH = join(__dirname, "..", "..", "hooks", "pretooluse.mjs");
 const _wid = process.env.VITEST_WORKER_ID;
 const _guidanceSuffix = _wid ? `${process.pid}-w${_wid}` : String(process.pid);
 const _guidanceDir = resolve(tmpdir(), `context-mode-guidance-${_guidanceSuffix}`);
+
+// MCP readiness sentinel — subprocess hooks check process.ppid (= this test's pid)
+const mcpSentinel = resolve(tmpdir(), `context-mode-mcp-ready-${process.pid}`);
+
 beforeEach(() => {
   try { rmSync(_guidanceDir, { recursive: true, force: true }); } catch {}
+  writeFileSync(mcpSentinel, String(process.pid));
+});
+
+afterEach(() => {
+  try { unlinkSync(mcpSentinel); } catch {}
 });
 
 interface HookResult {

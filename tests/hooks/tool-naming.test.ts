@@ -1,4 +1,7 @@
-import { describe, it, expect, beforeAll, beforeEach } from "vitest";
+import { describe, it, expect, beforeAll, beforeEach, afterEach } from "vitest";
+import { writeFileSync, unlinkSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { resolve } from "node:path";
 
 let getToolName: (platform: string, bareTool: string) => string;
 let createToolNamer: (platform: string) => (bareTool: string) => string;
@@ -45,8 +48,16 @@ beforeAll(async () => {
   BASH_GUIDANCE = block.BASH_GUIDANCE;
 });
 
+// MCP readiness sentinel — routing.mjs checks process.ppid in-process
+const mcpSentinel = resolve(tmpdir(), `context-mode-mcp-ready-${process.ppid}`);
+
 beforeEach(() => {
   if (typeof resetGuidanceThrottle === "function") resetGuidanceThrottle();
+  writeFileSync(mcpSentinel, String(process.pid));
+});
+
+afterEach(() => {
+  try { unlinkSync(mcpSentinel); } catch {}
 });
 
 // ═══════════════════════════════════════════════════════════════════
