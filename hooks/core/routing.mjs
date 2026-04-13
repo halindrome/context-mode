@@ -273,21 +273,9 @@ export function routePreToolUse(toolName, toolInput, projectDir, platform) {
     return guidanceOnce("grep", grepGuidance);
   }
 
-  // ─── WebFetch: deny + redirect to sandbox (with graceful fallback #230) ───
+  // ─── WebFetch: deny + redirect to sandbox ───
   if (canonical === "WebFetch") {
     const url = toolInput.url ?? "";
-    // Deny once per session — if agent retries, MCP tools are likely unavailable.
-    // Graceful degradation: allow WebFetch as fallback rather than leaving agent stuck.
-    const marker = resolve(_guidanceDir, "webfetch-deny");
-    try {
-      mkdirSync(_guidanceDir, { recursive: true });
-      const fd = openSync(marker, fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_WRONLY);
-      closeSync(fd);
-    } catch {
-      // Already denied once this session — MCP server may not be available (#230).
-      // Allow WebFetch as fallback to prevent agent from getting stuck.
-      return null;
-    }
     return {
       action: "deny",
       reason: `context-mode: WebFetch blocked. Think in Code — use ${t("ctx_fetch_and_index")}(url: "${url}", source: "...") to fetch and index, then ${t("ctx_search")}(queries: [...]) to query. Or use ${t("ctx_execute")}(language, code) to fetch, process, and console.log() only what you need. Write pure JS, no npm deps. Do NOT use curl, wget, or WebFetch.`,

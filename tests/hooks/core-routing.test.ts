@@ -283,17 +283,6 @@ describe("routePreToolUse", () => {
       expect(result!.reason).toContain("fetch_and_index");
       expect(result!.reason).toContain("ctx_search");
     });
-
-    it("allows WebFetch on retry when MCP tools unavailable (#230)", () => {
-      // First call: deny + redirect to ctx_fetch_and_index
-      const first = routePreToolUse("WebFetch", { url: "https://example.com" });
-      expect(first).not.toBeNull();
-      expect(first!.action).toBe("deny");
-
-      // Second call: agent retries because MCP tools unavailable — allow fallback
-      const second = routePreToolUse("WebFetch", { url: "https://example.com" });
-      expect(second).toBeNull(); // passthrough
-    });
   });
 
   // ─── Task routing ──────────────────────────────────────
