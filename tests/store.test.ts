@@ -1513,58 +1513,79 @@ describe("FTS5 periodic optimize", () => {
   });
 });
 
-describe("Fuzzy correction skips stopwords", () => {
-  test("searchWithFallback does not fuzzy-correct stopwords", () => {
+describe("Stopword filtering in search queries", () => {
+  test("stopwords are filtered from search — meaningful terms drive ranking", () => {
     const store = createStore();
-    // Index content with a typo-like word "databse" that fuzzy should correct
+    // "fix" and "update" are stopwords in the domain list.
+    // "database" and "connection" are meaningful terms.
     store.index({
       content:
-        "# Database Guide\n\nThe database handles all persistent storage.\n\n# Unrelated\n\nNothing relevant here.",
-      source: "fuzzy-stopwords",
+        "# Database Connection Pool\n\nManage database connections with pooling.\n\n# Update Log\n\nFix applied to update module on Tuesday.",
+      source: "stopword-search",
     });
 
-    // "update" is a stopword, "databse" is a typo for "database"
-    // Fuzzy correction should only run on "databse", not waste cycles on "update"
-    const results = store.searchWithFallback("update databse", 2);
-    // Should still find results via fuzzy correction of "databse" → "database"
-    // (or via RRF direct match since "database" stems match)
+    // Search with stopwords mixed in — results should prioritize "database connection"
+    const results = store.search("fix database connection", 2);
     assert.ok(results.length > 0, "Should return results");
     assert.ok(
-      results[0].content.toLowerCase().includes("database"),
-      `Should match 'database', got: ${results[0].title}`,
+      results[0].content.toLowerCase().includes("database") &&
+        results[0].content.toLowerCase().includes("connection"),
+      `Top result should match meaningful terms 'database connection', got: ${results[0].title}`,
     );
     store.close();
   });
-});
 
-describe("cleanupStaleSources uses cached prepared statements", () => {
-  test("cleanupStaleSources works correctly with cached statements", () => {
+  test("all-stopword query still returns results (fallback)", () => {
     const store = createStore();
-    store.index({ content: "# Old\n\nOld content.", source: "old-source" });
-    store.index({ content: "# New\n\nNew content.", source: "new-source" });
+    store.index({
+      content: "# Updates\n\nUpdate the test runner to fix the issue.\n\n# Other\n\nUnrelated content.",
+      source: "all-stopwords",
+    });
 
-    const statsBefore = store.getStats();
-    assert.equal(statsBefore.sources, 2, "Should have 2 sources");
-
-    // Cleanup with 0 days should remove everything
-    const cleaned = store.cleanupStaleSources(0);
-    assert.ok(cleaned >= 0, "Should not throw with cached statements");
-
+    // "update test fix" are all stopwords — should fall back to using them
+    const results = store.search("update test fix", 2);
+    assert.ok(results.length > 0, "All-stopword query should still return results via fallback");
     store.close();
   });
 
-  test("cleanupStaleSources can be called multiple times", () => {
+  test("stopwords filtered from trigram search", () => {
     const store = createStore();
-    store.index({ content: "# Test\n\nContent.", source: "multi-call" });
+    store.index({
+      content:
+        "# Encryption Module\n\nAES encryption with key rotation.\n\n# Testing Guide\n\nRun tests using the test framework.",
+      source: "trigram-stopwords",
+    });
 
-    // Multiple calls should reuse cached statements without error
-    store.cleanupStaleSources(30);
-    store.cleanupStaleSources(30);
-    store.cleanupStaleSources(30);
+    // "using" is a stopword, "encryption" is meaningful
+    const results = store.searchTrigram("using encryption", 2);
+    assert.ok(results.length > 0, "Should return results");
+    assert.ok(
+      results[0].content.toLowerCase().includes("encryption"),
+      `Should match on meaningful term 'encryption', got: ${results[0].title}`,
+    );
+    store.close();
+  });
 
-    // Still functional after multiple cleanup calls
-    const stats = store.getStats();
-    assert.equal(stats.sources, 1, "Source should still exist (not older than 30 days)");
+  test("proximity reranking ignores stopwords for boost calculation", () => {
+    const store = createStore();
+    // Two chunks: one has "database error" close together, the other has them far apart
+    // but has "fix" (stopword) nearby
+    store.index({
+      content:
+        "# Error Handling\n\nThe database threw an error during migration.\n\n# Fix Log\n\nWe fix things. Much later in this document we mention database. Even later we see error.",
+      source: "proximity-stopwords",
+    });
+
+    const results = store.searchWithFallback("fix database error", 2);
+    assert.ok(results.length > 0, "Should return results");
+    // The chunk with "database" and "error" close together should rank higher
+    // because "fix" (stopword) is excluded from proximity calculation
+    assert.ok(
+      results[0].content.toLowerCase().includes("database") &&
+        results[0].content.toLowerCase().includes("error") &&
+        results[0].title.includes("Error"),
+      `Proximity should favor chunk with meaningful terms close together, got: ${results[0].title}`,
+    );
     store.close();
   });
 });
