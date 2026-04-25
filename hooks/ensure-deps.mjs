@@ -51,16 +51,17 @@ export function ensureDeps() {
     if (!existsSync(pkgDir)) {
       // Package not installed at all
       try {
-        execSync(`npm install ${pkg} --no-package-lock --no-save --silent`, {
+        execSync(`${process.platform === "win32" ? "npm.cmd" : "npm"} install ${pkg} --no-package-lock --no-save --silent`, {
           cwd: root,
           stdio: "pipe",
           timeout: 120000,
+          shell: true,
         });
       } catch { /* best effort — hook degrades gracefully without DB */ }
     } else if (!existsSync(resolve(pkgDir, ...NATIVE_BINARIES[pkg]))) {
       // Package installed but native binary missing (e.g., npm ignore-scripts=true)
       try {
-        execSync(`npm rebuild ${pkg} --ignore-scripts=false`, {
+        execSync(`${process.platform === "win32" ? "npm.cmd" : "npm"} rebuild ${pkg} --ignore-scripts=false`, {
           cwd: root,
           stdio: "pipe",
           timeout: 120000,
@@ -121,10 +122,11 @@ export function ensureNativeCompat(pluginRoot) {
       copyFileSync(binaryPath, abiCachePath);
     } else {
       // ABI mismatch or missing native binary — rebuild for current Node version
-      execSync("npm rebuild better-sqlite3 --ignore-scripts=false", {
+      execSync(`${process.platform === "win32" ? "npm.cmd" : "npm"} rebuild better-sqlite3 --ignore-scripts=false`, {
         cwd: pluginRoot,
         stdio: "pipe",
         timeout: 60000,
+        shell: true,
       });
       codesignBinary(binaryPath);
       if (existsSync(binaryPath) && probeNativeInChildProcess(pluginRoot)) {

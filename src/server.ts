@@ -1964,8 +1964,8 @@ server.registerTool(
         `console.log("- [x] Starting inline upgrade (no CLI found)");`,
         `execFileSync("git",["clone","--depth","1","${repoUrl}",T],{stdio:"inherit"});`,
         `console.log("- [x] Cloned latest source");`,
-        `execFileSync("npm",["install"],{cwd:T,stdio:"inherit"});`,
-        `execFileSync("npm",["run","build"],{cwd:T,stdio:"inherit"});`,
+        `execFileSync(process.platform==="win32"?"npm.cmd":"npm",["install"],{cwd:T,stdio:"inherit",shell:process.platform==="win32"});`,
+        `execFileSync(process.platform==="win32"?"npm.cmd":"npm",["run","build"],{cwd:T,stdio:"inherit",shell:process.platform==="win32"});`,
         `console.log("- [x] Built from source");`,
         ...copyDirs.map(
           (d) =>
@@ -1976,7 +1976,7 @@ server.registerTool(
             `if(existsSync(join(T,${JSON.stringify(f)})))cpSync(join(T,${JSON.stringify(f)}),join(P,${JSON.stringify(f)}),{force:true});`,
         ),
         `console.log("- [x] Copied build artifacts");`,
-        `execFileSync("npm",["install","--production"],{cwd:P,stdio:"inherit"});`,
+        `execFileSync(process.platform==="win32"?"npm.cmd":"npm",["install","--production"],{cwd:P,stdio:"inherit",shell:process.platform==="win32"});`,
         `console.log("- [x] Installed production dependencies");`,
         `console.log("## context-mode upgrade complete");`,
         `}catch(e){`,
@@ -2165,7 +2165,7 @@ server.registerTool(
       if (!hasNodeModules) {
         steps.push("Installing dependencies (first run, ~30s)...");
         try {
-          execSync("npm install --production=false", {
+          execSync(process.platform === "win32" ? "npm.cmd install --production=false" : "npm install --production=false", {
             cwd: cacheDir,
             stdio: "pipe",
             timeout: 300000,
