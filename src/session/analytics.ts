@@ -292,29 +292,29 @@ export class AnalyticsEngine {
       };
     }
 
-    // ── Continuity data ──
+    // ── Continuity data (scoped to current session) ──
     const eventTotal = (this.db.prepare(
-      "SELECT COUNT(*) as cnt FROM session_events",
-    ).get() as { cnt: number }).cnt;
+      "SELECT COUNT(*) as cnt FROM session_events WHERE session_id = ?",
+    ).get(sid) as { cnt: number }).cnt;
 
     const byCategory = this.db.prepare(
-      "SELECT category, COUNT(*) as cnt FROM session_events GROUP BY category ORDER BY cnt DESC",
-    ).all() as Array<{ category: string; cnt: number }>;
+      "SELECT category, COUNT(*) as cnt FROM session_events WHERE session_id = ? GROUP BY category ORDER BY cnt DESC",
+    ).all(sid) as Array<{ category: string; cnt: number }>;
 
     const meta = this.db.prepare(
-      "SELECT compact_count FROM session_meta ORDER BY started_at DESC LIMIT 1",
-    ).get() as { compact_count: number } | undefined;
+      "SELECT compact_count FROM session_meta WHERE session_id = ?",
+    ).get(sid) as { compact_count: number } | undefined;
     const compactCount = meta?.compact_count ?? 0;
 
     const resume = this.db.prepare(
-      "SELECT event_count, consumed FROM session_resume ORDER BY created_at DESC LIMIT 1",
-    ).get() as { event_count: number; consumed: number } | undefined;
+      "SELECT event_count, consumed FROM session_resume WHERE session_id = ? ORDER BY created_at DESC LIMIT 1",
+    ).get(sid) as { event_count: number; consumed: number } | undefined;
     const resumeReady = resume ? !resume.consumed : false;
 
-    // Build category previews
+    // Build category previews (current session only)
     const previewRows = this.db.prepare(
-      "SELECT category, type, data FROM session_events ORDER BY id DESC",
-    ).all() as Array<{ category: string; type: string; data: string }>;
+      "SELECT category, type, data FROM session_events WHERE session_id = ? ORDER BY id DESC",
+    ).all(sid) as Array<{ category: string; type: string; data: string }>;
 
     const previews = new Map<string, Set<string>>();
     for (const row of previewRows) {
