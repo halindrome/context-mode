@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, test } from "vitest";
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync, cpSync, symlinkSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
@@ -182,10 +182,24 @@ function startInsight(runtime: "node" | "bun" = "node"): { port: number; child: 
 }
 
 describe("Insight API same-machine cross-origin policy", () => {
-  test("does not advertise permissive CORS headers on sensitive session endpoints (Node)", async () => {
-    const { port, child } = startInsight("node");
-    await waitForInsight(port, child);
+  let port: number;
+  let serverChild: ChildProcess;
 
+  beforeAll(async () => {
+    const started = startInsight("node");
+    port = started.port;
+    serverChild = started.child;
+    // Remove from global children array — this describe manages its own lifecycle
+    const idx = children.indexOf(serverChild);
+    if (idx !== -1) children.splice(idx, 1);
+    await waitForInsight(port, serverChild);
+  });
+
+  afterAll(() => {
+    try { serverChild?.kill("SIGTERM"); } catch { /* best effort */ }
+  });
+
+  test("does not advertise permissive CORS headers on sensitive session endpoints (Node)", async () => {
     const res = await fetch(`http://127.0.0.1:${port}/api/sessions/abcd1234/events/sess-1`, {
       headers: { Origin: "http://127.0.0.1:8081" },
     });
@@ -198,9 +212,6 @@ describe("Insight API same-machine cross-origin policy", () => {
   });
 
   test("OPTIONS returns 405 instead of permissive preflight (Node)", async () => {
-    const { port, child } = startInsight("node");
-    await waitForInsight(port, child);
-
     const res = await fetch(`http://127.0.0.1:${port}/api/content/feedface/source/7`, {
       method: "OPTIONS",
       headers: {
