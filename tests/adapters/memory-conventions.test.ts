@@ -1,7 +1,17 @@
 import "../setup-home";
+import { fakeHome } from "../setup-home";
 import { describe, it, expect } from "vitest";
 import { homedir } from "node:os";
 import { join } from "node:path";
+
+// Adapters that honor XDG_CONFIG_HOME / APPDATA (e.g. opencode) read the env
+// var BEFORE falling back to homedir(). GitHub Actions Ubuntu can have these
+// set to the runner's real home and bypass the homedir mock — anchor them
+// under fakeHome so adapters stay sandboxed regardless of host env.
+process.env.XDG_CONFIG_HOME = join(fakeHome, ".config");
+process.env.XDG_DATA_HOME = join(fakeHome, ".local", "share");
+process.env.APPDATA = join(fakeHome, "AppData", "Roaming");
+process.env.LOCALAPPDATA = join(fakeHome, "AppData", "Local");
 
 import { QwenCodeAdapter } from "../../src/adapters/qwen-code/index.js";
 import { GeminiCLIAdapter } from "../../src/adapters/gemini-cli/index.js";
