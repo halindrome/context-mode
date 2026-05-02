@@ -25,37 +25,53 @@ import { execFileSync } from "node:child_process";
  * (useful in CI environments or when git is unavailable).
  * Set to empty string to disable isolation entirely.
  */
+// Memoized per (cwd, env override) — recomputing on every tool call cost
+// ~12ms (git worktree list subprocess fork) on macOS, 50ms+ on Windows.
+// Key by cwd so a defensive `process.chdir()` invalidates rather than
+// returning stale data.
+let _wtCache: { cwd: string; envSuffix: string | undefined; suffix: string } | undefined;
+
 export function getWorktreeSuffix(): string {
   const envSuffix = process.env.CONTEXT_MODE_SESSION_SUFFIX;
+  const cwd = process.cwd();
+  if (_wtCache && _wtCache.cwd === cwd && _wtCache.envSuffix === envSuffix) {
+    return _wtCache.suffix;
+  }
+
+  let suffix = "";
   if (envSuffix !== undefined) {
-    return envSuffix ? `__${envSuffix}` : "";
-  }
+    suffix = envSuffix ? `__${envSuffix}` : "";
+  } else {
+    try {
+      const mainWorktree = execFileSync(
+        "git",
+        ["worktree", "list", "--porcelain"],
+        {
+          encoding: "utf-8",
+          timeout: 2000,
+          stdio: ["ignore", "pipe", "ignore"],
+        },
+      )
+        .split(/\r?\n/)
+        .find((l) => l.startsWith("worktree "))
+        ?.replace("worktree ", "")
+        ?.trim();
 
-  try {
-    const cwd = process.cwd();
-    const mainWorktree = execFileSync(
-      "git",
-      ["worktree", "list", "--porcelain"],
-      {
-        encoding: "utf-8",
-        timeout: 2000,
-        stdio: ["ignore", "pipe", "ignore"],
-      },
-    )
-      .split(/\r?\n/)
-      .find((l) => l.startsWith("worktree "))
-      ?.replace("worktree ", "")
-      ?.trim();
-
-    if (mainWorktree && cwd !== mainWorktree) {
-      const suffix = createHash("sha256").update(cwd).digest("hex").slice(0, 8);
-      return `__${suffix}`;
+      if (mainWorktree && cwd !== mainWorktree) {
+        suffix = `__${createHash("sha256").update(cwd).digest("hex").slice(0, 8)}`;
+      }
+    } catch {
+      // git not available or not a git repo — no suffix
     }
-  } catch {
-    // git not available or not a git repo — no suffix
   }
 
-  return "";
+  _wtCache = { cwd, envSuffix, suffix };
+  return suffix;
+}
+
+// Test-only helper: clear the memoization between cases.
+export function _resetWorktreeSuffixCacheForTests(): void {
+  _wtCache = undefined;
 }
 
 // ─────────────────────────────────────────────────────────
@@ -95,6 +111,13 @@ export interface ResumeRow {
   consumed: number;
 }
 
+/** Aggregated tool-call stats for a single session. */
+export interface ToolCallStats {
+  totalCalls: number;
+  totalBytesReturned: number;
+  byTool: Record<string, { calls: number; bytesReturned: number }>;
+}
+
 // ─────────────────────────────────────────────────────────
 // Constants
 // ─────────────────────────────────────────────────────────
@@ -131,6 +154,9 @@ const S = {
   deleteResume: "deleteResume",
   getOldSessions: "getOldSessions",
   searchEvents: "searchEvents",
+  incrementToolCall: "incrementToolCall",
+  getToolCallTotals: "getToolCallTotals",
+  getToolCallByTool: "getToolCallByTool",
 } as const;
 
 // ─────────────────────────────────────────────────────────
@@ -211,6 +237,17 @@ export class SessionDB extends SQLiteBase {
         created_at TEXT NOT NULL DEFAULT (datetime('now')),
         consumed INTEGER NOT NULL DEFAULT 0
       );
+
+      CREATE TABLE IF NOT EXISTS tool_calls (
+        session_id TEXT NOT NULL,
+        tool TEXT NOT NULL,
+        calls INTEGER NOT NULL DEFAULT 0,
+        bytes_returned INTEGER NOT NULL DEFAULT 0,
+        updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+        PRIMARY KEY (session_id, tool)
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_tool_calls_session ON tool_calls(session_id);
     `);
 
     // Migration: add per-event attribution columns for existing DBs.
@@ -348,6 +385,23 @@ export class SessionDB extends SQLiteBase {
     p(S.getOldSessions,
       `SELECT session_id FROM session_meta WHERE started_at < datetime('now', ? || ' days')`);
 
+    // ── Tool calls (persistent counter) ──
+    p(S.incrementToolCall,
+      `INSERT INTO tool_calls (session_id, tool, calls, bytes_returned)
+       VALUES (?, ?, 1, ?)
+       ON CONFLICT(session_id, tool) DO UPDATE SET
+         calls = calls + 1,
+         bytes_returned = bytes_returned + excluded.bytes_returned,
+         updated_at = datetime('now')`);
+
+    p(S.getToolCallTotals,
+      `SELECT COALESCE(SUM(calls), 0) AS calls,
+              COALESCE(SUM(bytes_returned), 0) AS bytes_returned
+       FROM tool_calls WHERE session_id = ?`);
+
+    p(S.getToolCallByTool,
+      `SELECT tool, calls, bytes_returned
+       FROM tool_calls WHERE session_id = ? ORDER BY calls DESC`);
   }
 
   // ═══════════════════════════════════════════
@@ -422,6 +476,85 @@ export class SessionDB extends SQLiteBase {
       );
 
       // Update meta if session exists
+      this.stmt(S.updateMetaLastEvent).run(sessionId);
+    });
+
+    this.withRetry(() => transaction());
+  }
+
+  /**
+   * Bulk-insert N events in a SINGLE transaction.
+   *
+   * PostToolUse hooks emit 5–15 events per tool call. Calling insertEvent()
+   * in a loop runs N transactions = N WAL commits = N fsync candidates,
+   * which is painful on Windows NTFS where commit latency dominates.
+   * One transaction = one commit, dedup/evict checks reuse cached statements.
+   *
+   * Cross-platform: uses the same WAL-mode transaction primitive as
+   * insertEvent — behavior identical on macOS / Linux / Windows.
+   */
+  bulkInsertEvents(
+    sessionId: string,
+    events: SessionEvent[],
+    sourceHook: string = "PostToolUse",
+    attributions?: Array<Partial<ProjectAttribution> | undefined>,
+  ): void {
+    if (!events || events.length === 0) return;
+    if (events.length === 1) {
+      // Cheaper to fall through to insertEvent (its own dedicated transaction).
+      this.insertEvent(sessionId, events[0], sourceHook, attributions?.[0]);
+      return;
+    }
+
+    // Pre-compute hashes + normalized attribution outside the transaction
+    // so the SQL transaction holds only DB work (shorter lock window).
+    const prepared = events.map((event, i) => {
+      const dataHash = createHash("sha256")
+        .update(event.data)
+        .digest("hex")
+        .slice(0, 16)
+        .toUpperCase();
+      const attribution = attributions?.[i];
+      const projectDir = String(
+        attribution?.projectDir ?? event.project_dir ?? "",
+      ).trim();
+      const attributionSource = String(
+        attribution?.source ?? event.attribution_source ?? "unknown",
+      );
+      const rawConfidence = Number(
+        attribution?.confidence ?? event.attribution_confidence ?? 0,
+      );
+      const attributionConfidence = Number.isFinite(rawConfidence)
+        ? Math.max(0, Math.min(1, rawConfidence))
+        : 0;
+      return { event, dataHash, projectDir, attributionSource, attributionConfidence };
+    });
+
+    const transaction = this.db.transaction(() => {
+      let cnt = (this.stmt(S.getEventCount).get(sessionId) as { cnt: number }).cnt;
+      for (const row of prepared) {
+        const dup = this.stmt(S.checkDuplicate).get(
+          sessionId, DEDUP_WINDOW, row.event.type, row.dataHash,
+        );
+        if (dup) continue;
+        if (cnt >= MAX_EVENTS_PER_SESSION) {
+          this.stmt(S.evictLowestPriority).run(sessionId);
+        } else {
+          cnt++;
+        }
+        this.stmt(S.insertEvent).run(
+          sessionId,
+          row.event.type,
+          row.event.category,
+          row.event.priority,
+          row.event.data,
+          row.projectDir,
+          row.attributionSource,
+          row.attributionConfidence,
+          sourceHook,
+          row.dataHash,
+        );
+      }
       this.stmt(S.updateMetaLastEvent).run(sessionId);
     });
 
@@ -563,6 +696,73 @@ export class SessionDB extends SQLiteBase {
    */
   markResumeConsumed(sessionId: string): void {
     this.stmt(S.markResumeConsumed).run(sessionId);
+  }
+
+  /**
+   * Return the most recent session_id from session_meta, or null if none.
+   * Used by the runtime to attach persistent counters to the right session
+   * after a process restart.
+   */
+  getLatestSessionId(): string | null {
+    try {
+      const row = this.db.prepare(
+        "SELECT session_id FROM session_meta ORDER BY started_at DESC LIMIT 1",
+      ).get() as { session_id?: string } | undefined;
+      return row?.session_id ?? null;
+    } catch {
+      return null;
+    }
+  }
+
+  // ═══════════════════════════════════════════
+  // Tool call counters (Bug #1 + #2 — survive restart, --continue, upgrade)
+  // ═══════════════════════════════════════════
+
+  /**
+   * Increment the persistent tool-call counter for `tool` in `sessionId`.
+   * Adds `bytesReturned` to the cumulative total. Idempotent across
+   * SessionDB instances — counters survive process restart.
+   */
+  incrementToolCall(sessionId: string, tool: string, bytesReturned: number = 0): void {
+    const safeBytes = Number.isFinite(bytesReturned) && bytesReturned > 0 ? Math.round(bytesReturned) : 0;
+    try {
+      this.stmt(S.incrementToolCall).run(sessionId, tool, safeBytes);
+    } catch {
+      // best-effort: counter must never throw and break the parent call
+    }
+  }
+
+  /**
+   * Get aggregated tool-call stats for `sessionId`. Returns zero-stats
+   * when the session has no recorded calls.
+   */
+  getToolCallStats(sessionId: string): ToolCallStats {
+    try {
+      const totals = this.stmt(S.getToolCallTotals).get(sessionId) as
+        | { calls: number; bytes_returned: number }
+        | undefined;
+      const rows = this.stmt(S.getToolCallByTool).all(sessionId) as Array<{
+        tool: string;
+        calls: number;
+        bytes_returned: number;
+      }>;
+
+      const byTool: ToolCallStats["byTool"] = {};
+      for (const row of rows) {
+        byTool[row.tool] = {
+          calls: row.calls,
+          bytesReturned: row.bytes_returned,
+        };
+      }
+
+      return {
+        totalCalls: totals?.calls ?? 0,
+        totalBytesReturned: totals?.bytes_returned ?? 0,
+        byTool,
+      };
+    } catch {
+      return { totalCalls: 0, totalBytesReturned: 0, byTool: {} };
+    }
   }
 
   // ═══════════════════════════════════════════

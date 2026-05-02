@@ -1444,14 +1444,15 @@ describe("MCP Events", () => {
     };
 
     const events = extractEvents(input);
-    assert.equal(events.length, 1);
-    assert.equal(events[0].type, "mcp");
-    assert.equal(events[0].category, "mcp");
-    assert.ok(events[0].data.includes("jira_get"), "data should include tool short name");
-    assert.ok(events[0].data.includes("CVX-5909"), "data should include first string arg");
+    const mcpEvents = events.filter(e => e.category === "mcp");
+    assert.equal(mcpEvents.length, 1);
+    assert.equal(mcpEvents[0].type, "mcp");
+    assert.equal(mcpEvents[0].category, "mcp");
+    assert.ok(mcpEvents[0].data.includes("jira_get"), "data should include tool short name");
+    assert.ok(mcpEvents[0].data.includes("CVX-5909"), "data should include first string arg");
     // Response body is now searchable, not just the call shape
     assert.ok(
-      events[0].data.includes("MQTT reconnect storm"),
+      mcpEvents[0].data.includes("MQTT reconnect storm"),
       "data should include tool_response body so FTS5 can index it",
     );
   });
@@ -1468,9 +1469,10 @@ describe("MCP Events", () => {
     };
 
     const events = extractEvents(input);
-    assert.equal(events.length, 1);
+    const mcpEvents = events.filter(e => e.category === "mcp");
+    assert.equal(mcpEvents.length, 1);
     assert.ok(
-      events[0].data.includes(bigResponse),
+      mcpEvents[0].data.includes(bigResponse),
       "large tool_response must be preserved in full",
     );
   });
@@ -1484,9 +1486,10 @@ describe("MCP Events", () => {
     };
 
     const events = extractEvents(input);
-    assert.equal(events.length, 1);
-    assert.equal(events[0].type, "mcp");
-    assert.equal(events[0].data, "ctx_stats", "no \\nresponse: suffix when tool_response absent");
+    const mcpEvents = events.filter(e => e.category === "mcp");
+    assert.equal(mcpEvents.length, 1);
+    assert.equal(mcpEvents[0].type, "mcp");
+    assert.equal(mcpEvents[0].data, "ctx_stats", "no \\nresponse: suffix when tool_response absent");
   });
 
   test("gracefully handles empty tool_response", () => {
@@ -1497,8 +1500,156 @@ describe("MCP Events", () => {
     };
 
     const events = extractEvents(input);
-    assert.equal(events.length, 1);
-    assert.equal(events[0].data, "ctx_stats", "empty tool_response should not add suffix");
+    const mcpEvents = events.filter(e => e.category === "mcp");
+    assert.equal(mcpEvents.length, 1);
+    assert.equal(mcpEvents[0].data, "ctx_stats", "empty tool_response should not add suffix");
+  });
+
+  test("emits mcp_tool_call category for mcp__* events with truncated params", () => {
+    // Small payload — no truncation, params parsed verbatim
+    const small = extractEvents({
+      tool_name: "mcp__context-mode__ctx_batch_execute",
+      tool_input: { commands: [{ label: "x", command: "ls" }], concurrency: 6 },
+    });
+    const smallCall = small.find(e => e.category === "mcp_tool_call");
+    assert.ok(smallCall, "mcp_tool_call event should be emitted");
+    assert.equal(smallCall!.type, "mcp_tool_call");
+    assert.equal(smallCall!.priority, 4);
+    const smallPayload = JSON.parse(smallCall!.data);
+    assert.equal(smallPayload.tool_name, "mcp__context-mode__ctx_batch_execute");
+    assert.equal(smallPayload.params.concurrency, 6);
+    assert.equal(smallPayload.truncated, undefined);
+
+    // Large payload — params JSON exceeds 2KB, must be truncated with sentinel
+    const bigCommands = Array.from({ length: 200 }, (_, i) => ({
+      label: `cmd-${i}`,
+      command: "echo " + "x".repeat(50),
+    }));
+    const big = extractEvents({
+      tool_name: "mcp__context-mode__ctx_batch_execute",
+      tool_input: { commands: bigCommands, concurrency: 8 },
+    });
+    const bigCall = big.find(e => e.category === "mcp_tool_call");
+    assert.ok(bigCall, "mcp_tool_call event should be emitted for large payload");
+    // 2KB params budget + JSON-escape overhead + wrapper (~300 bytes max).
+    assert.ok(bigCall!.data.length <= 2500, "data should be capped near 2KB params budget");
+    const bigPayload = JSON.parse(bigCall!.data);
+    assert.equal(bigPayload.truncated, true, "truncation sentinel must be set");
+    assert.equal(typeof bigPayload.params_raw, "string", "raw substring preserved");
+    assert.equal(bigPayload.tool_name, "mcp__context-mode__ctx_batch_execute");
+  });
+
+  test("UTF-8-aware truncation: never lands mid-codepoint (review F3)", () => {
+    // Naive `string.slice(0, N)` operates on UTF-16 code units. With multi-byte
+    // characters, that can either over-shoot the byte budget OR slice mid
+    // surrogate pair, producing an unpaired surrogate that becomes U+FFFD
+    // after a SQLite TEXT round-trip.
+    //
+    // Repro shape: enough multi-byte characters to push the JSON payload past
+    // 2KB. We use 3-byte (CJK) and 4-byte (math symbol) characters so any
+    // mid-codepoint slice is observable.
+    const cjkChunk = "中文测试".repeat(200); // 4 × 3 bytes × 200 = 2400 bytes raw
+    const symbolChunk = "𝕏".repeat(100);     // 1 × 4 bytes × 100 = 400 bytes raw
+    const big = extractEvents({
+      tool_name: "mcp__context-mode__ctx_batch_execute",
+      tool_input: { mixed: cjkChunk + symbolChunk, concurrency: 4 },
+    });
+    const call = big.find(e => e.category === "mcp_tool_call");
+    assert.ok(call, "mcp_tool_call event should be emitted for multibyte payload");
+    const payload = JSON.parse(call!.data);
+    assert.equal(payload.truncated, true, "multibyte payload should trip truncation");
+
+    // Critical invariant 1 — params_raw must round-trip through Buffer.from cleanly.
+    // If the slice landed mid-codepoint, JSON.parse would have already thrown above
+    // (invalid JSON token) OR the string would contain U+FFFD replacement chars.
+    assert.equal(typeof payload.params_raw, "string");
+    assert.ok(!payload.params_raw.includes("�"), "no replacement chars (mid-codepoint slice)");
+
+    // Critical invariant 2 — the truncated raw must satisfy the BYTE budget,
+    // not the UTF-16 code-unit budget. Since CJK = 3 bytes/char and the raw
+    // payload includes JSON quoting overhead, a UTF-16-only cap would let
+    // ~6KB of bytes through; UTF-8-aware cap holds it ≤ 2KB.
+    const rawBytes = Buffer.byteLength(payload.params_raw, "utf8");
+    assert.ok(rawBytes <= 2048, `raw bytes (${rawBytes}) exceed 2KB budget`);
+  });
+
+  test("redacts secret-bearing keys before persisting (B3 token leakage fix)", () => {
+    // PR #401 review (grill-me) flagged: any MCP tool whose tool_input
+    // carries Authorization, api_key, password, etc. would be persisted
+    // verbatim to SessionDB. Reproduce + assert masking.
+    const events = extractEvents({
+      tool_name: "mcp__github__create_issue",
+      tool_input: {
+        repo: "owner/name",
+        title: "test",
+        headers: {
+          Authorization: "Bearer ghp_ABC123XYZ_secret_token",
+          "X-API-Key": "sk-real-key-here",
+          "Content-Type": "application/json",
+        },
+        auth: {
+          token: "another-secret",
+          api_key: "yet-another",
+        },
+        password: "p@ssw0rd!",
+        nested: {
+          deep: {
+            cookie: "session=secret-cookie",
+            ok_field: "kept",
+          },
+        },
+      },
+    });
+    const call = events.find((e) => e.category === "mcp_tool_call");
+    assert.ok(call, "mcp_tool_call event emitted");
+    const payload = JSON.parse(call!.data);
+
+    // No secret value should appear anywhere in serialized data
+    const serialized = call!.data;
+    assert.ok(!serialized.includes("ghp_ABC123XYZ_secret_token"), "Bearer token must be redacted");
+    assert.ok(!serialized.includes("sk-real-key-here"), "X-API-Key must be redacted");
+    assert.ok(!serialized.includes("another-secret"), "auth.token must be redacted");
+    assert.ok(!serialized.includes("yet-another"), "auth.api_key must be redacted");
+    assert.ok(!serialized.includes("p@ssw0rd!"), "password must be redacted");
+    assert.ok(!serialized.includes("session=secret-cookie"), "nested cookie must be redacted");
+
+    // Non-secret values must survive
+    assert.equal(payload.params.repo, "owner/name", "non-secret repo preserved");
+    assert.equal(payload.params.title, "test", "non-secret title preserved");
+    assert.equal(payload.params.headers["Content-Type"], "application/json", "non-secret header preserved");
+    assert.equal(payload.params.nested.deep.ok_field, "kept", "non-secret nested field preserved");
+
+    // Redacted values must show the sentinel
+    assert.equal(payload.params.headers.Authorization, "[REDACTED]");
+    assert.equal(payload.params.headers["X-API-Key"], "[REDACTED]");
+    assert.equal(payload.params.auth.token, "[REDACTED]");
+    assert.equal(payload.params.auth.api_key, "[REDACTED]");
+    assert.equal(payload.params.password, "[REDACTED]");
+    assert.equal(payload.params.nested.deep.cookie, "[REDACTED]");
+  });
+
+  test("shared-ref redaction (B3) — same secret object referenced multiple times stays redacted", () => {
+    // tool_input frequently uses shared object references (e.g., a single
+    // headers object passed to multiple sub-requests). Redaction must mask
+    // the value AT EVERY reference site, not just one.
+    const sharedHeaders = { Authorization: "Bearer SECRET-XYZ-shared", trace_id: "abc-123" };
+    const events = extractEvents({
+      tool_name: "mcp__test__shared",
+      tool_input: {
+        primary_request: { url: "https://api/x", headers: sharedHeaders },
+        retry_request: { url: "https://api/x", headers: sharedHeaders }, // SAME ref
+      },
+    });
+    const call = events.find((e) => e.category === "mcp_tool_call");
+    assert.ok(call, "mcp_tool_call event emitted for shared-ref input");
+    // Secret must be redacted at BOTH reference sites
+    assert.ok(!call!.data.includes("SECRET-XYZ-shared"), "shared secret value redacted at all sites");
+    const payload = JSON.parse(call!.data);
+    assert.equal(payload.params.primary_request.headers.Authorization, "[REDACTED]");
+    assert.equal(payload.params.retry_request.headers.Authorization, "[REDACTED]");
+    // Non-secret trace_id survives at both sites
+    assert.equal(payload.params.primary_request.headers.trace_id, "abc-123");
+    assert.equal(payload.params.retry_request.headers.trace_id, "abc-123");
   });
 });
 

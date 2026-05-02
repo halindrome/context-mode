@@ -157,6 +157,20 @@ export class KiroAdapter extends BaseAdapter implements HookAdapter {
     return resolve(homedir(), ".kiro", "settings", "mcp.json");
   }
 
+  /**
+   * Kiro stores per-project context under .kiro/ (steering files, etc).
+   * Auto-memory + rule detection use this project-relative dir, returned as
+   * an absolute path resolved against `projectDir` (or `process.cwd()`).
+   * (Settings/MCP config still live under ~/.kiro/.)
+   */
+  getConfigDir(projectDir?: string): string {
+    return resolve(projectDir ?? process.cwd(), ".kiro");
+  }
+
+  getInstructionFiles(): string[] {
+    return ["KIRO.md"];
+  }
+
   generateHookConfig(pluginRoot: string): HookRegistration {
     // Kiro CLI hook config format: { preToolUse: [{ matcher, command }] }
     // Note: This generates the entries for agent config files

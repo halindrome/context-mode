@@ -213,6 +213,19 @@ export class CursorAdapter extends BaseAdapter implements HookAdapter {
     return resolve(".cursor", "hooks.json");
   }
 
+  /**
+   * Cursor stores conventions per project under .cursor/. Always returned
+   * as an absolute path resolved against `projectDir` (or `process.cwd()`
+   * when omitted) per the HookAdapter.getConfigDir contract.
+   */
+  getConfigDir(projectDir?: string): string {
+    return resolve(projectDir ?? process.cwd(), ".cursor");
+  }
+
+  getInstructionFiles(): string[] {
+    return ["context-mode.mdc"];
+  }
+
   generateHookConfig(_pluginRoot: string): HookRegistration {
     const hooks = {
       [CURSOR_HOOK_NAMES.PRE_TOOL_USE]: [

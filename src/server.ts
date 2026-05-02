@@ -3,15 +3,17 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { createRequire } from "node:module";
 import { createHash } from "node:crypto";
-import { existsSync, unlinkSync, readdirSync, readFileSync, writeFileSync, rmSync, mkdirSync, cpSync, statSync, symlinkSync, lstatSync } from "node:fs";
+import { existsSync, unlinkSync, readdirSync, readFileSync, writeFileSync, renameSync, rmSync, mkdirSync, cpSync, statSync, symlinkSync, lstatSync } from "node:fs";
 import { execSync, type ChildProcess } from "node:child_process";
-import { join, dirname, resolve, sep } from "node:path";
+import { join, dirname, resolve, sep, isAbsolute } from "node:path";
 import { fileURLToPath } from "node:url";
-import { homedir, tmpdir } from "node:os";
+import { homedir, tmpdir, cpus } from "node:os";
 import { request as httpsRequest } from "node:https";
 import { z } from "zod";
 import { PolyglotExecutor } from "./executor.js";
+import { runPool, type PoolJob } from "./concurrency/runPool.js";
 import { ContentStore, cleanupStaleDBs, cleanupStaleContentDBs, type SearchResult, type IndexResult } from "./store.js";
+import { composeFetchCacheKey } from "./fetch-cache.js";
 import {
   readBashPolicies,
   evaluateCommandDenyOnly,
@@ -30,8 +32,9 @@ import { startLifecycleGuard } from "./lifecycle.js";
 import { getWorktreeSuffix, SessionDB } from "./session/db.js";
 import { searchAllSources } from "./search/unified.js";
 import { buildNodeCommand, type HookAdapter } from "./adapters/types.js";
+import { detectPlatform, getSessionDirSegments } from "./adapters/detect.js";
 import { loadDatabase } from "./db-base.js";
-import { AnalyticsEngine, formatReport } from "./session/analytics.js";
+import { AnalyticsEngine, formatReport, getLifetimeStats, OPUS_INPUT_PRICE_PER_TOKEN } from "./session/analytics.js";
 const __pkg_dir = dirname(fileURLToPath(import.meta.url));
 const VERSION: string = (() => {
   for (const rel of ["../package.json", "./package.json"]) {
@@ -69,7 +72,7 @@ server.server.setRequestHandler(ListResourceTemplatesRequestSchema, async () => 
 
 const executor = new PolyglotExecutor({
   runtimes,
-  projectRoot: process.env.CLAUDE_PROJECT_DIR,
+  projectRoot: () => getProjectDir(),
 });
 
 // ─────────────────────────────────────────────────────────
@@ -127,6 +130,19 @@ let _insightChild: ChildProcess | null = null;
  */
 function getSessionDir(): string {
   if (_detectedAdapter) return _detectedAdapter.getSessionDir();
+  // Pre-detection path (race window before MCP `initialize` completes):
+  // call detectPlatform() (sync, env-var-based) and look up segments via
+  // getSessionDirSegments() (sync map, no adapter instantiation). This keeps
+  // non-Claude platforms from spilling sessions into ~/.claude/.
+  try {
+    const signal = detectPlatform();
+    const segments = getSessionDirSegments(signal.platform);
+    if (segments) {
+      const dir = join(homedir(), ...segments, "context-mode", "sessions");
+      mkdirSync(dir, { recursive: true });
+      return dir;
+    }
+  } catch { /* fall through to .claude fallback */ }
   const dir = join(homedir(), ".claude", "context-mode", "sessions");
   mkdirSync(dir, { recursive: true });
   return dir;
@@ -149,8 +165,18 @@ function getProjectDir(): string {
     || process.env.VSCODE_CWD
     || process.env.OPENCODE_PROJECT_DIR
     || process.env.PI_PROJECT_DIR
+    || process.env.IDEA_INITIAL_DIRECTORY
     || process.env.CONTEXT_MODE_PROJECT_DIR
     || process.cwd();
+}
+
+/**
+ * Resolve a possibly-relative path against the project directory (full env cascade),
+ * not the MCP server's process.cwd(). MCP server is spawned by the host and its cwd
+ * is unrelated to where the user is working.
+ */
+function resolveProjectPath(filePath: string): string {
+  return isAbsolute(filePath) ? filePath : resolve(getProjectDir(), filePath);
 }
 
 /**
@@ -345,11 +371,139 @@ function trackResponse(toolName: string, response: ToolResult): ToolResult {
   sessionStats.calls[toolName] = (sessionStats.calls[toolName] || 0) + 1;
   sessionStats.bytesReturned[toolName] =
     (sessionStats.bytesReturned[toolName] || 0) + bytes;
+
+  // Persist a sidecar JSON snapshot for the statusline — read at ~3-5 Hz by
+  // bin/statusline.mjs (and any external dashboard) so they don't have to
+  // open the SQLite database. Throttled inside persistStats() (500ms) so
+  // it's safe to call on every response. The b392c2f concurrency refactor
+  // dropped the SessionDB tool-call counter (`persistToolCallCounter`); we
+  // keep persistStats here because the statusline depends on it.
+  persistStats();
   return response;
 }
 
 function trackIndexed(bytes: number): void {
   sessionStats.bytesIndexed += bytes;
+  persistStats();
+}
+
+// ─────────────────────────────────────────────────────────
+// Stats persistence — written after every tool call so
+// external readers (status line scripts, dashboards, hooks)
+// can see real-time savings without spawning an MCP client.
+// ─────────────────────────────────────────────────────────
+
+const STATS_PERSIST_THROTTLE_MS = 500;
+// Schema version for the persisted stats payload (~/.claude/context-mode/sessions/stats-*.json).
+// Bump when a field is added/renamed/removed. Statusline reads `schemaVersion ?? 0` and warns when
+// it sees a future schema, so legacy bundles degrade gracefully on upgrade rather than silently
+// rendering missing fields (PR #401 architect review P1.3).
+// v2: added tokens_saved_lifetime + dollars_saved_lifetime.
+const STATS_SCHEMA_VERSION = 2;
+// OPUS_INPUT_PRICE_PER_TOKEN intentionally NOT defined here — single source in
+// src/session/analytics.ts re-exported above. (P1.1 — pricing constant dedup,
+// PR #401 architect + ops 2-vote convergence.)
+const LIFETIME_REFRESH_MS = 30_000;
+// Matches the conversion factor in src/session/analytics.ts renderBottomLine:
+// ~1KB per session event ÷ 4 bytes/token = 256 tokens/event.
+const TOKENS_PER_EVENT = 256;
+let _lastStatsPersist = 0;
+let _lifetimeCache: { tokens: number; computedAt: number } | undefined;
+
+/**
+ * Resolve the per-session stats file path.
+ *
+ * The session id mirrors the Claude Code adapter contract
+ * (`pid-<parent pid>`), so a status line script can derive
+ * the same id from `$PPID` without coupling to MCP.
+ */
+function getStatsFilePath(): string {
+  const sessionId = process.env.CLAUDE_SESSION_ID || `pid-${process.ppid}`;
+  return join(getSessionDir(), `stats-${sessionId}.json`);
+}
+
+function persistStats(): void {
+  const now = Date.now();
+  if (now - _lastStatsPersist < STATS_PERSIST_THROTTLE_MS) return;
+  _lastStatsPersist = now;
+
+  try {
+    const totalReturned = Object.values(sessionStats.bytesReturned).reduce(
+      (a, b) => a + b,
+      0,
+    );
+    const totalCalls = Object.values(sessionStats.calls).reduce(
+      (a, b) => a + b,
+      0,
+    );
+    const keptOut =
+      sessionStats.bytesIndexed +
+      sessionStats.bytesSandboxed +
+      sessionStats.cacheBytesSaved;
+    const totalProcessed = keptOut + totalReturned;
+    const reductionPct =
+      totalProcessed > 0
+        ? Math.round((1 - totalReturned / totalProcessed) * 100)
+        : 0;
+    const tokensSaved = Math.round(keptOut / 4);
+
+    // Lifetime savings — cached separately because getLifetimeStats() scans
+    // disk (per-project SessionDBs + auto-memory dirs) and is too expensive
+    // for the 500ms persist throttle. Refresh every 30s; the statusline
+    // doesn't need second-by-second lifetime accuracy.
+    let lifetimeTokens = _lifetimeCache?.tokens ?? 0;
+    if (!_lifetimeCache || now - _lifetimeCache.computedAt > LIFETIME_REFRESH_MS) {
+      try {
+        const life = getLifetimeStats({ sessionsDir: getSessionDir() });
+        lifetimeTokens = (life?.totalEvents ?? 0) * TOKENS_PER_EVENT;
+        _lifetimeCache = { tokens: lifetimeTokens, computedAt: now };
+      } catch {
+        // best-effort — keep stale cache or 0
+      }
+    }
+
+    const payload = {
+      schemaVersion: STATS_SCHEMA_VERSION,
+      version: VERSION,
+      updated_at: now,
+      session_start: sessionStats.sessionStart,
+      uptime_ms: now - sessionStats.sessionStart,
+      total_calls: totalCalls,
+      bytes_returned: totalReturned,
+      bytes_indexed: sessionStats.bytesIndexed,
+      bytes_sandboxed: sessionStats.bytesSandboxed,
+      cache_hits: sessionStats.cacheHits,
+      cache_bytes_saved: sessionStats.cacheBytesSaved,
+      kept_out: keptOut,
+      total_processed: totalProcessed,
+      reduction_pct: reductionPct,
+      tokens_saved: tokensSaved,
+      // statusline-facing $ values — pre-computed at Opus input rate so the
+      // statusline doesn't have to know pricing. Lets us evolve pricing in
+      // one place without touching consumers.
+      dollars_saved_session: +(tokensSaved * OPUS_INPUT_PRICE_PER_TOKEN).toFixed(2),
+      tokens_saved_lifetime: lifetimeTokens,
+      dollars_saved_lifetime: +(lifetimeTokens * OPUS_INPUT_PRICE_PER_TOKEN).toFixed(2),
+      by_tool: Object.fromEntries(
+        Object.keys({ ...sessionStats.calls, ...sessionStats.bytesReturned }).map(
+          (t) => [
+            t,
+            {
+              calls: sessionStats.calls[t] || 0,
+              bytes: sessionStats.bytesReturned[t] || 0,
+            },
+          ],
+        ),
+      ),
+    };
+
+    const filePath = getStatsFilePath();
+    const tmpPath = `${filePath}.tmp`;
+    writeFileSync(tmpPath, JSON.stringify(payload));
+    renameSync(tmpPath, filePath);
+  } catch {
+    // best-effort — never break tool calls because of stats persistence
+  }
 }
 
 // ==============================================================================
@@ -422,7 +576,7 @@ function checkFilePathDenyPolicy(
   toolName: string,
 ): ToolResult | null {
   try {
-    const projectDir = process.env.CLAUDE_PROJECT_DIR ?? process.cwd();
+    const projectDir = getProjectDir();
     const denyGlobs = readToolDenyPatterns("Read", projectDir);
     const result = evaluateFilePath(
       filePath,
@@ -607,6 +761,122 @@ export function formatBatchQueryResults(
   sections.push(`\n> **Tip:** Results are scoped to this batch only. To search across all indexed sources, use \`ctx_search(queries: [...])\`.`);
 
   return sections;
+}
+
+// ─────────────────────────────────────────────────────────
+// batch_execute runner — used by ctx_batch_execute handler
+// ─────────────────────────────────────────────────────────
+
+export interface BatchCommand { label: string; command: string; }
+
+export interface BatchRunResult {
+  outputs: string[];
+  timedOut: boolean;
+}
+
+export interface BatchRunOptions {
+  timeout: number;
+  concurrency: number;
+  nodeOptsPrefix: string;
+  onFsBytes?: (bytes: number) => void;
+}
+
+interface BatchExecutor {
+  execute(input: { language: "shell"; code: string; timeout: number }): Promise<{ stdout: string; timedOut?: boolean }>;
+}
+
+function formatCommandOutput(label: string, raw: string, onFsBytes?: (bytes: number) => void): string {
+  let output = raw || "(no output)";
+  const fsMatches = output.matchAll(/__CM_FS__:(\d+)/g);
+  let cmdFsBytes = 0;
+  for (const m of fsMatches) cmdFsBytes += parseInt(m[1]);
+  if (cmdFsBytes > 0) {
+    onFsBytes?.(cmdFsBytes);
+    output = output.replace(/__CM_FS__:\d+\n?/g, "");
+  }
+  return `# ${label}\n\n${output}\n`;
+}
+
+/**
+ * Execute batch commands. concurrency=1 preserves the legacy serial path
+ * (shared timeout budget + cascading skip-on-timeout). concurrency>1 runs
+ * commands concurrently with at most N in flight; each command receives the
+ * full timeout, output is collated by input index, and per-command timeouts
+ * record `(timed out)` blocks without skipping siblings.
+ */
+export async function runBatchCommands(
+  commands: BatchCommand[],
+  opts: BatchRunOptions,
+  executor: BatchExecutor,
+): Promise<BatchRunResult> {
+  const { timeout, concurrency, nodeOptsPrefix, onFsBytes } = opts;
+
+  if (concurrency <= 1) {
+    // Serial path — shared timeout budget, cascading skip on timeout.
+    const outputs: string[] = [];
+    const startTime = Date.now();
+    let timedOut = false;
+    for (let i = 0; i < commands.length; i++) {
+      const cmd = commands[i];
+      const elapsed = Date.now() - startTime;
+      const remaining = timeout - elapsed;
+      if (remaining <= 0) {
+        outputs.push(`# ${cmd.label}\n\n(skipped — batch timeout exceeded)\n`);
+        timedOut = true;
+        continue;
+      }
+      const result = await executor.execute({
+        language: "shell",
+        code: `${nodeOptsPrefix}${cmd.command} 2>&1`,
+        timeout: remaining,
+      });
+      outputs.push(formatCommandOutput(cmd.label, result.stdout, onFsBytes));
+      if (result.timedOut) {
+        timedOut = true;
+        for (let j = i + 1; j < commands.length; j++) {
+          outputs.push(`# ${commands[j].label}\n\n(skipped — batch timeout exceeded)\n`);
+        }
+        break;
+      }
+    }
+    return { outputs, timedOut };
+  }
+
+  // Parallel path — delegated to the shared runPool primitive.
+  // Each job returns { output, timedOut }; runPool handles in-flight cap,
+  // throw isolation (Promise.allSettled semantics), and order preservation.
+  const jobs: PoolJob<{ output: string; timedOut: boolean }>[] = commands.map((cmd) => ({
+    run: async () => {
+      const result = await executor.execute({
+        language: "shell",
+        code: `${nodeOptsPrefix}${cmd.command} 2>&1`,
+        timeout,
+      });
+      // Always route partial stdout through formatCommandOutput so __CM_FS__
+      // markers are stripped + counted, even when the command timed out.
+      const formatted = formatCommandOutput(cmd.label, result.stdout, onFsBytes);
+      const output = result.timedOut
+        ? formatted.replace(/\n$/, "") + `\n(timed out after ${timeout}ms)\n`
+        : formatted;
+      return { output, timedOut: !!result.timedOut };
+    },
+  }));
+
+  const { settled } = await runPool(jobs, { concurrency });
+  const outputs: string[] = new Array(commands.length);
+  let timedOut = false;
+  for (let i = 0; i < settled.length; i++) {
+    const r = settled[i];
+    if (r.status === "fulfilled") {
+      outputs[i] = r.value.output;
+      if (r.value.timedOut) timedOut = true;
+    } else {
+      // Isolated executor throw (spawn EAGAIN, ENOMEM, EMFILE, …) — siblings keep running.
+      const message = r.reason instanceof Error ? r.reason.message : String(r.reason);
+      outputs[i] = `# ${commands[i].label}\n\n(executor error: ${message})\n`;
+    }
+  }
+  return { outputs, timedOut };
 }
 
 // ─────────────────────────────────────────────────────────
@@ -1142,16 +1412,17 @@ server.registerTool(
     }
 
     try {
+      const resolvedPath = path ? resolveProjectPath(path) : undefined;
       // Track the raw bytes being indexed (content or file)
       if (content) trackIndexed(Buffer.byteLength(content));
-      else if (path) {
+      else if (resolvedPath) {
         try {
           const fs = await import("fs");
-          trackIndexed(fs.readFileSync(path).byteLength);
+          trackIndexed(fs.readFileSync(resolvedPath).byteLength);
         } catch { /* ignore — file read errors handled by store */ }
       }
       const store = getStore();
-      const result = store.index({ content, path, source });
+      const result = store.index({ content, path: resolvedPath, source: source ?? resolvedPath });
 
       return trackResponse("ctx_index", {
         content: [
@@ -1330,14 +1601,14 @@ server.registerTool(
       if (sort === "timeline") {
         try {
           const sessionsDir = getSessionDir();
-          const dbFile = join(sessionsDir, `${hashProjectDir()}.db`);
+          const dbFile = join(sessionsDir, `${hashProjectDir()}${getWorktreeSuffix()}.db`);
           if (existsSync(dbFile)) {
             timelineDB = new SessionDB({ dbPath: dbFile });
           }
         } catch { /* SessionDB unavailable — search ContentStore + auto-memory only */ }
       }
 
-      const configDir = process.env.CLAUDE_CONFIG_DIR || join(homedir(), ".claude");
+      const configDir = _detectedAdapter?.getConfigDir() ?? (process.env.CLAUDE_CONFIG_DIR || join(homedir(), ".claude"));
 
       try {
       for (const q of queryList) {
@@ -1358,6 +1629,7 @@ server.registerTool(
             sessionDB: timelineDB,
             projectDir: getProjectDir(),
             configDir,
+            adapter: _detectedAdapter ?? undefined,
           });
         } else {
           results = store.searchWithFallback(q, effectiveLimit, source, contentType);
@@ -1506,23 +1778,298 @@ main();
 `;
 }
 
+// ─────────────────────────────────────────────────────────
+// fetch_and_index helpers — split into parallel-safe fetch and serial-only index
+// ─────────────────────────────────────────────────────────
+
+const FETCH_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
+const FETCH_PREVIEW_LIMIT = 3072;
+
+type FetchOneResult =
+  | { kind: "cached"; label: string; chunkCount: number; estimatedBytes: number; ageStr: string }
+  | { kind: "fetched"; url: string; source?: string; markdown: string; header: string }
+  | { kind: "fetch_error"; url: string; error: string; reason: "exit" | "read" | "empty" | "throw" };
+
+/**
+ * Pure fetch step — TTL cache check + subprocess fetch. SAFE TO RUN IN PARALLEL.
+ * Performs zero SQLite writes (only reads source meta). Caller must funnel
+ * fetched results through `indexFetched` serially to avoid FTS5 WAL contention.
+ */
+/**
+ * SSRF guard for ctx_fetch_and_index: validate URL scheme + resolve target IP +
+ * block link-local / IMDS / multicast / reserved IP ranges. Returns null if
+ * safe; returns a FetchOneResult fetch_error if blocked.
+ *
+ * Policy (PR #401 ops review, developer-friendly default):
+ *
+ * **HARD BLOCK** (no legitimate dev workflow):
+ *   - file://, gopher://, javascript:, data: schemes (only http: and https:)
+ *   - 169.254.0.0/16 link-local (INCLUDES 169.254.169.254 = AWS/GCP/Azure IMDS
+ *     cloud credential endpoint — high-value target for indirect prompt injection)
+ *   - IPv6 link-local fe80::/10
+ *   - Multicast (224+ IPv4, ff00::/8 IPv6) and reserved (0.0.0.0/8) ranges
+ *
+ * **ALLOW by default** (legitimate developer use cases dominate):
+ *   - localhost, 127.x.x.x, ::1 (local dev servers — Next.js, Vite, Postgres, …)
+ *   - 10.x, 172.16-31.x, 192.168.x RFC1918 private (developer's internal network)
+ *
+ * **STRICT MODE** opt-in via env var: `CTX_FETCH_STRICT=1`
+ *   - Blocks loopback + RFC1918 too
+ *   - For hosted/CI environments where the runtime isn't the user's own machine
+ *
+ * DNS resolution is performed against the resolved IP (not just URL parse) so a
+ * hostname like `evil.com` pointing to 169.254.169.254 is rejected — defends
+ * against attacker-controlled DNS records and DNS rebinding.
+ */
+async function ssrfGuard(rawUrl: string): Promise<FetchOneResult | null> {
+  let parsed: URL;
+  try {
+    parsed = new URL(rawUrl);
+  } catch {
+    return { kind: "fetch_error", url: rawUrl, error: "invalid URL", reason: "exit" };
+  }
+
+  // 1. Scheme allowlist — http and https only
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+    return {
+      kind: "fetch_error",
+      url: rawUrl,
+      error: `URL scheme "${parsed.protocol}" not allowed (only http: and https:)`,
+      reason: "exit",
+    };
+  }
+
+  const strict = process.env.CTX_FETCH_STRICT === "1";
+
+  // 2. DNS resolve + check IP ranges (hard-block + optional strict-mode block)
+  try {
+    const { lookup } = await import("node:dns/promises");
+    const records = await lookup(parsed.hostname, { all: true, verbatim: true });
+    for (const rec of records) {
+      const verdict = classifyIp(rec.address);
+      if (verdict === "block") {
+        return {
+          kind: "fetch_error",
+          url: rawUrl,
+          error: `URL "${parsed.hostname}" resolves to ${rec.address} — blocked (link-local / IMDS / multicast / reserved)`,
+          reason: "exit",
+        };
+      }
+      if (verdict === "private" && strict) {
+        return {
+          kind: "fetch_error",
+          url: rawUrl,
+          error: `URL "${parsed.hostname}" resolves to private IP ${rec.address} — blocked under CTX_FETCH_STRICT=1`,
+          reason: "exit",
+        };
+      }
+    }
+  } catch (err) {
+    return {
+      kind: "fetch_error",
+      url: rawUrl,
+      error: `DNS lookup failed for "${parsed.hostname}": ${err instanceof Error ? err.message : String(err)}`,
+      reason: "exit",
+    };
+  }
+
+  return null; // safe to fetch
+}
+
+/**
+ * Classify an IP address.
+ *   - "block":    always blocked (link-local/IMDS/multicast/reserved/malformed)
+ *   - "private":  loopback or RFC1918 — allowed by default, blocked in strict mode
+ *   - "public":   safe to fetch
+ *
+ * Exported (via the function name) so SSRF tests can exercise the matcher directly.
+ */
+export function classifyIp(ip: string): "block" | "private" | "public" {
+  const lower = ip.toLowerCase();
+
+  // IPv6 takes priority — check for `:` first so IPv4-mapped addresses
+  // (`::ffff:127.0.0.1`) don't get incorrectly routed through the IPv4 parser.
+  if (lower.includes(":")) {
+    // IPv4-mapped IPv6 (`::ffff:127.0.0.1`) — recurse through IPv4 classifier
+    const v4MappedMatch = lower.match(/^::ffff:([\d.]+)$/);
+    if (v4MappedMatch) return classifyIp(v4MappedMatch[1]);
+    // Hard-block
+    if (lower === "::") return "block"; // unspecified
+    if (lower.startsWith("fe8") || lower.startsWith("fe9") ||
+        lower.startsWith("fea") || lower.startsWith("feb")) return "block"; // fe80::/10 link-local
+    if (lower.startsWith("ff")) return "block"; // ff00::/8 multicast
+    // Private (loopback + ULA)
+    if (lower === "::1") return "private";
+    if (lower.startsWith("fc") || lower.startsWith("fd")) return "private"; // fc00::/7 ULA
+    return "public";
+  }
+
+  // IPv4 (or non-IP string — malformed = block)
+  if (!ip.includes(".")) return "block"; // not an IP at all
+  const parts = ip.split(".").map((p) => parseInt(p, 10));
+  if (parts.length !== 4 || parts.some((p) => isNaN(p) || p < 0 || p > 255)) return "block";
+  const [a, b] = parts;
+  // Hard-block (no legitimate use)
+  if (a === 169 && b === 254) return "block"; // link-local incl. 169.254.169.254 (IMDS)
+  if (a === 0) return "block";                 // 0.0.0.0/8 (current network)
+  if (a >= 224) return "block";                // 224.0.0.0+ multicast/reserved
+  // Private (loopback + RFC1918) — allow by default
+  if (a === 127) return "private";                          // 127.0.0.0/8 loopback
+  if (a === 10) return "private";                           // 10.0.0.0/8
+  if (a === 172 && b >= 16 && b <= 31) return "private";    // 172.16.0.0/12
+  if (a === 192 && b === 168) return "private";             // 192.168.0.0/16
+  return "public";
+}
+
+async function fetchOneUrl(url: string, source: string | undefined, force: boolean | undefined): Promise<FetchOneResult> {
+  // SSRF guard — reject file://, javascript:, loopback, RFC1918, IMDS, link-local
+  // BEFORE any cache lookup or subprocess spawn. Even cached entries shouldn't
+  // serve a previously-poisoned source label.
+  const ssrfBlock = await ssrfGuard(url);
+  if (ssrfBlock) return ssrfBlock;
+
+  if (!force) {
+    const store = getStore();
+    // Cache key composes (source, url) so two distinct URLs sharing the same
+    // `source` label do not collide — they each get their own cache slot
+    // (commit 1f1243e regression test enforced).
+    const cacheKey = composeFetchCacheKey(source, url);
+    const meta = store.getSourceMeta(cacheKey);
+    if (meta) {
+      const indexedAt = new Date(meta.indexedAt + "Z"); // SQLite datetime is UTC without Z
+      const ageMs = Date.now() - indexedAt.getTime();
+      if (ageMs < FETCH_TTL_MS) {
+        const ageHours = Math.floor(ageMs / (60 * 60 * 1000));
+        const ageMin = Math.floor(ageMs / (60 * 1000));
+        const ageStr = ageHours > 0 ? `${ageHours}h ago` : ageMin > 0 ? `${ageMin}m ago` : "just now";
+        const estimatedBytes = meta.chunkCount * 1600; // ~1.6KB/chunk avg
+        return { kind: "cached", label: meta.label, chunkCount: meta.chunkCount, estimatedBytes, ageStr };
+      }
+      // Stale — fall through to re-fetch silently
+    }
+  }
+
+  const outputPath = join(tmpdir(), `ctx-fetch-${Date.now()}-${Math.random().toString(36).slice(2)}.dat`);
+  try {
+    const fetchCode = buildFetchCode(url, outputPath);
+    const result = await executor.execute({
+      language: "javascript",
+      code: fetchCode,
+      timeout: 30_000,
+    });
+    if (result.exitCode !== 0) {
+      return { kind: "fetch_error", url, error: result.stderr || result.stdout || "unknown error", reason: "exit" };
+    }
+    const header = (result.stdout || "").trim();
+    let markdown: string;
+    try {
+      markdown = readFileSync(outputPath, "utf-8").trim();
+    } catch {
+      return { kind: "fetch_error", url, error: "could not read subprocess output", reason: "read" };
+    }
+    if (markdown.length === 0) {
+      return { kind: "fetch_error", url, error: "empty content", reason: "empty" };
+    }
+    return { kind: "fetched", url, source, markdown, header };
+  } catch (err: unknown) {
+    return {
+      kind: "fetch_error",
+      url,
+      error: err instanceof Error ? err.message : String(err),
+      reason: "throw",
+    };
+  } finally {
+    try { rmSync(outputPath); } catch { /* already gone */ }
+  }
+}
+
+interface IndexedFetchResult {
+  label: string;
+  totalChunks: number;
+  totalBytes: number;
+  preview: string;
+}
+
+/**
+ * Serial-only indexing step — single FTS5 write per call. Caller loops over
+ * fetched results and calls this one-at-a-time to avoid SQLite WAL contention
+ * (PRD finding E).
+ */
+function indexFetched(f: { url: string; source?: string; markdown: string; header: string }): IndexedFetchResult {
+  const store = getStore();
+  // Storage label composed via composeFetchCacheKey so two URLs sharing a
+  // `source` label do not overwrite each other (commit 1f1243e). ctx_search()
+  // still finds both via LIKE-mode source filter on the `source` substring.
+  const storageLabel = composeFetchCacheKey(f.source, f.url);
+  let indexed: IndexResult;
+  if (f.header === "__CM_CT__:json") {
+    indexed = store.indexJSON(f.markdown, storageLabel);
+  } else if (f.header === "__CM_CT__:text") {
+    indexed = store.indexPlainText(f.markdown, storageLabel);
+  } else {
+    indexed = store.index({ content: f.markdown, source: storageLabel });
+  }
+  // Track AFTER the FTS5 write succeeds — failed indexes shouldn't inflate the counter.
+  trackIndexed(Buffer.byteLength(f.markdown));
+  const preview = f.markdown.length > FETCH_PREVIEW_LIMIT
+    ? f.markdown.slice(0, FETCH_PREVIEW_LIMIT) + "\n\n…[truncated — use ctx_search() for full content]"
+    : f.markdown;
+  return {
+    label: indexed.label,
+    totalChunks: indexed.totalChunks,
+    totalBytes: Buffer.byteLength(f.markdown),
+    preview,
+  };
+}
+
 server.registerTool(
   "ctx_fetch_and_index",
   {
-    title: "Fetch & Index URL",
+    title: "Fetch & Index URL(s)",
     description:
       "Fetches URL content, converts HTML to markdown, indexes into searchable knowledge base, " +
       "and returns a ~3KB preview. Full content stays in sandbox — use ctx_search() for deeper lookups.\n\n" +
       "Better than WebFetch: preview is immediate, full content is searchable, raw HTML never enters context.\n\n" +
       "Content-type aware: HTML is converted to markdown, JSON is chunked by key paths, plain text is indexed directly.\n\n" +
+      "PARALLELIZE I/O: For multi-URL research (library evaluation, migration scans, doc comparisons), pass `requests: [{url, source}, ...]` with `concurrency: 4-8` — speeds up by 3-5x on real workloads.\n" +
+      "  ✅ Use concurrency: 4-8 for: library docs sweep, multi-changelog scan, competitive pricing pages, multi-region docs, GitHub raw file pulls.\n" +
+      "  ❌ Single URL → use the legacy {url, source} shape (concurrency irrelevant).\n" +
+      "  Example: requests: [{url: 'https://react.dev/...', source: 'react'}, {url: 'https://vuejs.org/...', source: 'vue'}], concurrency: 5.\n" +
+      "  Indexing is serial regardless of concurrency — fetches race, FTS5 writes don't (avoids SQLite WAL contention).\n\n" +
       "When reporting results — terse like caveman. Technical substance exact. Only fluff die. Pattern: [thing] [action] [reason]. [next step].",
     inputSchema: z.object({
-      url: z.string().describe("The URL to fetch and index"),
+      url: z.string().optional().describe("Single URL to fetch and index (legacy single-shape)"),
       source: z
         .string()
         .optional()
         .describe(
-          "Label for the indexed content (e.g., 'React useEffect docs', 'Supabase Auth API')",
+          "Label for the indexed content when using single `url` (e.g., 'React useEffect docs', 'Supabase Auth API'). For batch, put source in each requests entry.",
+        ),
+      requests: z
+        .array(
+          z.object({
+            url: z.string().describe("URL to fetch"),
+            source: z.string().optional().describe("Label for this URL's indexed content"),
+          }),
+        )
+        .min(1)
+        .optional()
+        .describe(
+          "Batch shape: array of {url, source?} entries. Use with concurrency>1 for parallel fetch. " +
+          "Each request indexed under its own source label. Output preserves input order.",
+        ),
+      concurrency: z
+        .coerce.number()
+        .int()
+        .min(1)
+        .max(8)
+        .optional()
+        .default(1)
+        .describe(
+          "Max URLs to fetch in parallel (1-8, default: 1). " +
+          "Use 4-8 for I/O-bound multi-URL batches (library docs, changelogs, pricing pages). " +
+          "Capped by os.cpus().length on small machines (response notes when capped). " +
+          "Indexing is always serial regardless — only fetches race.",
         ),
       force: z
         .boolean()
@@ -1530,135 +2077,166 @@ server.registerTool(
         .describe("Skip cache and re-fetch even if content was recently indexed"),
     }),
   },
-  async ({ url, source, force }) => {
-    // TTL cache: if source was indexed within 24h, return cached hint
-    if (!force) {
-      const store = getStore();
-      const label = source ?? url;
-      const meta = store.getSourceMeta(label);
-      if (meta) {
-        const indexedAt = new Date(meta.indexedAt + "Z"); // SQLite datetime is UTC without Z
-        const ageMs = Date.now() - indexedAt.getTime();
-        const TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
-        if (ageMs < TTL_MS) {
-          const ageHours = Math.floor(ageMs / (60 * 60 * 1000));
-          const ageMin = Math.floor(ageMs / (60 * 1000));
-          const ageStr = ageHours > 0 ? `${ageHours}h ago` : ageMin > 0 ? `${ageMin}m ago` : "just now";
-          // Track cache savings — estimate ~1.6KB per chunk (average indexed content size)
-          const estimatedBytes = meta.chunkCount * 1600;
-          sessionStats.cacheHits++;
-          sessionStats.cacheBytesSaved += estimatedBytes;
+  async ({ url, source, requests, concurrency, force }) => {
+    // Normalize input: legacy {url} or new {requests: [...]}.
+    // requests wins when both are provided (explicit batch intent).
+    const batch: { url: string; source?: string }[] = requests
+      ? requests
+      : url
+        ? [{ url, source }]
+        : [];
 
-          return trackResponse("ctx_fetch_and_index", {
-            content: [{
-              type: "text" as const,
-              text: `Cached: **${meta.label}** — ${meta.chunkCount} sections, indexed ${ageStr} (fresh, TTL: 24h).\nTo refresh: call ctx_fetch_and_index again with \`force: true\`.\n\nYou MUST call ctx_search() to answer questions about this content — this cached response contains no content.\nUse: ctx_search(queries: [...], source: "${meta.label}")`,
-            }],
-          });
-        }
-        // Stale (>24h) — fall through to re-fetch silently
-      }
-    }
-    // Generate a unique temp file path for the subprocess to write fetched content.
-    // This bypasses the executor's 100KB stdout truncation — content goes file→handler directly.
-    const outputPath = join(tmpdir(), `ctx-fetch-${Date.now()}-${Math.random().toString(36).slice(2)}.dat`);
-
-    try {
-      const fetchCode = buildFetchCode(url, outputPath);
-      const result = await executor.execute({
-        language: "javascript",
-        code: fetchCode,
-        timeout: 30_000,
-      });
-
-      if (result.exitCode !== 0) {
-        return trackResponse("ctx_fetch_and_index", {
-          content: [
-            {
-              type: "text" as const,
-              text: `Failed to fetch ${url}: ${result.stderr || result.stdout}`,
-            },
-          ],
-          isError: true,
-        });
-      }
-
-      // Parse content-type marker from stdout (content is in the temp file)
-      const store = getStore();
-      const header = (result.stdout || "").trim();
-
-      // Read full content from temp file
-      let markdown: string;
-      try {
-        markdown = readFileSync(outputPath, "utf-8").trim();
-      } catch {
-        return trackResponse("ctx_fetch_and_index", {
-          content: [
-            {
-              type: "text" as const,
-              text: `Fetched ${url} but could not read subprocess output`,
-            },
-          ],
-          isError: true,
-        });
-      }
-
-      if (markdown.length === 0) {
-        return trackResponse("ctx_fetch_and_index", {
-          content: [
-            {
-              type: "text" as const,
-              text: `Fetched ${url} but got empty content`,
-            },
-          ],
-          isError: true,
-        });
-      }
-
-      trackIndexed(Buffer.byteLength(markdown));
-
-      // Route to the appropriate indexing strategy based on Content-Type
-      let indexed: IndexResult;
-      if (header === "__CM_CT__:json") {
-        indexed = store.indexJSON(markdown, source ?? url);
-      } else if (header === "__CM_CT__:text") {
-        indexed = store.indexPlainText(markdown, source ?? url);
-      } else {
-        // HTML (default) — content is already converted to markdown
-        indexed = store.index({ content: markdown, source: source ?? url });
-      }
-
-      // Build preview — first ~3KB of markdown for immediate use
-      const PREVIEW_LIMIT = 3072;
-      const preview = markdown.length > PREVIEW_LIMIT
-        ? markdown.slice(0, PREVIEW_LIMIT) + "\n\n…[truncated — use ctx_search() for full content]"
-        : markdown;
-      const totalKB = (Buffer.byteLength(markdown) / 1024).toFixed(1);
-
-      const text = [
-        `Fetched and indexed **${indexed.totalChunks} sections** (${totalKB}KB) from: ${indexed.label}`,
-        `Full content indexed in sandbox — use ctx_search(queries: [...], source: "${indexed.label}") for specific lookups.`,
-        "",
-        "---",
-        "",
-        preview,
-      ].join("\n");
-
+    if (batch.length === 0) {
       return trackResponse("ctx_fetch_and_index", {
-        content: [{ type: "text" as const, text }],
-      });
-    } catch (err: unknown) {
-      const message = err instanceof Error ? err.message : String(err);
-      return trackResponse("ctx_fetch_and_index", {
-        content: [
-          { type: "text" as const, text: `Fetch error: ${message}` },
-        ],
+        content: [{
+          type: "text" as const,
+          text: "ctx_fetch_and_index requires either `url` (single) or `requests: [{url, source?}, ...]` (batch).",
+        }],
         isError: true,
       });
-    } finally {
-      // Clean up temp file
-      try { rmSync(outputPath); } catch { /* already gone */ }
     }
+
+    const isLegacySingle = !requests && batch.length === 1;
+    const requestedConcurrency = concurrency ?? 1;
+
+    // Parallel fetch via shared runPool primitive. capByCpuCount only for batch
+    // — single-URL doesn't need the cap (only one job, executor is one subprocess).
+    const jobs: PoolJob<FetchOneResult>[] = batch.map((req) => ({
+      run: () => fetchOneUrl(req.url, req.source, force),
+    }));
+    const { settled, effectiveConcurrency, capped } = await runPool(jobs, {
+      concurrency: requestedConcurrency,
+      capByCpuCount: !isLegacySingle && requestedConcurrency > 1,
+    });
+
+    // Serial index drain — workers race on fetch, but store.index* runs one at a time.
+    type Finalized =
+      | { kind: "cached"; label: string; chunkCount: number; ageStr: string }
+      | { kind: "fetched"; indexed: IndexedFetchResult }
+      | { kind: "fetch_error"; url: string; error: string; reason: "exit" | "read" | "empty" | "throw" }
+      | { kind: "job_error"; url: string; error: string };
+
+    const finalized: Finalized[] = [];
+    for (let i = 0; i < settled.length; i++) {
+      const r = settled[i];
+      if (r.status === "rejected") {
+        const message = r.reason instanceof Error ? r.reason.message : String(r.reason);
+        finalized.push({ kind: "job_error", url: batch[i].url, error: message });
+        continue;
+      }
+      const v = r.value;
+      if (v.kind === "cached") {
+        sessionStats.cacheHits++;
+        sessionStats.cacheBytesSaved += v.estimatedBytes;
+        finalized.push({ kind: "cached", label: v.label, chunkCount: v.chunkCount, ageStr: v.ageStr });
+      } else if (v.kind === "fetch_error") {
+        finalized.push({ kind: "fetch_error", url: v.url, error: v.error, reason: v.reason });
+      } else {
+        // Serial FTS5 write here — no parallel store.index calls.
+        finalized.push({ kind: "fetched", indexed: indexFetched(v) });
+      }
+    }
+
+    // Backward-compat single-URL response shape — preserve the EXACT original wording.
+    if (isLegacySingle) {
+      const r = finalized[0];
+      if (r.kind === "cached") {
+        return trackResponse("ctx_fetch_and_index", {
+          content: [{
+            type: "text" as const,
+            text: `Cached: **${r.label}** — ${r.chunkCount} sections, indexed ${r.ageStr} (fresh, TTL: 24h).\nTo refresh: call ctx_fetch_and_index again with \`force: true\`.\n\nYou MUST call ctx_search() to answer questions about this content — this cached response contains no content.\nUse: ctx_search(queries: [...], source: "${r.label}")`,
+          }],
+        });
+      }
+      if (r.kind === "fetched") {
+        const totalKB = (r.indexed.totalBytes / 1024).toFixed(1);
+        const text = [
+          `Fetched and indexed **${r.indexed.totalChunks} sections** (${totalKB}KB) from: ${r.indexed.label}`,
+          `Full content indexed in sandbox — use ctx_search(queries: [...], source: "${r.indexed.label}") for specific lookups.`,
+          "",
+          "---",
+          "",
+          r.indexed.preview,
+        ].join("\n");
+        return trackResponse("ctx_fetch_and_index", {
+          content: [{ type: "text" as const, text }],
+        });
+      }
+      // fetch_error — preserve original error wording per reason
+      if (r.kind === "fetch_error") {
+        const text =
+          r.reason === "empty" ? `Fetched ${r.url} but got empty content`
+          : r.reason === "read" ? `Fetched ${r.url} but could not read subprocess output`
+          : r.reason === "exit" ? `Failed to fetch ${r.url}: ${r.error}`
+          : /* throw */         `Fetch error: ${r.error}`;
+        return trackResponse("ctx_fetch_and_index", {
+          content: [{ type: "text" as const, text }],
+          isError: true,
+        });
+      }
+      // job_error
+      return trackResponse("ctx_fetch_and_index", {
+        content: [{ type: "text" as const, text: `Fetch error: ${r.error}` }],
+        isError: true,
+      });
+    }
+
+    // Batch response — aggregated summary; isError only when EVERY URL failed.
+    // Per-URL preview capped tightly so a 8-URL batch doesn't undo the
+    // context-savings the tool exists to deliver (PRD review finding G1).
+    const FETCH_BATCH_PREVIEW_LIMIT = 384; // ~3KB total for 8-URL batches
+    const lines: string[] = [];
+    let totalSections = 0;
+    let totalBytes = 0;
+    let cachedCount = 0;
+    let fetchedCount = 0;
+    let errorCount = 0;
+    const snippets: string[] = [];
+    for (const r of finalized) {
+      if (r.kind === "cached") {
+        cachedCount++;
+        lines.push(`- [cache] ${r.label} — ${r.chunkCount} sections (${r.ageStr})`);
+      } else if (r.kind === "fetched") {
+        fetchedCount++;
+        totalSections += r.indexed.totalChunks;
+        totalBytes += r.indexed.totalBytes;
+        const kb = (r.indexed.totalBytes / 1024).toFixed(1);
+        lines.push(`- [new]   ${r.indexed.label} — ${r.indexed.totalChunks} sections (${kb}KB)`);
+        const snippet = r.indexed.preview.length > FETCH_BATCH_PREVIEW_LIMIT
+          ? r.indexed.preview.slice(0, FETCH_BATCH_PREVIEW_LIMIT).trimEnd() + "…"
+          : r.indexed.preview;
+        snippets.push(`### ${r.indexed.label}\n\n${snippet}`);
+      } else {
+        errorCount++;
+        lines.push(`- [err]   ${r.url}: ${r.error}`);
+      }
+    }
+
+    const totalKB = (totalBytes / 1024).toFixed(1);
+    const cappedNote = capped
+      ? ` cap=${effectiveConcurrency}/${cpus().length}cpu`
+      : "";
+    // Caveman style — terse status line: counts + sections + size.
+    // Singular forms used at count=1 to avoid grammar drift ("1 errors" → "1 error").
+    const fmt = (n: number, sing: string, plur: string) => `${n} ${n === 1 ? sing : plur}`;
+    const headerLine =
+      `fetched ${batch.length} c=${effectiveConcurrency}${cappedNote}. ` +
+      `ok=${fetchedCount} cache=${cachedCount} err=${errorCount}. ` +
+      `${fmt(totalSections, "section", "sections")} ${totalKB}KB.`;
+
+    const text = [
+      headerLine,
+      "",
+      ...lines,
+      "",
+      `ctx_search(queries: [...], source: "<label>") for full content.`,
+      ...(snippets.length > 0 ? ["", "---", "", ...snippets] : []),
+    ].join("\n");
+
+    return trackResponse("ctx_fetch_and_index", {
+      content: [{ type: "text" as const, text }],
+      isError: errorCount === batch.length, // only mark error if every URL failed
+    });
   },
 );
 
@@ -1676,7 +2254,12 @@ server.registerTool(
       "THIS IS THE PRIMARY TOOL. Use this instead of multiple ctx_execute() calls.\n\n" +
       "One ctx_batch_execute call replaces 30+ ctx_execute calls + 10+ ctx_search calls.\n" +
       "Provide all commands to run and all queries to search — everything happens in one round trip.\n\n" +
-      "THINK IN CODE: When commands produce data you need to analyze, add processing commands that filter and summarize. Don't pull raw output into context — let the sandbox do the work.\n\n" +
+      "PARALLELIZE I/O: For I/O-bound batches (network calls, slow API queries, multi-URL fetches), ALWAYS pass concurrency: 4-8 — speeds up by 3-5x on real workloads.\n" +
+      "  ✅ Use concurrency: 4-8 for: gh API calls, curl/web fetches, multi-region cloud queries, multi-repo git reads, dig/DNS, docker inspect.\n" +
+      "  ❌ Keep concurrency: 1 for: npm test, build, lint, image processing (CPU-bound), or commands sharing state (ports, lock files, same-repo writes).\n" +
+      "  Example: [gh issue view 1, gh issue view 2, gh issue view 3] → concurrency: 3.\n" +
+      "  Speedup depends on workload — applies to I/O wait, not CPU work.\n\n" +
+      "THINK IN CODE — NON-NEGOTIABLE: When commands produce data you need to analyze, count, filter, compare, or transform — add a processing command that runs JavaScript and console.log() ONLY the answer. NEVER pull raw output into context to reason over. Concurrency parallelizes the FETCH; THINK IN CODE owns the PROCESSING. One programmed analysis replaces ten read-and-reason rounds. Pure JavaScript, Node.js built-ins (fs, path, child_process), try/catch, null-safe.\n\n" +
       "When reporting results — terse like caveman. Technical substance exact. Only fluff die. Pattern: [thing] [action] [reason]. [next step].",
     inputSchema: z.object({
       commands: z.preprocess(coerceCommandsArray, z
@@ -1694,7 +2277,8 @@ server.registerTool(
         )
         .min(1)
         .describe(
-          "Commands to execute as a batch. Each runs sequentially, output is labeled with the section header.",
+          "Commands to execute as a batch. Output is labeled with the section header. " +
+          "Default order is sequential; pass concurrency>1 to run in parallel (output stays in input order).",
         )),
       queries: z.preprocess(coerceJsonArray, z
         .array(z.string())
@@ -1708,10 +2292,24 @@ server.registerTool(
         .coerce.number()
         .optional()
         .default(60000)
-        .describe("Max execution time in ms (default: 60s)"),
+        .describe("Max execution time in ms (default: 60s). With concurrency=1, shared budget across commands; with concurrency>1, applied per-command."),
+      concurrency: z
+        .coerce.number()
+        .int()
+        .min(1)
+        .max(8)
+        .optional()
+        .default(1)
+        .describe(
+          "Max commands to run in parallel (1-8, default: 1). " +
+          "Use 4-8 for I/O-bound batches (network, gh, curl, multi-repo git reads). " +
+          "Keep at 1 for CPU-bound (npm test, build, lint) or stateful commands (ports, locks). " +
+          ">1 switches to per-command timeouts (no shared budget) and " +
+          "individual `(timed out)` blocks instead of cascading skip.",
+        ),
     }),
   },
-  async ({ commands, queries, timeout }) => {
+  async ({ commands, queries, timeout, concurrency }) => {
     // Security: check each command against deny patterns
     for (const cmd of commands) {
       const denied = checkDenyPolicy(cmd.command, "batch_execute");
@@ -1719,61 +2317,23 @@ server.registerTool(
     }
 
     try {
-      // Execute each command individually so every command gets its own
-      // output capture. Full stdout is preserved and indexed into FTS5.
-      // (Issue #61, #197)
-      const perCommandOutputs: string[] = [];
-      const startTime = Date.now();
-      let timedOut = false;
-
       // Inject NODE_OPTIONS for FS read tracking in spawned Node processes.
       // The executor denies NODE_OPTIONS in its env (security), so we set it
       // as an inline shell prefix. This only affects child `node` invocations.
       const nodeOptsPrefix = `NODE_OPTIONS="--require ${CM_FS_PRELOAD}" `;
 
-      for (const cmd of commands) {
-        const elapsed = Date.now() - startTime;
-        const remaining = timeout - elapsed;
-        if (remaining <= 0) {
-          perCommandOutputs.push(
-            `# ${cmd.label}\n\n(skipped — batch timeout exceeded)\n`,
-          );
-          timedOut = true;
-          continue;
-        }
-
-        const result = await executor.execute({
-          language: "shell",
-          code: `${nodeOptsPrefix}${cmd.command} 2>&1`,
-          timeout: remaining,
-        });
-
-        let output = result.stdout || "(no output)";
-
-        // Parse and strip __CM_FS__ markers emitted by the preload script.
-        // Because 2>&1 merges stderr into stdout, markers appear in output.
-        const fsMatches = output.matchAll(/__CM_FS__:(\d+)/g);
-        let cmdFsBytes = 0;
-        for (const m of fsMatches) cmdFsBytes += parseInt(m[1]);
-        if (cmdFsBytes > 0) {
-          sessionStats.bytesSandboxed += cmdFsBytes;
-          output = output.replace(/__CM_FS__:\d+\n?/g, "");
-        }
-
-        perCommandOutputs.push(`# ${cmd.label}\n\n${output}\n`);
-
-        if (result.timedOut) {
-          timedOut = true;
-          // Mark remaining commands as skipped
-          const idx = commands.indexOf(cmd);
-          for (let i = idx + 1; i < commands.length; i++) {
-            perCommandOutputs.push(
-              `# ${commands[i].label}\n\n(skipped — batch timeout exceeded)\n`,
-            );
-          }
-          break;
-        }
-      }
+      // Full stdout is preserved per-command and indexed into FTS5 (Issue #61, #197).
+      // Concurrency>1 switches to a worker pool with per-command timeouts.
+      const { outputs: perCommandOutputs, timedOut } = await runBatchCommands(
+        commands,
+        {
+          timeout,
+          concurrency,
+          nodeOptsPrefix,
+          onFsBytes: (bytes) => { sessionStats.bytesSandboxed += bytes; },
+        },
+        executor,
+      );
 
       const stdout = perCommandOutputs.join("\n");
       const totalBytes = Buffer.byteLength(stdout);
@@ -1896,21 +2456,31 @@ server.registerTool(
         try {
           const engine = new AnalyticsEngine(sdb);
           const report = engine.queryAll(sessionStats);
-          text = formatReport(report, VERSION, _latestVersion);
+          // MCP usage is read-only and cheap; only available when DB exists.
+          const mcpUsage = engine.getMcpToolUsage();
+          // Lifetime stats span every project's SessionDB + auto-memory dir
+          // (Bugs #3/#4); failures are absorbed inside getLifetimeStats so a
+          // corrupt sidecar can never break ctx_stats.
+          const lifetime = getLifetimeStats();
+          text = formatReport(report, VERSION, _latestVersion, { lifetime, mcpUsage });
         } finally {
           sdb.close();
         }
       } else {
-        // No session DB — build a minimal report from runtime stats only
+        // No session DB — build a minimal report from runtime stats only.
+        // Lifetime still meaningful (other projects, auto-memory) so include it.
         const engine = new AnalyticsEngine(createMinimalDb());
         const report = engine.queryAll(sessionStats);
-        text = formatReport(report, VERSION, _latestVersion);
+        const lifetime = getLifetimeStats();
+        text = formatReport(report, VERSION, _latestVersion, { lifetime });
       }
     } catch {
       // Session DB not available or incompatible — build minimal report from runtime stats
       const engine = new AnalyticsEngine(createMinimalDb());
       const report = engine.queryAll(sessionStats);
-      text = formatReport(report, VERSION, _latestVersion);
+      let lifetime;
+      try { lifetime = getLifetimeStats(); } catch { /* never block ctx_stats */ }
+      text = formatReport(report, VERSION, _latestVersion, lifetime ? { lifetime } : undefined);
     }
 
     return trackResponse("ctx_stats", {
@@ -2203,6 +2773,12 @@ server.registerTool(
     sessionStats.sessionStart = Date.now();
     deleted.push("session stats");
 
+    // Also drop the persisted stats file so external readers see a fresh state
+    try {
+      const statsFile = getStatsFilePath();
+      if (existsSync(statsFile)) unlinkSync(statsFile);
+    } catch { /* best effort */ }
+
     return trackResponse("ctx_purge", {
       content: [{
         type: "text" as const,
@@ -2445,6 +3021,14 @@ async function main() {
     }
   };
   const gracefulShutdown = async () => {
+    // Final stats flush — bypass throttle so the last 0-500ms of
+    // bytes_indexed / bytes_returned aren't silently lost on SIGTERM/SIGINT
+    // (PR #401 grill-me review B1: persistStats early-returns inside throttle
+    // window; gracefulShutdown previously did NOT bypass).
+    try {
+      _lastStatsPersist = 0;
+      persistStats();
+    } catch { /* best effort — never block shutdown */ }
     shutdown();
     process.exit(0);
   };

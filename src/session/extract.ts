@@ -71,8 +71,24 @@ function extractFileAndRule(input: HookInput): SessionEvent[] {
   if (tool_name === "Read") {
     const filePath = String(tool_input["file_path"] ?? "");
 
-    // Rule detection: CLAUDE.md or anything inside a .claude/ directory
-    const isRuleFile = /CLAUDE\.md$|\.claude[\\/]/i.test(filePath);
+    // Rule detection — covers every supported platform's instruction
+    // file convention plus per-user memory directories. Hardcoding here
+    // (instead of dispatching through the adapter) keeps extract.ts
+    // pure / sync / hot-path-safe — the tradeoff is that adding a new
+    // platform requires updating this regex.
+    //
+    //   Filenames: CLAUDE.md, AGENTS.md, AGENTS.override.md, GEMINI.md,
+    //              QWEN.md, KIRO.md, copilot-instructions.md,
+    //              context-mode.mdc
+    //   Directories: .claude/, .codex/memories/, .qwen/memory/,
+    //                .gemini/memory/, .config/<plat>/memory/, .cursor/memory/,
+    //                .github/memory/, .kiro/memory/, etc.
+    const isRuleFile =
+      /(?:CLAUDE|AGENTS(?:\.override)?|GEMINI|QWEN|KIRO)\.md$/i.test(filePath)
+      || /\/copilot-instructions\.md$/i.test(filePath)
+      || /\/context-mode\.mdc$/i.test(filePath)
+      || /\.claude[\\/]/i.test(filePath)
+      || /[\\/]memor(?:y|ies)[\\/][^\\/]+\.md$/i.test(filePath);
     if (isRuleFile) {
       events.push({
         type: "rule",
@@ -494,6 +510,117 @@ function extractMcp(input: HookInput): SessionEvent[] {
 }
 
 /**
+ * Category 27: mcp_tool_call
+ * Records the raw MCP call shape (tool_name + tool_input) so analytics
+ * can compute usage patterns like batch concurrency.
+ *
+ * Distinct from `extractMcp` (category "mcp"), which captures the textual
+ * call+response for FTS5 search. This emits a structured JSON payload
+ * keyed by tool_name + params, capped to ~2KB to keep SQLite rows small.
+ *
+ * Priority 4 (informational) — should not crowd out high-signal events
+ * during FIFO eviction.
+ */
+const MCP_PARAMS_BUDGET_BYTES = 2048;
+
+/**
+ * UTF-8-aware string truncation. Returns the longest prefix of `s` whose
+ * UTF-8 byte length is <= `maxBytes`, never landing mid-multibyte-codepoint.
+ *
+ * Naive `s.slice(0, N)` operates on UTF-16 code units, so a 2KB cap could
+ * either over-shoot (multi-byte codepoints occupy fewer code units than
+ * bytes — e.g. a chunk of CJK / emoji-heavy JSON would silently exceed
+ * the byte budget) or land mid surrogate pair (corrupt JSON downstream).
+ */
+function truncateToBytes(s: string, maxBytes: number): { value: string; truncated: boolean } {
+  if (Buffer.byteLength(s, "utf8") <= maxBytes) return { value: s, truncated: false };
+  const buf = Buffer.from(s, "utf8");
+  // Walk back from maxBytes until the byte starts a fresh codepoint:
+  //   0xxxxxxx → ASCII (start)
+  //   11xxxxxx → start of multi-byte
+  //   10xxxxxx → continuation; keep walking
+  let cut = maxBytes;
+  while (cut > 0 && (buf[cut] & 0xc0) === 0x80) cut--;
+  return { value: buf.subarray(0, cut).toString("utf8"), truncated: true };
+}
+
+/**
+ * Keys whose VALUES must be redacted before persisting tool_input — secrets,
+ * tokens, credentials, signatures. Match is on the LAST path segment of the
+ * key (case-insensitive substring), so `headers.Authorization`, `auth.token`,
+ * `apiKey`, `API_KEY`, `password`, `secret`, `cookie`, `set-cookie`, `signature`,
+ * `private_key`, etc. all redact. False-positive risk acceptable — we'd rather
+ * over-redact than ship a Bearer token to SQLite.
+ */
+const SECRET_KEY_PATTERN =
+  /(authorization|auth_token|access_token|refresh_token|bearer|token|secret|password|passwd|pwd|api[-_]?key|apikey|cookie|set-cookie|signature|private[-_]?key|client[-_]?secret|x[-_]?api[-_]?key)/i;
+
+const REDACTED = "[REDACTED]";
+
+/**
+ * Walk an arbitrary JSON-serializable value and return a clone with values
+ * redacted under any key matching SECRET_KEY_PATTERN. Cycle-safe.
+ */
+function redactSecrets(value: unknown, ancestors: WeakSet<object> = new WeakSet()): unknown {
+  if (value == null || typeof value !== "object") return value;
+  // Path-based ancestor check: only flag TRUE cycles, not DAG / shared refs
+  // (e.g., a single `headers` object passed to multiple sub-requests must
+  // be processed at every reference site, not flagged as circular).
+  if (ancestors.has(value as object)) return "[CIRCULAR]";
+  ancestors.add(value as object);
+
+  let out: unknown;
+  if (Array.isArray(value)) {
+    out = value.map((v) => redactSecrets(v, ancestors));
+  } else {
+    const obj: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+      if (SECRET_KEY_PATTERN.test(k)) {
+        obj[k] = REDACTED;
+      } else {
+        obj[k] = redactSecrets(v, ancestors);
+      }
+    }
+    out = obj;
+  }
+
+  ancestors.delete(value as object); // pop ancestor — siblings can re-visit
+  return out;
+}
+
+function extractMcpToolCall(input: HookInput): SessionEvent[] {
+  const { tool_name, tool_input } = input;
+  if (!tool_name.startsWith("mcp__")) return [];
+
+  // Redact secrets BEFORE serialization. Any `tool_input` carrying
+  // `Authorization: Bearer …`, `api_key: "sk-…"`, cookies, signatures, etc.
+  // is masked before it touches SQLite. Over-redaction acceptable — under-
+  // redaction is a credential leak to SessionDB.
+  const redactedInput = redactSecrets(tool_input ?? {});
+
+  // Serialize the redacted shape, then truncate the *string* (not the object)
+  // so the diagnosable shape survives huge payloads.
+  let paramsStr: string;
+  try {
+    paramsStr = JSON.stringify(redactedInput);
+  } catch {
+    paramsStr = "{}";
+  }
+  const { value: cappedStr, truncated } = truncateToBytes(paramsStr, MCP_PARAMS_BUDGET_BYTES);
+
+  const payload = truncated
+    ? `{"tool_name":${JSON.stringify(tool_name)},"params_raw":${JSON.stringify(cappedStr)},"truncated":true}`
+    : `{"tool_name":${JSON.stringify(tool_name)},"params":${cappedStr}}`;
+
+  return [{
+    type: "mcp_tool_call",
+    category: "mcp_tool_call",
+    data: safeString(payload),
+    priority: 4,
+  }];
+}
+
+/**
  * Category 6 (tool-based): decision
  * AskUserQuestion tool — tracks questions posed to user and their answers.
  */
@@ -883,6 +1010,7 @@ export function extractEvents(input: HookInput): SessionEvent[] {
     events.push(...extractSkill(input));
     events.push(...extractSubagent(input));
     events.push(...extractMcp(input));
+    events.push(...extractMcpToolCall(input));
     events.push(...extractDecision(input));
     events.push(...extractConstraint(input));
     events.push(...extractWorktree(input));

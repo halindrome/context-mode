@@ -12,7 +12,7 @@
 import {
   readFileSync,
 } from "node:fs";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 
 import { CopilotBaseAdapter } from "../copilot-base.js";
 import type { CopilotHookInput, CopilotHookModule } from "../copilot-base.js";
@@ -63,6 +63,19 @@ export class JetBrainsCopilotAdapter extends CopilotBaseAdapter {
 
   protected getProjectDir(): string {
     return process.env.IDEA_INITIAL_DIRECTORY || process.env.CLAUDE_PROJECT_DIR || process.cwd();
+  }
+
+  /**
+   * JetBrains Copilot honors .github/copilot-instructions.md per project.
+   * Always returned absolute, resolved against the supplied `projectDir`,
+   * the JetBrains-specific project env vars, or `process.cwd()`.
+   */
+  getConfigDir(projectDir?: string): string {
+    return resolve(projectDir ?? this.getProjectDir(), ".github");
+  }
+
+  getInstructionFiles(): string[] {
+    return ["copilot-instructions.md"];
   }
 
   // ── Diagnostics (doctor) ─────────────────────────────────
