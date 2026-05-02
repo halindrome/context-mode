@@ -5,12 +5,13 @@ import { createRequire } from "node:module";
 import { createHash } from "node:crypto";
 import { existsSync, unlinkSync, readdirSync, readFileSync, writeFileSync, rmSync, mkdirSync, cpSync, statSync, symlinkSync, lstatSync } from "node:fs";
 import { execSync, type ChildProcess } from "node:child_process";
-import { join, dirname, resolve, sep, isAbsolute } from "node:path";
+import { join, dirname, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
-import { homedir, tmpdir } from "node:os";
+import { homedir, tmpdir, cpus } from "node:os";
 import { request as httpsRequest } from "node:https";
 import { z } from "zod";
 import { PolyglotExecutor } from "./executor.js";
+import { runPool, type PoolJob } from "./concurrency/runPool.js";
 import { ContentStore, cleanupStaleDBs, cleanupStaleContentDBs, type SearchResult, type IndexResult } from "./store.js";
 import { composeFetchCacheKey } from "./fetch-cache.js";
 import {
@@ -31,9 +32,8 @@ import { startLifecycleGuard } from "./lifecycle.js";
 import { getWorktreeSuffix, SessionDB } from "./session/db.js";
 import { searchAllSources } from "./search/unified.js";
 import { buildNodeCommand, type HookAdapter } from "./adapters/types.js";
-import { detectPlatform, getSessionDirSegments } from "./adapters/detect.js";
 import { loadDatabase } from "./db-base.js";
-import { AnalyticsEngine, formatReport, getLifetimeStats } from "./session/analytics.js";
+import { AnalyticsEngine, formatReport } from "./session/analytics.js";
 const __pkg_dir = dirname(fileURLToPath(import.meta.url));
 const VERSION: string = (() => {
   for (const rel of ["../package.json", "./package.json"]) {
@@ -69,13 +69,9 @@ server.server.setRequestHandler(ListPromptsRequestSchema, async () => ({ prompts
 server.server.setRequestHandler(ListResourcesRequestSchema, async () => ({ resources: [] }));
 server.server.setRequestHandler(ListResourceTemplatesRequestSchema, async () => ({ resourceTemplates: [] }));
 
-// Pass `getProjectDir` (env cascade) lazily so the executor stays in sync
-// with the same resolver used by ctx_index / resolveProjectPath. Capturing
-// a snapshot at construction would diverge when only CONTEXT_MODE_PROJECT_DIR
-// (or another non-CLAUDE_PROJECT_DIR var) is set — see PR #365.
 const executor = new PolyglotExecutor({
   runtimes,
-  projectRoot: () => getProjectDir(),
+  projectRoot: process.env.CLAUDE_PROJECT_DIR,
 });
 
 // ─────────────────────────────────────────────────────────
@@ -129,28 +125,10 @@ let _insightChild: ChildProcess | null = null;
 
 /**
  * Get the platform-specific sessions directory from the detected adapter.
- *
- * Pre-detection path (race window before MCP `initialize` completes):
- * call `detectPlatform()` (sync, env-var-based) and look up segments via
- * `getSessionDirSegments()` (sync map, no adapter instantiation). This keeps
- * non-Claude platforms from spilling sessions into `~/.claude/`.
- *
- * Last-resort `.claude` fallback only fires if the segments map returns null
- * (e.g., "unknown" PlatformId) or if anything throws.
+ * Falls back to ~/.claude/context-mode/sessions/ before adapter detection.
  */
 function getSessionDir(): string {
   if (_detectedAdapter) return _detectedAdapter.getSessionDir();
-
-  try {
-    const signal = detectPlatform();
-    const segments = getSessionDirSegments(signal.platform);
-    if (segments) {
-      const dir = join(homedir(), ...segments, "context-mode", "sessions");
-      mkdirSync(dir, { recursive: true });
-      return dir;
-    }
-  } catch { /* fall through to default */ }
-
   const dir = join(homedir(), ".claude", "context-mode", "sessions");
   mkdirSync(dir, { recursive: true });
   return dir;
@@ -173,13 +151,8 @@ function getProjectDir(): string {
     || process.env.VSCODE_CWD
     || process.env.OPENCODE_PROJECT_DIR
     || process.env.PI_PROJECT_DIR
-    || process.env.IDEA_INITIAL_DIRECTORY
     || process.env.CONTEXT_MODE_PROJECT_DIR
     || process.cwd();
-}
-
-function resolveProjectPath(filePath: string): string {
-  return isAbsolute(filePath) ? filePath : resolve(getProjectDir(), filePath);
 }
 
 /**
@@ -374,44 +347,7 @@ function trackResponse(toolName: string, response: ToolResult): ToolResult {
   sessionStats.calls[toolName] = (sessionStats.calls[toolName] || 0) + 1;
   sessionStats.bytesReturned[toolName] =
     (sessionStats.bytesReturned[toolName] || 0) + bytes;
-
-  // Persist to SessionDB so counters survive process restart, --continue, upgrade.
-  // Best-effort: never throws, never blocks. Deferred via setImmediate so the
-  // SQLite open/select/update/close (~1-5ms even after worktree-suffix cache)
-  // does not extend the response path on any of macOS / Linux / Windows.
-  setImmediate(() => persistToolCallCounter(toolName, bytes));
-
   return response;
-}
-
-/**
- * Increment the per-session, per-tool counter in SessionDB so ctx_stats
- * keeps showing the right numbers after the server restarts mid-session
- * (e.g. on `npm update -g context-mode` or `claude --continue`).
- *
- * The session_id used is whatever session_meta currently holds as the
- * most recent session — populated by the SessionStart hook.
- */
-function persistToolCallCounter(toolName: string, bytes: number): void {
-  try {
-    const dbHash = hashProjectDir();
-    const worktreeSuffix = getWorktreeSuffix();
-    const sessionDbPath = join(
-      getSessionDir(),
-      `${dbHash}${worktreeSuffix}.db`,
-    );
-    if (!existsSync(sessionDbPath)) return;
-    const sdb = new SessionDB({ dbPath: sessionDbPath });
-    try {
-      const sid = sdb.getLatestSessionId();
-      if (!sid) return;
-      sdb.incrementToolCall(sid, toolName, bytes);
-    } finally {
-      sdb.close();
-    }
-  } catch {
-    // best-effort: counter must never throw
-  }
 }
 
 function trackIndexed(bytes: number): void {
@@ -488,11 +424,7 @@ function checkFilePathDenyPolicy(
   toolName: string,
 ): ToolResult | null {
   try {
-    // Use the canonical getProjectDir() helper so deny-policy enforcement
-    // works on every supported adapter. The previous shortcut skipped the
-    // full env cascade and either failed open on non-Claude hosts or
-    // matched against an unrelated repo's deny rules.
-    const projectDir = getProjectDir();
+    const projectDir = process.env.CLAUDE_PROJECT_DIR ?? process.cwd();
     const denyGlobs = readToolDenyPatterns("Read", projectDir);
     const result = evaluateFilePath(
       filePath,
@@ -758,34 +690,40 @@ export async function runBatchCommands(
     return { outputs, timedOut };
   }
 
-  // Parallel path — per-command timeout, in-flight cap, order preserved by index.
-  const outputs: string[] = new Array(commands.length);
-  let timedOut = false;
-  const cap = Math.min(concurrency, commands.length);
-  let nextIdx = 0;
-
-  async function worker(): Promise<void> {
-    while (true) {
-      const idx = nextIdx++;
-      if (idx >= commands.length) return;
-      const cmd = commands[idx];
+  // Parallel path — delegated to the shared runPool primitive.
+  // Each job returns { output, timedOut }; runPool handles in-flight cap,
+  // throw isolation (Promise.allSettled semantics), and order preservation.
+  const jobs: PoolJob<{ output: string; timedOut: boolean }>[] = commands.map((cmd) => ({
+    run: async () => {
       const result = await executor.execute({
         language: "shell",
         code: `${nodeOptsPrefix}${cmd.command} 2>&1`,
         timeout,
       });
-      if (result.timedOut) {
-        timedOut = true;
-        outputs[idx] = `# ${cmd.label}\n\n(timed out after ${timeout}ms)\n`;
-      } else {
-        outputs[idx] = formatCommandOutput(cmd.label, result.stdout, onFsBytes);
-      }
+      // Always route partial stdout through formatCommandOutput so __CM_FS__
+      // markers are stripped + counted, even when the command timed out.
+      const formatted = formatCommandOutput(cmd.label, result.stdout, onFsBytes);
+      const output = result.timedOut
+        ? formatted.replace(/\n$/, "") + `\n(timed out after ${timeout}ms)\n`
+        : formatted;
+      return { output, timedOut: !!result.timedOut };
+    },
+  }));
+
+  const { settled } = await runPool(jobs, { concurrency });
+  const outputs: string[] = new Array(commands.length);
+  let timedOut = false;
+  for (let i = 0; i < settled.length; i++) {
+    const r = settled[i];
+    if (r.status === "fulfilled") {
+      outputs[i] = r.value.output;
+      if (r.value.timedOut) timedOut = true;
+    } else {
+      // Isolated executor throw (spawn EAGAIN, ENOMEM, EMFILE, …) — siblings keep running.
+      const message = r.reason instanceof Error ? r.reason.message : String(r.reason);
+      outputs[i] = `# ${commands[i].label}\n\n(executor error: ${message})\n`;
     }
   }
-
-  const workers: Promise<void>[] = [];
-  for (let w = 0; w < cap; w++) workers.push(worker());
-  await Promise.all(workers);
   return { outputs, timedOut };
 }
 
@@ -1322,18 +1260,16 @@ server.registerTool(
     }
 
     try {
-      const resolvedPath = path ? resolveProjectPath(path) : undefined;
-
       // Track the raw bytes being indexed (content or file)
       if (content) trackIndexed(Buffer.byteLength(content));
-      else if (resolvedPath) {
+      else if (path) {
         try {
           const fs = await import("fs");
-          trackIndexed(fs.readFileSync(resolvedPath).byteLength);
+          trackIndexed(fs.readFileSync(path).byteLength);
         } catch { /* ignore — file read errors handled by store */ }
       }
       const store = getStore();
-      const result = store.index({ content, path: resolvedPath, source: source ?? resolvedPath });
+      const result = store.index({ content, path, source });
 
       return trackResponse("ctx_index", {
         content: [
@@ -1507,25 +1443,19 @@ server.registerTool(
       let totalSize = 0;
       const sections: string[] = [];
 
-      // Open SessionDB once before the loop (Blocker 4: avoid open/close per query).
-      // The DB filename must match what session-snapshot/session-extract write to,
-      // which is `${hash}${getWorktreeSuffix()}.db` — bug #4 was the missing suffix.
+      // Open SessionDB once before the loop (Blocker 4: avoid open/close per query)
       let timelineDB: InstanceType<typeof SessionDB> | null = null;
       if (sort === "timeline") {
         try {
           const sessionsDir = getSessionDir();
-          const dbFile = join(sessionsDir, `${hashProjectDir()}${getWorktreeSuffix()}.db`);
+          const dbFile = join(sessionsDir, `${hashProjectDir()}.db`);
           if (existsSync(dbFile)) {
             timelineDB = new SessionDB({ dbPath: dbFile });
           }
         } catch { /* SessionDB unavailable — search ContentStore + auto-memory only */ }
       }
 
-      // Adapter-aware config dir. Falls back to CLAUDE_CONFIG_DIR / ~/.claude
-      // only when no platform adapter has been detected (e.g. raw `npx context-mode dev`).
-      const configDir = _detectedAdapter?.getConfigDir()
-        || process.env.CLAUDE_CONFIG_DIR
-        || join(homedir(), ".claude");
+      const configDir = process.env.CLAUDE_CONFIG_DIR || join(homedir(), ".claude");
 
       try {
       for (const q of queryList) {
@@ -1546,7 +1476,6 @@ server.registerTool(
             sessionDB: timelineDB,
             projectDir: getProjectDir(),
             configDir,
-            adapter: _detectedAdapter ?? undefined,
           });
         } else {
           results = store.searchWithFallback(q, effectiveLimit, source, contentType);
@@ -1695,23 +1624,166 @@ main();
 `;
 }
 
+// ─────────────────────────────────────────────────────────
+// fetch_and_index helpers — split into parallel-safe fetch and serial-only index
+// ─────────────────────────────────────────────────────────
+
+const FETCH_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
+const FETCH_PREVIEW_LIMIT = 3072;
+
+type FetchOneResult =
+  | { kind: "cached"; label: string; chunkCount: number; estimatedBytes: number; ageStr: string }
+  | { kind: "fetched"; url: string; source?: string; markdown: string; header: string }
+  | { kind: "fetch_error"; url: string; error: string; reason: "exit" | "read" | "empty" | "throw" };
+
+/**
+ * Pure fetch step — TTL cache check + subprocess fetch. SAFE TO RUN IN PARALLEL.
+ * Performs zero SQLite writes (only reads source meta). Caller must funnel
+ * fetched results through `indexFetched` serially to avoid FTS5 WAL contention.
+ */
+async function fetchOneUrl(url: string, source: string | undefined, force: boolean | undefined): Promise<FetchOneResult> {
+  if (!force) {
+    const store = getStore();
+    // Cache key composes (source, url) so two distinct URLs sharing the same
+    // `source` label do not collide — they each get their own cache slot
+    // (commit 1f1243e regression test enforced).
+    const cacheKey = composeFetchCacheKey(source, url);
+    const meta = store.getSourceMeta(cacheKey);
+    if (meta) {
+      const indexedAt = new Date(meta.indexedAt + "Z"); // SQLite datetime is UTC without Z
+      const ageMs = Date.now() - indexedAt.getTime();
+      if (ageMs < FETCH_TTL_MS) {
+        const ageHours = Math.floor(ageMs / (60 * 60 * 1000));
+        const ageMin = Math.floor(ageMs / (60 * 1000));
+        const ageStr = ageHours > 0 ? `${ageHours}h ago` : ageMin > 0 ? `${ageMin}m ago` : "just now";
+        const estimatedBytes = meta.chunkCount * 1600; // ~1.6KB/chunk avg
+        return { kind: "cached", label: meta.label, chunkCount: meta.chunkCount, estimatedBytes, ageStr };
+      }
+      // Stale — fall through to re-fetch silently
+    }
+  }
+
+  const outputPath = join(tmpdir(), `ctx-fetch-${Date.now()}-${Math.random().toString(36).slice(2)}.dat`);
+  try {
+    const fetchCode = buildFetchCode(url, outputPath);
+    const result = await executor.execute({
+      language: "javascript",
+      code: fetchCode,
+      timeout: 30_000,
+    });
+    if (result.exitCode !== 0) {
+      return { kind: "fetch_error", url, error: result.stderr || result.stdout || "unknown error", reason: "exit" };
+    }
+    const header = (result.stdout || "").trim();
+    let markdown: string;
+    try {
+      markdown = readFileSync(outputPath, "utf-8").trim();
+    } catch {
+      return { kind: "fetch_error", url, error: "could not read subprocess output", reason: "read" };
+    }
+    if (markdown.length === 0) {
+      return { kind: "fetch_error", url, error: "empty content", reason: "empty" };
+    }
+    return { kind: "fetched", url, source, markdown, header };
+  } catch (err: unknown) {
+    return {
+      kind: "fetch_error",
+      url,
+      error: err instanceof Error ? err.message : String(err),
+      reason: "throw",
+    };
+  } finally {
+    try { rmSync(outputPath); } catch { /* already gone */ }
+  }
+}
+
+interface IndexedFetchResult {
+  label: string;
+  totalChunks: number;
+  totalBytes: number;
+  preview: string;
+}
+
+/**
+ * Serial-only indexing step — single FTS5 write per call. Caller loops over
+ * fetched results and calls this one-at-a-time to avoid SQLite WAL contention
+ * (PRD finding E).
+ */
+function indexFetched(f: { url: string; source?: string; markdown: string; header: string }): IndexedFetchResult {
+  const store = getStore();
+  // Storage label composed via composeFetchCacheKey so two URLs sharing a
+  // `source` label do not overwrite each other (commit 1f1243e). ctx_search()
+  // still finds both via LIKE-mode source filter on the `source` substring.
+  const storageLabel = composeFetchCacheKey(f.source, f.url);
+  let indexed: IndexResult;
+  if (f.header === "__CM_CT__:json") {
+    indexed = store.indexJSON(f.markdown, storageLabel);
+  } else if (f.header === "__CM_CT__:text") {
+    indexed = store.indexPlainText(f.markdown, storageLabel);
+  } else {
+    indexed = store.index({ content: f.markdown, source: storageLabel });
+  }
+  // Track AFTER the FTS5 write succeeds — failed indexes shouldn't inflate the counter.
+  trackIndexed(Buffer.byteLength(f.markdown));
+  const preview = f.markdown.length > FETCH_PREVIEW_LIMIT
+    ? f.markdown.slice(0, FETCH_PREVIEW_LIMIT) + "\n\n…[truncated — use ctx_search() for full content]"
+    : f.markdown;
+  return {
+    label: indexed.label,
+    totalChunks: indexed.totalChunks,
+    totalBytes: Buffer.byteLength(f.markdown),
+    preview,
+  };
+}
+
 server.registerTool(
   "ctx_fetch_and_index",
   {
-    title: "Fetch & Index URL",
+    title: "Fetch & Index URL(s)",
     description:
       "Fetches URL content, converts HTML to markdown, indexes into searchable knowledge base, " +
       "and returns a ~3KB preview. Full content stays in sandbox — use ctx_search() for deeper lookups.\n\n" +
       "Better than WebFetch: preview is immediate, full content is searchable, raw HTML never enters context.\n\n" +
       "Content-type aware: HTML is converted to markdown, JSON is chunked by key paths, plain text is indexed directly.\n\n" +
+      "PARALLELIZE I/O: For multi-URL research (library evaluation, migration scans, doc comparisons), pass `requests: [{url, source}, ...]` with `concurrency: 4-8` — speeds up by 3-5x on real workloads.\n" +
+      "  ✅ Use concurrency: 4-8 for: library docs sweep, multi-changelog scan, competitive pricing pages, multi-region docs, GitHub raw file pulls.\n" +
+      "  ❌ Single URL → use the legacy {url, source} shape (concurrency irrelevant).\n" +
+      "  Example: requests: [{url: 'https://react.dev/...', source: 'react'}, {url: 'https://vuejs.org/...', source: 'vue'}], concurrency: 5.\n" +
+      "  Indexing is serial regardless of concurrency — fetches race, FTS5 writes don't (avoids SQLite WAL contention).\n\n" +
       "When reporting results — terse like caveman. Technical substance exact. Only fluff die. Pattern: [thing] [action] [reason]. [next step].",
     inputSchema: z.object({
-      url: z.string().describe("The URL to fetch and index"),
+      url: z.string().optional().describe("Single URL to fetch and index (legacy single-shape)"),
       source: z
         .string()
         .optional()
         .describe(
-          "Label for the indexed content (e.g., 'React useEffect docs', 'Supabase Auth API')",
+          "Label for the indexed content when using single `url` (e.g., 'React useEffect docs', 'Supabase Auth API'). For batch, put source in each requests entry.",
+        ),
+      requests: z
+        .array(
+          z.object({
+            url: z.string().describe("URL to fetch"),
+            source: z.string().optional().describe("Label for this URL's indexed content"),
+          }),
+        )
+        .min(1)
+        .optional()
+        .describe(
+          "Batch shape: array of {url, source?} entries. Use with concurrency>1 for parallel fetch. " +
+          "Each request indexed under its own source label. Output preserves input order.",
+        ),
+      concurrency: z
+        .coerce.number()
+        .int()
+        .min(1)
+        .max(8)
+        .optional()
+        .default(1)
+        .describe(
+          "Max URLs to fetch in parallel (1-8, default: 1). " +
+          "Use 4-8 for I/O-bound multi-URL batches (library docs, changelogs, pricing pages). " +
+          "Capped by os.cpus().length on small machines (response notes when capped). " +
+          "Indexing is always serial regardless — only fetches race.",
         ),
       force: z
         .boolean()
@@ -1719,141 +1791,166 @@ server.registerTool(
         .describe("Skip cache and re-fetch even if content was recently indexed"),
     }),
   },
-  async ({ url, source, force }) => {
-    // TTL cache: if source was indexed within 24h, return cached hint.
-    // Cache key composes (source, url) so two distinct URLs sharing the same
-    // `source` label do not collide — they each get their own cache slot.
-    if (!force) {
-      const store = getStore();
-      const cacheKey = composeFetchCacheKey(source, url);
-      const meta = store.getSourceMeta(cacheKey);
-      if (meta) {
-        const indexedAt = new Date(meta.indexedAt + "Z"); // SQLite datetime is UTC without Z
-        const ageMs = Date.now() - indexedAt.getTime();
-        const TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
-        if (ageMs < TTL_MS) {
-          const ageHours = Math.floor(ageMs / (60 * 60 * 1000));
-          const ageMin = Math.floor(ageMs / (60 * 1000));
-          const ageStr = ageHours > 0 ? `${ageHours}h ago` : ageMin > 0 ? `${ageMin}m ago` : "just now";
-          // Track cache savings — estimate ~1.6KB per chunk (average indexed content size)
-          const estimatedBytes = meta.chunkCount * 1600;
-          sessionStats.cacheHits++;
-          sessionStats.cacheBytesSaved += estimatedBytes;
+  async ({ url, source, requests, concurrency, force }) => {
+    // Normalize input: legacy {url} or new {requests: [...]}.
+    // requests wins when both are provided (explicit batch intent).
+    const batch: { url: string; source?: string }[] = requests
+      ? requests
+      : url
+        ? [{ url, source }]
+        : [];
 
-          return trackResponse("ctx_fetch_and_index", {
-            content: [{
-              type: "text" as const,
-              text: `Cached: **${meta.label}** — ${meta.chunkCount} sections, indexed ${ageStr} (fresh, TTL: 24h).\nTo refresh: call ctx_fetch_and_index again with \`force: true\`.\n\nYou MUST call ctx_search() to answer questions about this content — this cached response contains no content.\nUse: ctx_search(queries: [...], source: "${meta.label}")`,
-            }],
-          });
-        }
-        // Stale (>24h) — fall through to re-fetch silently
-      }
-    }
-    // Generate a unique temp file path for the subprocess to write fetched content.
-    // This bypasses the executor's 100KB stdout truncation — content goes file→handler directly.
-    const outputPath = join(tmpdir(), `ctx-fetch-${Date.now()}-${Math.random().toString(36).slice(2)}.dat`);
-
-    try {
-      const fetchCode = buildFetchCode(url, outputPath);
-      const result = await executor.execute({
-        language: "javascript",
-        code: fetchCode,
-        timeout: 30_000,
-      });
-
-      if (result.exitCode !== 0) {
-        return trackResponse("ctx_fetch_and_index", {
-          content: [
-            {
-              type: "text" as const,
-              text: `Failed to fetch ${url}: ${result.stderr || result.stdout}`,
-            },
-          ],
-          isError: true,
-        });
-      }
-
-      // Parse content-type marker from stdout (content is in the temp file)
-      const store = getStore();
-      const header = (result.stdout || "").trim();
-
-      // Read full content from temp file
-      let markdown: string;
-      try {
-        markdown = readFileSync(outputPath, "utf-8").trim();
-      } catch {
-        return trackResponse("ctx_fetch_and_index", {
-          content: [
-            {
-              type: "text" as const,
-              text: `Fetched ${url} but could not read subprocess output`,
-            },
-          ],
-          isError: true,
-        });
-      }
-
-      if (markdown.length === 0) {
-        return trackResponse("ctx_fetch_and_index", {
-          content: [
-            {
-              type: "text" as const,
-              text: `Fetched ${url} but got empty content`,
-            },
-          ],
-          isError: true,
-        });
-      }
-
-      trackIndexed(Buffer.byteLength(markdown));
-
-      // Route to the appropriate indexing strategy based on Content-Type.
-      // Storage label includes URL via composeFetchCacheKey so two URLs sharing
-      // a `source` label do not overwrite each other; ctx_search() still finds
-      // both via LIKE-mode source filter on the `source` substring.
-      const storageLabel = composeFetchCacheKey(source, url);
-      let indexed: IndexResult;
-      if (header === "__CM_CT__:json") {
-        indexed = store.indexJSON(markdown, storageLabel);
-      } else if (header === "__CM_CT__:text") {
-        indexed = store.indexPlainText(markdown, storageLabel);
-      } else {
-        // HTML (default) — content is already converted to markdown
-        indexed = store.index({ content: markdown, source: storageLabel });
-      }
-
-      // Build preview — first ~3KB of markdown for immediate use
-      const PREVIEW_LIMIT = 3072;
-      const preview = markdown.length > PREVIEW_LIMIT
-        ? markdown.slice(0, PREVIEW_LIMIT) + "\n\n…[truncated — use ctx_search() for full content]"
-        : markdown;
-      const totalKB = (Buffer.byteLength(markdown) / 1024).toFixed(1);
-
-      const text = [
-        `Fetched and indexed **${indexed.totalChunks} sections** (${totalKB}KB) from: ${indexed.label}`,
-        `Full content indexed in sandbox — use ctx_search(queries: [...], source: "${indexed.label}") for specific lookups.`,
-        "",
-        "---",
-        "",
-        preview,
-      ].join("\n");
-
+    if (batch.length === 0) {
       return trackResponse("ctx_fetch_and_index", {
-        content: [{ type: "text" as const, text }],
-      });
-    } catch (err: unknown) {
-      const message = err instanceof Error ? err.message : String(err);
-      return trackResponse("ctx_fetch_and_index", {
-        content: [
-          { type: "text" as const, text: `Fetch error: ${message}` },
-        ],
+        content: [{
+          type: "text" as const,
+          text: "ctx_fetch_and_index requires either `url` (single) or `requests: [{url, source?}, ...]` (batch).",
+        }],
         isError: true,
       });
-    } finally {
-      // Clean up temp file
-      try { rmSync(outputPath); } catch { /* already gone */ }
     }
+
+    const isLegacySingle = !requests && batch.length === 1;
+    const requestedConcurrency = concurrency ?? 1;
+
+    // Parallel fetch via shared runPool primitive. capByCpuCount only for batch
+    // — single-URL doesn't need the cap (only one job, executor is one subprocess).
+    const jobs: PoolJob<FetchOneResult>[] = batch.map((req) => ({
+      run: () => fetchOneUrl(req.url, req.source, force),
+    }));
+    const { settled, effectiveConcurrency, capped } = await runPool(jobs, {
+      concurrency: requestedConcurrency,
+      capByCpuCount: !isLegacySingle && requestedConcurrency > 1,
+    });
+
+    // Serial index drain — workers race on fetch, but store.index* runs one at a time.
+    type Finalized =
+      | { kind: "cached"; label: string; chunkCount: number; ageStr: string }
+      | { kind: "fetched"; indexed: IndexedFetchResult }
+      | { kind: "fetch_error"; url: string; error: string; reason: "exit" | "read" | "empty" | "throw" }
+      | { kind: "job_error"; url: string; error: string };
+
+    const finalized: Finalized[] = [];
+    for (let i = 0; i < settled.length; i++) {
+      const r = settled[i];
+      if (r.status === "rejected") {
+        const message = r.reason instanceof Error ? r.reason.message : String(r.reason);
+        finalized.push({ kind: "job_error", url: batch[i].url, error: message });
+        continue;
+      }
+      const v = r.value;
+      if (v.kind === "cached") {
+        sessionStats.cacheHits++;
+        sessionStats.cacheBytesSaved += v.estimatedBytes;
+        finalized.push({ kind: "cached", label: v.label, chunkCount: v.chunkCount, ageStr: v.ageStr });
+      } else if (v.kind === "fetch_error") {
+        finalized.push({ kind: "fetch_error", url: v.url, error: v.error, reason: v.reason });
+      } else {
+        // Serial FTS5 write here — no parallel store.index calls.
+        finalized.push({ kind: "fetched", indexed: indexFetched(v) });
+      }
+    }
+
+    // Backward-compat single-URL response shape — preserve the EXACT original wording.
+    if (isLegacySingle) {
+      const r = finalized[0];
+      if (r.kind === "cached") {
+        return trackResponse("ctx_fetch_and_index", {
+          content: [{
+            type: "text" as const,
+            text: `Cached: **${r.label}** — ${r.chunkCount} sections, indexed ${r.ageStr} (fresh, TTL: 24h).\nTo refresh: call ctx_fetch_and_index again with \`force: true\`.\n\nYou MUST call ctx_search() to answer questions about this content — this cached response contains no content.\nUse: ctx_search(queries: [...], source: "${r.label}")`,
+          }],
+        });
+      }
+      if (r.kind === "fetched") {
+        const totalKB = (r.indexed.totalBytes / 1024).toFixed(1);
+        const text = [
+          `Fetched and indexed **${r.indexed.totalChunks} sections** (${totalKB}KB) from: ${r.indexed.label}`,
+          `Full content indexed in sandbox — use ctx_search(queries: [...], source: "${r.indexed.label}") for specific lookups.`,
+          "",
+          "---",
+          "",
+          r.indexed.preview,
+        ].join("\n");
+        return trackResponse("ctx_fetch_and_index", {
+          content: [{ type: "text" as const, text }],
+        });
+      }
+      // fetch_error — preserve original error wording per reason
+      if (r.kind === "fetch_error") {
+        const text =
+          r.reason === "empty" ? `Fetched ${r.url} but got empty content`
+          : r.reason === "read" ? `Fetched ${r.url} but could not read subprocess output`
+          : r.reason === "exit" ? `Failed to fetch ${r.url}: ${r.error}`
+          : /* throw */         `Fetch error: ${r.error}`;
+        return trackResponse("ctx_fetch_and_index", {
+          content: [{ type: "text" as const, text }],
+          isError: true,
+        });
+      }
+      // job_error
+      return trackResponse("ctx_fetch_and_index", {
+        content: [{ type: "text" as const, text: `Fetch error: ${r.error}` }],
+        isError: true,
+      });
+    }
+
+    // Batch response — aggregated summary; isError only when EVERY URL failed.
+    // Per-URL preview capped tightly so a 8-URL batch doesn't undo the
+    // context-savings the tool exists to deliver (PRD review finding G1).
+    const FETCH_BATCH_PREVIEW_LIMIT = 384; // ~3KB total for 8-URL batches
+    const lines: string[] = [];
+    let totalSections = 0;
+    let totalBytes = 0;
+    let cachedCount = 0;
+    let fetchedCount = 0;
+    let errorCount = 0;
+    const snippets: string[] = [];
+    for (const r of finalized) {
+      if (r.kind === "cached") {
+        cachedCount++;
+        lines.push(`- [cache] ${r.label} — ${r.chunkCount} sections (${r.ageStr})`);
+      } else if (r.kind === "fetched") {
+        fetchedCount++;
+        totalSections += r.indexed.totalChunks;
+        totalBytes += r.indexed.totalBytes;
+        const kb = (r.indexed.totalBytes / 1024).toFixed(1);
+        lines.push(`- [new]   ${r.indexed.label} — ${r.indexed.totalChunks} sections (${kb}KB)`);
+        const snippet = r.indexed.preview.length > FETCH_BATCH_PREVIEW_LIMIT
+          ? r.indexed.preview.slice(0, FETCH_BATCH_PREVIEW_LIMIT).trimEnd() + "…"
+          : r.indexed.preview;
+        snippets.push(`### ${r.indexed.label}\n\n${snippet}`);
+      } else {
+        errorCount++;
+        lines.push(`- [err]   ${r.url}: ${r.error}`);
+      }
+    }
+
+    const totalKB = (totalBytes / 1024).toFixed(1);
+    const cappedNote = capped
+      ? ` cap=${effectiveConcurrency}/${cpus().length}cpu`
+      : "";
+    // Caveman style — terse status line: counts + sections + size.
+    // Singular forms used at count=1 to avoid grammar drift ("1 errors" → "1 error").
+    const fmt = (n: number, sing: string, plur: string) => `${n} ${n === 1 ? sing : plur}`;
+    const headerLine =
+      `fetched ${batch.length} c=${effectiveConcurrency}${cappedNote}. ` +
+      `ok=${fetchedCount} cache=${cachedCount} err=${errorCount}. ` +
+      `${fmt(totalSections, "section", "sections")} ${totalKB}KB.`;
+
+    const text = [
+      headerLine,
+      "",
+      ...lines,
+      "",
+      `ctx_search(queries: [...], source: "<label>") for full content.`,
+      ...(snippets.length > 0 ? ["", "---", "", ...snippets] : []),
+    ].join("\n");
+
+    return trackResponse("ctx_fetch_and_index", {
+      content: [{ type: "text" as const, text }],
+      isError: errorCount === batch.length, // only mark error if every URL failed
+    });
   },
 );
 
@@ -2059,12 +2156,6 @@ server.registerTool(
   async () => {
     // ONE call, ONE source — AnalyticsEngine.queryAll()
     let text: string;
-    // Lifetime stats (across all SessionDBs + auto-memory) — best-effort.
-    let lifetime;
-    try {
-      lifetime = getLifetimeStats({ sessionsDir: getSessionDir() });
-    } catch { /* ignore — formatReport tolerates undefined */ }
-
     try {
       const dbHash = hashProjectDir();
       const worktreeSuffix = getWorktreeSuffix();
@@ -2079,7 +2170,9 @@ server.registerTool(
         try {
           const engine = new AnalyticsEngine(sdb);
           const report = engine.queryAll(sessionStats);
-          text = formatReport(report, VERSION, _latestVersion, { lifetime });
+          // MCP usage is read-only and cheap; only available when DB exists.
+          const mcpUsage = engine.getMcpToolUsage();
+          text = formatReport(report, VERSION, _latestVersion, mcpUsage);
         } finally {
           sdb.close();
         }
@@ -2087,13 +2180,13 @@ server.registerTool(
         // No session DB — build a minimal report from runtime stats only
         const engine = new AnalyticsEngine(createMinimalDb());
         const report = engine.queryAll(sessionStats);
-        text = formatReport(report, VERSION, _latestVersion, { lifetime });
+        text = formatReport(report, VERSION, _latestVersion);
       }
     } catch {
       // Session DB not available or incompatible — build minimal report from runtime stats
       const engine = new AnalyticsEngine(createMinimalDb());
       const report = engine.queryAll(sessionStats);
-      text = formatReport(report, VERSION, _latestVersion, { lifetime });
+      text = formatReport(report, VERSION, _latestVersion);
     }
 
     return trackResponse("ctx_stats", {
@@ -2407,23 +2500,15 @@ server.registerTool(
       "First run installs dependencies (~30s). Subsequent runs open instantly.",
     inputSchema: z.object({
       port: z.coerce.number().optional().describe("Port to serve on (default: 4747)"),
-      sessionDir: z.string().optional().describe("Override INSIGHT_SESSION_DIR: directory containing context-mode session .db files"),
-      contentDir: z.string().optional().describe("Override INSIGHT_CONTENT_DIR: directory containing context-mode content/index .db files"),
-      insightSessionDir: z.string().optional().describe("Alias for sessionDir / INSIGHT_SESSION_DIR"),
-      insightContentDir: z.string().optional().describe("Alias for contentDir / INSIGHT_CONTENT_DIR"),
     }),
   },
-  async ({ port: userPort, sessionDir, contentDir: inputContentDir, insightSessionDir, insightContentDir }) => {
+  async ({ port: userPort }) => {
     const port = userPort || 4747;
-    const userSessionDir = sessionDir || insightSessionDir;
-    const userContentDir = inputContentDir || insightContentDir;
     // __pkg_dir is build/ for tsc, plugin root for bundle — resolve to plugin root
     const pluginRoot = existsSync(resolve(__pkg_dir, "package.json")) ? __pkg_dir : dirname(__pkg_dir);
     const insightSource = resolve(pluginRoot, "insight");
-    // Use adapter-aware path by default, with explicit overrides for hosts whose
-    // MCP adapter/session DB lives outside the detected default path.
-    const sessDir = userSessionDir ? resolve(userSessionDir) : getSessionDir();
-    const contentDir = userContentDir ? resolve(userContentDir) : join(dirname(sessDir), "content");
+    // Use adapter-aware path: derive from sessions dir (works across all 12 adapters)
+    const sessDir = getSessionDir();
     const cacheDir = join(dirname(sessDir), "insight-cache");
 
     // Verify source exists
@@ -2502,10 +2587,9 @@ server.registerTool(
         // Port is free, proceed with spawn
       }
 
-      if (portOccupied && (sourceUpdated || userSessionDir || userContentDir)) {
-        // Source or data-dir configuration changed while a server is already running —
-        // kill it so fresh code/env runs.
-        steps.push(sourceUpdated ? "Killing stale dashboard server (source updated)..." : "Killing existing dashboard server (data dir override)...");
+      if (portOccupied && sourceUpdated) {
+        // Source was updated but stale server is running on port — kill it so fresh code runs
+        steps.push("Killing stale dashboard server (source updated)...");
         try {
           if (process.platform === "win32") {
             execSync(`for /f "tokens=5" %a in ('netstat -ano ^| findstr :${port}') do taskkill /F /PID %a`, { stdio: "pipe" });
@@ -2545,8 +2629,8 @@ server.registerTool(
         env: {
           ...process.env,
           PORT: String(port),
-          INSIGHT_SESSION_DIR: sessDir,
-          INSIGHT_CONTENT_DIR: contentDir,
+          INSIGHT_SESSION_DIR: getSessionDir(),
+          INSIGHT_CONTENT_DIR: join(dirname(getSessionDir()), "content"),
           INSIGHT_PARENT_PID: String(process.pid),
         },
         detached: true,
@@ -2590,8 +2674,6 @@ server.registerTool(
         else execSync(`xdg-open "${url}" 2>/dev/null || sensible-browser "${url}" 2>/dev/null`, { stdio: "pipe" });
       } catch { /* browser open is best-effort */ }
 
-      if (userSessionDir) steps.push(`Session dir: ${sessDir}`);
-      if (userContentDir) steps.push(`Content dir: ${contentDir}`);
       steps.push(`Dashboard running at ${url}`);
 
       return trackResponse("ctx_insight", {
