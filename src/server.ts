@@ -1219,7 +1219,7 @@ server.registerTool(
         } catch { /* ignore — file read errors handled by store */ }
       }
       const store = getStore();
-      const result = store.index({ content, path: resolvedPath, source: source ?? path });
+      const result = store.index({ content, path: resolvedPath, source: source ?? resolvedPath });
 
       return trackResponse("ctx_index", {
         content: [

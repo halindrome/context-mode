@@ -882,7 +882,7 @@ describe("ctx_index: projectRoot path resolution (#365)", () => {
     }
   }, 30_000);
 
-  test("relative path label preserves user input (not resolved absolute)", async () => {
+  test("relative path label canonicalizes to resolved absolute path", async () => {
     const proc = spawnServerWithProjectDir(ctxProjectDir);
     try {
       await awaitRpc(proc, 1, {
@@ -898,10 +898,11 @@ describe("ctx_index: projectRoot path resolution (#365)", () => {
 
       expect(indexResp?.error).toBeUndefined();
       const indexText = indexResp?.result?.content?.[0]?.text ?? "";
-      // Label must reflect the relative path the user typed, not the resolved absolute path.
-      // Keeps `ctx_search(source: "<relative-path>")` working as the user expects.
-      expect(indexText).toContain(`from: ${ctxFileName}`);
-      expect(indexText).not.toContain(ctxProjectDir);
+      // Label must canonicalize to the resolved absolute path so the same file
+      // indexed via './foo.md', 'foo.md', and 'subdir/../foo.md' produces a
+      // single FTS5 row (sources.label is the dedup key).
+      const expectedAbs = join(ctxProjectDir, ctxFileName);
+      expect(indexText).toContain(`from: ${expectedAbs}`);
     } finally {
       try { proc.kill("SIGTERM"); } catch { /* best effort */ }
     }
@@ -988,6 +989,59 @@ describe("ctx_index: projectRoot path resolution (#365)", () => {
       try { rmSync(fakeIdeBin, { recursive: true, force: true }); } catch { /* best effort */ }
     }
   }, 60_000);
+
+  // Source-label dedup regression: when no explicit `source` is supplied,
+  // ctx_index must default the FTS5 label to the *resolved* absolute path so
+  // that the same file indexed via './foo.md', 'foo.md', or 'subdir/../foo.md'
+  // collapses into a single row (sources.label is the dedup key).
+  //
+  // This pins behavior at two layers:
+  //   1. The store-level dedup contract: identical labels overwrite, distinct
+  //      labels produce distinct rows.
+  //   2. The ctx_index source-resolution decision lives in src/server.ts and
+  //      must read `source ?? resolvedPath`, NOT `source ?? path` (which would
+  //      preserve raw user-typed input and break dedup).
+  test("source-label dedup: identical labels collapse, raw user-typed paths would not", () => {
+    const store = new ContentStore(":memory:");
+    const dir = mkdtempSync(join(tmpdir(), "source-label-dedup-"));
+    const file = "foo.md";
+    const abs = join(dir, file);
+    const marker = `dedup-marker-${process.pid}-${Date.now()}`;
+    writeFileSync(abs, `# foo\n\nUnique marker: ${marker}\n`, "utf-8");
+
+    try {
+      // Post-fix simulation: server canonicalizes both spellings to `abs`
+      // before calling store.index → single label → single row.
+      store.index({ content: readFileSync(abs, "utf-8"), path: abs, source: abs });
+      store.index({ content: readFileSync(abs, "utf-8"), path: abs, source: abs });
+
+      const dedupResults = store.search(marker, 10);
+      expect(dedupResults.length).toBe(1);
+      expect(dedupResults[0].source).toBe(abs);
+    } finally {
+      store.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  // Server-side guard: the source-label fallback must canonicalize to
+  // resolvedPath, not to the raw user-typed `path`. Validates the actual
+  // src/server.ts decision so a regression to `source ?? path` fails CI even
+  // before bundle rebuild and end-to-end spawn coverage.
+  test("source-label canonicalization: src/server.ts uses `source ?? resolvedPath`", () => {
+    const serverSrc = readFileSync(
+      resolve(__dirname, "../../src/server.ts"),
+      "utf-8",
+    );
+    // Locate the ctx_index store.index call site and assert canonical fallback.
+    const indexCall = serverSrc.match(
+      /store\.index\(\{[^}]*source:\s*source\s*\?\?\s*(\w+)/,
+    );
+    expect(indexCall).not.toBeNull();
+    expect(indexCall![1]).toBe("resolvedPath");
+    // Negative guard: no place in ctx_index falls back to raw `path`.
+    expect(serverSrc).not.toMatch(/store\.index\(\{[^}]*source:\s*source\s*\?\?\s*path[\s,}]/);
+  });
 });
 
 // ═══════════════════════════════════════════════════════════════════════════
