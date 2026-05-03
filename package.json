@@ -1,6 +1,6 @@
 {
   "name": "context-mode",
-  "version": "1.0.103",
+  "version": "1.0.104",
   "type": "module",
   "description": "MCP plugin that saves 98% of your context window. Works with Claude Code, Gemini CLI, VS Code Copilot, OpenCode, and Codex CLI. Sandboxed code execution, FTS5 knowledge base, and intent-driven search.",
   "author": "Mert Koseoğlu",
@@ -65,6 +65,7 @@
     "insight/src",
     "server.bundle.mjs",
     "cli.bundle.mjs",
+    "bin",
     "skills",
     ".claude-plugin",
     ".openclaw-plugin",
