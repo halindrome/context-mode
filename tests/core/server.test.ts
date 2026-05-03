@@ -2117,8 +2117,8 @@ import { runBatchCommands, type BatchCommand } from "../../src/server.js";
 interface MockResult { stdout: string; timedOut?: boolean; }
 
 function mkMockExecutor(
-  handler: (code: string, timeout: number) => Promise<MockResult> | MockResult,
-): { execute: (input: { language: "shell"; code: string; timeout: number }) => Promise<MockResult> } {
+  handler: (code: string, timeout: number | undefined) => Promise<MockResult> | MockResult,
+): { execute: (input: { language: "shell"; code: string; timeout: number | undefined }) => Promise<MockResult> } {
   return {
     execute: async ({ code, timeout }) => Promise.resolve(handler(code, timeout)),
   };
@@ -2178,6 +2178,48 @@ describe("runBatchCommands serial path (concurrency=1)", () => {
     expect(callCount).toBeLessThan(3);
     expect(timedOut).toBe(true);
     expect(outputs.some((o) => o.includes("(skipped — batch timeout exceeded)"))).toBe(true);
+  });
+
+  // Issue #406 — when timeout omitted, no shared budget, no skip cascade.
+  test("no timeout: all commands run to completion, no skip", async () => {
+    const exec = mkMockExecutor(async () => {
+      // Each call burns 60ms. With timeout omitted, NONE should be skipped.
+      await new Promise((r) => setTimeout(r, 60));
+      return { stdout: "ok" };
+    });
+    const cmds: BatchCommand[] = [
+      { label: "A", command: "x" },
+      { label: "B", command: "x" },
+      { label: "C", command: "x" },
+    ];
+    const { outputs, timedOut } = await runBatchCommands(
+      cmds,
+      { timeout: undefined, concurrency: 1, nodeOptsPrefix: NOOP_PREFIX },
+      exec,
+    );
+    expect(timedOut).toBe(false);
+    expect(outputs).toHaveLength(3);
+    expect(outputs.every((o) => !o.includes("skipped"))).toBe(true);
+  });
+
+  test("no timeout: per-command timeout passed to executor is undefined", async () => {
+    const seenTimeouts: Array<number | undefined> = [];
+    const exec = {
+      execute: async (input: { language: "shell"; code: string; timeout: number | undefined }) => {
+        seenTimeouts.push(input.timeout);
+        return { stdout: "ok" } as MockResult;
+      },
+    };
+    const cmds: BatchCommand[] = [
+      { label: "A", command: "x" },
+      { label: "B", command: "y" },
+    ];
+    await runBatchCommands(
+      cmds,
+      { timeout: undefined, concurrency: 1, nodeOptsPrefix: NOOP_PREFIX },
+      exec,
+    );
+    expect(seenTimeouts).toEqual([undefined, undefined]);
   });
 });
 
@@ -2806,7 +2848,7 @@ async function initAndCallDoctor(
 }
 
 describe("ctx_doctor — resource cleanup regression (#247)", () => {
-  test("single ctx_doctor call returns a markdown checklist", async () => {
+  test("single ctx_doctor call returns a status report", async () => {
     const proc = startMcpServer();
     const responses = await initAndCallDoctor(proc, 1);
     const call = responses.find((r) => r.id === 100);
@@ -2828,6 +2870,40 @@ describe("ctx_doctor — resource cleanup regression (#247)", () => {
       expect(c!.result?.content?.[0]?.text).toContain("context-mode doctor");
     }
   }, 35_000);
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ctx_doctor renderer-safe output (Mickey #3 — Z.ai GLM compatibility)
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// Z.ai's MCP renderer crashes with `ReferenceError: client is not defined`
+// when it parses GitHub-flavored markdown task-list syntax (`- [x]`, `- [ ]`,
+// `- [-]`). To stay safe across all MCP clients (including renderers that mount
+// custom React components for task lists or h2 headers), ctx_doctor MUST emit
+// plain-text status prefixes (`[OK]`, `[FAIL]`, `[WARN]`) and avoid `##`
+// headings.
+describe("ctx_doctor — renderer-safe output (Z.ai compat)", () => {
+  test("output uses [OK]/[FAIL]/[WARN] prefixes and no markdown task-list syntax", async () => {
+    const proc = startMcpServer();
+    const responses = await initAndCallDoctor(proc, 1);
+    const call = responses.find((r) => r.id === 100);
+    expect(call).toBeDefined();
+    expect(call!.error).toBeUndefined();
+    const text: string = call!.result?.content?.[0]?.text ?? "";
+
+    // Must NOT contain GFM task-list syntax (triggers Z.ai's broken renderer)
+    expect(text).not.toMatch(/-\s+\[x\]/);
+    expect(text).not.toMatch(/-\s+\[ \]/);
+    expect(text).not.toMatch(/-\s+\[-\]/);
+
+    // Must NOT contain `## ` h2 (some renderers mount custom h2 components)
+    expect(text).not.toMatch(/^##\s/m);
+
+    // Must use plain-text status prefixes
+    expect(text).toMatch(/\[OK\]/);
+    // Header is plain text, no markdown
+    expect(text).toMatch(/^context-mode doctor/m);
+  }, 30_000);
 });
 
 // ═══════════════════════════════════════════════════════════════════════════

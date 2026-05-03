@@ -426,6 +426,72 @@ describe("Resume Edge Cases", () => {
 });
 
 // ════════════════════════════════════════════
+// SLICE 12b: ATOMIC CLAIM LATEST UNCONSUMED RESUME
+// (PR #376 — Mickey: cross-session resume injection without
+// process-global UUID. Must be race-safe under concurrent processes.)
+// ════════════════════════════════════════════
+
+describe("Atomic claim of latest unconsumed resume", () => {
+  test("returns null when no resume rows exist", () => {
+    const db = createTestDB();
+    const claimed = db.claimLatestUnconsumedResume();
+    assert.equal(claimed, null);
+  });
+
+  test("returns null when only consumed rows exist", () => {
+    const db = createTestDB();
+    db.ensureSession("sess-A", "/p");
+    db.upsertResume("sess-A", "<snap>A</snap>", 5);
+    db.markResumeConsumed("sess-A");
+
+    const claimed = db.claimLatestUnconsumedResume();
+    assert.equal(claimed, null);
+  });
+
+  test("returns the most recent unconsumed snapshot and marks it consumed atomically", () => {
+    const db = createTestDB();
+    // Older row (already consumed — must be skipped)
+    db.ensureSession("sess-old", "/p");
+    db.upsertResume("sess-old", "<snap>old</snap>", 3);
+    db.markResumeConsumed("sess-old");
+
+    // Newer row (unconsumed — must be claimed)
+    db.ensureSession("sess-new", "/p");
+    db.upsertResume("sess-new", "<snap>new</snap>", 7);
+
+    const claimed = db.claimLatestUnconsumedResume();
+    assert.deepEqual(claimed, { sessionId: "sess-new", snapshot: "<snap>new</snap>" });
+
+    // Second claim returns null — only one unconsumed row existed.
+    const second = db.claimLatestUnconsumedResume();
+    assert.equal(second, null);
+
+    // The row's consumed flag is set
+    const row = db.getResume("sess-new");
+    assert.equal(row!.consumed, 1);
+  });
+
+  test("two parallel claims on the same DB instance return distinct snapshots (race-safe)", () => {
+    // Simulates two concurrent `chat.system.transform` invocations on
+    // the same project hitting the DB at the same time.
+    const db = createTestDB();
+    db.ensureSession("sess-1", "/p");
+    db.upsertResume("sess-1", "<snap>1</snap>", 1);
+    db.ensureSession("sess-2", "/p");
+    db.upsertResume("sess-2", "<snap>2</snap>", 2);
+
+    const a = db.claimLatestUnconsumedResume();
+    const b = db.claimLatestUnconsumedResume();
+    const c = db.claimLatestUnconsumedResume();
+
+    assert.ok(a !== null);
+    assert.ok(b !== null);
+    assert.equal(c, null); // only 2 rows existed
+    assert.notEqual(a!.sessionId, b!.sessionId);
+  });
+});
+
+// ════════════════════════════════════════════
 // SLICE 13: DELETE SESSION
 // ════════════════════════════════════════════
 

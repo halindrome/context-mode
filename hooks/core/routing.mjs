@@ -289,9 +289,10 @@ export function routePreToolUse(toolName, toolInput, projectDir, platform, sessi
       });
     }
 
-    // Build tools (gradle, maven) → redirect to execute sandbox (Issue #38).
+    // Build tools (gradle, maven, sbt) → redirect to execute sandbox (Issue #38, #406).
     // These produce extremely verbose output that should stay in sandbox.
-    if (/(^|\s|&&|\||\;)(\.\/gradlew|gradlew|gradle|\.\/mvnw|mvnw|mvn)\s/i.test(stripped)) {
+    // Word-boundary guard prevents matching `gradle-wrapper-config`, `mvnDocker`, etc.
+    if (/(^|\s|&&|\||\;)(\.\/gradlew|gradlew|gradle|\.\/mvnw|mvnw|mvn|\.\/sbt|sbt)(\s|$)/i.test(stripped)) {
       const safeCmd = command.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
       return mcpRedirect({
         action: "modify",

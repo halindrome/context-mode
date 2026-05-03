@@ -149,6 +149,7 @@ const S = {
   upsertResume: "upsertResume",
   getResume: "getResume",
   markResumeConsumed: "markResumeConsumed",
+  claimLatestUnconsumedResume: "claimLatestUnconsumedResume",
   deleteEvents: "deleteEvents",
   deleteMeta: "deleteMeta",
   deleteResume: "deleteResume",
@@ -365,6 +366,21 @@ export class SessionDB extends SQLiteBase {
 
     p(S.markResumeConsumed,
       `UPDATE session_resume SET consumed = 1 WHERE session_id = ?`);
+
+    // Atomic "pick newest unconsumed snapshot AND mark it consumed in one
+    // statement". Required for race-safe cross-session resume injection
+    // (Mickey / PR #376) — two parallel chat-turn hooks must not both read
+    // the same row before either one writes consumed=1.
+    p(S.claimLatestUnconsumedResume,
+      `UPDATE session_resume
+       SET consumed = 1
+       WHERE id = (
+         SELECT id FROM session_resume
+         WHERE consumed = 0
+         ORDER BY created_at DESC, id DESC
+         LIMIT 1
+       )
+       RETURNING session_id, snapshot`);
 
     // ── Delete ──
     p(S.deleteEvents, `DELETE FROM session_events WHERE session_id = ?`);
@@ -696,6 +712,24 @@ export class SessionDB extends SQLiteBase {
    */
   markResumeConsumed(sessionId: string): void {
     this.stmt(S.markResumeConsumed).run(sessionId);
+  }
+
+  /**
+   * Atomically claim the most recent unconsumed resume snapshot in this DB.
+   *
+   * `SessionDB` is sharded per project (see `getSessionDBPath` — SHA-256 of
+   * project dir), so "this DB" already implies "this project". The atomic
+   * `UPDATE … RETURNING` ensures concurrent processes for the same project
+   * cannot both inject the same snapshot (Mickey / PR #376 race).
+   *
+   * Returns null when no unconsumed snapshot exists.
+   */
+  claimLatestUnconsumedResume(): { sessionId: string; snapshot: string } | null {
+    const row = this.stmt(S.claimLatestUnconsumedResume).get() as
+      | { session_id: string; snapshot: string }
+      | undefined;
+    if (!row) return null;
+    return { sessionId: row.session_id, snapshot: row.snapshot };
   }
 
   /**

@@ -690,6 +690,29 @@ describe("Timeout Handling", () => {
     assert.equal(r.timedOut, true);
   });
 
+  // Issue #406 — when timeout omitted, no server-side timer fires and a
+  // long-running process completes naturally. Caller (or MCP host) owns
+  // the timeout policy.
+  test("JS: no timeout — short script completes without forced kill", async () => {
+    const r = await executor.execute({
+      language: "javascript",
+      // 250ms wait then print — caller didn't pass timeout, so we must
+      // wait for natural exit, not kill at any heuristic ceiling.
+      code: "setTimeout(() => { console.log('done'); }, 250);",
+    });
+    assert.equal(r.timedOut, false);
+    assert.equal(r.stdout.trim(), "done");
+  });
+
+  test("Shell: no timeout — sleep 1 completes without forced kill", async () => {
+    const r = await executor.execute({
+      language: "shell",
+      code: "sleep 1 && echo done",
+    });
+    assert.equal(r.timedOut, false);
+    assert.equal(r.stdout.trim(), "done");
+  });
+
   test("JS: infinite loop leaves no orphaned process after kill", async () => {
     // Spawn a process that writes its PID then loops forever
     const r = await executor.execute({
@@ -1563,11 +1586,41 @@ describe("Windows Shell Support", () => {
 
   test("buildScriptFilename: shell on Windows has NO extension (avoid .sh file association)", async () => {
     assert.equal(buildScriptFilename("shell", "win32"), "script");
+    assert.equal(buildScriptFilename("shell", "win32", "C:\\Program Files\\Git\\usr\\bin\\bash.exe"), "script");
+    assert.equal(buildScriptFilename("shell", "win32", "sh"), "script");
+  });
+
+  test("buildScriptFilename: PowerShell on Windows uses .ps1 extension", async () => {
+    assert.equal(buildScriptFilename("shell", "win32", "powershell"), "script.ps1");
+    assert.equal(buildScriptFilename("shell", "win32", "pwsh"), "script.ps1");
+    assert.equal(
+      buildScriptFilename("shell", "win32", "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe"),
+      "script.ps1",
+    );
+    assert.equal(
+      buildScriptFilename("shell", "win32", "C:\\Program Files\\PowerShell\\7\\pwsh.exe"),
+      "script.ps1",
+    );
+  });
+
+  test.runIf(process.platform === "win32")("PowerShell shell runtime executes generated script", async () => {
+    const powershellRuntimes: RuntimeMap = { ...runtimes, shell: "powershell" };
+    const powershellExecutor = new PolyglotExecutor({ runtimes: powershellRuntimes });
+    const r = await powershellExecutor.execute({
+      language: "shell",
+      code: 'Write-Output "POWERSHELL_EXECUTOR_OK"',
+      timeout: 10_000,
+    });
+
+    assert.equal(r.exitCode, 0, `stderr: ${r.stderr}`);
+    assert.ok(r.stdout.includes("POWERSHELL_EXECUTOR_OK"), `stdout: ${r.stdout}`);
   });
 
   test("buildScriptFilename: shell on Unix keeps .sh extension", async () => {
     assert.equal(buildScriptFilename("shell", "darwin"), "script.sh");
     assert.equal(buildScriptFilename("shell", "linux"), "script.sh");
+    assert.equal(buildScriptFilename("shell", "linux", "pwsh"), "script.sh");
+    assert.equal(buildScriptFilename("shell", "darwin", "powershell"), "script.sh");
   });
 
   test("buildScriptFilename: non-shell languages keep their extension on Windows", async () => {

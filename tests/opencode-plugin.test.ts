@@ -54,16 +54,23 @@ describe("ContextModePlugin", () => {
   // ── Factory ───────────────────────────────────────────
 
   describe("factory", () => {
-    it("returns object with 3 hook handlers", async () => {
+    it("returns object with 4 hook handlers", async () => {
       const plugin = await createTestPlugin(join(tempDir, "factory-test"));
 
       expect(plugin).toHaveProperty("tool.execute.before");
       expect(plugin).toHaveProperty("tool.execute.after");
       expect(plugin).toHaveProperty("experimental.session.compacting");
+      // SessionStart-equivalent (PR #376 / Mickey #1) — must be on
+      // chat.system.transform, NOT chat.messages.transform (whose input
+      // shape `{}` carries no sessionID and whose output {info,parts}[]
+      // does not accept the {role,content} shape we used to push).
+      expect(plugin).toHaveProperty("experimental.chat.system.transform");
+      expect(plugin).not.toHaveProperty("experimental.chat.messages.transform");
 
       expect(typeof plugin["tool.execute.before"]).toBe("function");
       expect(typeof plugin["tool.execute.after"]).toBe("function");
       expect(typeof plugin["experimental.session.compacting"]).toBe("function");
+      expect(typeof plugin["experimental.chat.system.transform"]).toBe("function");
     });
 
     it("does not write AGENTS.md routing instructions on startup", async () => {
@@ -253,6 +260,125 @@ describe("ContextModePlugin", () => {
         output2,
       );
       expect(snap2.length).toBeGreaterThan(0);
+    });
+  });
+
+  // ── experimental.chat.system.transform ────────────────
+  // SessionStart-equivalent (PR #376 / Mickey 3-issue fix). Verifies:
+  //  • Snapshot is prepended to output.system (NOT output.messages)
+  //  • Per-session at-most-once gate (multi-session reuse — Mickey #2)
+  //  • Cross-session lookup via DB.claimLatestUnconsumedResume
+  //  • Race-safe atomic claim — two parallel transforms get distinct rows
+
+  describe("experimental.chat.system.transform", () => {
+    it("is a no-op when sessionID is missing", async () => {
+      const plugin = await createTestPlugin(join(tempDir, "sysxform-no-sid"));
+      const out = { system: ["existing"] };
+      await plugin["experimental.chat.system.transform"](
+        { sessionID: undefined, model: {} } as any,
+        out,
+      );
+      expect(out.system).toEqual(["existing"]);
+    });
+
+    it("is a no-op when no resume snapshot exists", async () => {
+      const plugin = await createTestPlugin(join(tempDir, "sysxform-no-resume"));
+      const out = { system: [] as string[] };
+      await plugin["experimental.chat.system.transform"](
+        { sessionID: "fresh-session", model: {} } as any,
+        out,
+      );
+      expect(out.system).toEqual([]);
+    });
+
+    it("prepends a previously-recorded snapshot to output.system on first call", async () => {
+      const projectDir = join(tempDir, "sysxform-inject");
+      const plugin = await createTestPlugin(projectDir);
+
+      // Build a snapshot in a *prior* session
+      await plugin["tool.execute.after"](
+        { tool: "Read", sessionID: "prior-session", callID: "c1", args: { file_path: "/a.ts" } },
+        { title: "Read", output: "content", metadata: {} },
+      );
+      const compactOut = { context: [] as string[], prompt: undefined };
+      await plugin["experimental.session.compacting"](
+        { sessionID: "prior-session" } as any,
+        compactOut,
+      );
+
+      // New session enters via system.transform — must inherit the snapshot
+      const out = { system: [] as string[] };
+      await plugin["experimental.chat.system.transform"](
+        { sessionID: "new-session", model: {} } as any,
+        out,
+      );
+      expect(out.system.length).toBe(1);
+      expect(out.system[0]).toContain("session_resume");
+    });
+
+    it("preserves system[0] header so OpenCode's prompt-cache fold survives", async () => {
+      // OpenCode (packages/opencode/src/session/llm.ts:117-128) preserves a
+      // 2-part `[header, body]` system structure for provider prompt caching.
+      // It saves `header = system[0]` BEFORE invoking this hook, then folds
+      // the rest into `[header, body]` only when `system[0] === header` after
+      // the hook returns. If we `unshift(snapshot)` we replace system[0] →
+      // cache-fold is skipped → each system block ships as a separate
+      // `role: "system"` message → provider prompt cache invalidates on every
+      // resume injection (token cost regression). We insert at index 1 instead.
+      const projectDir = join(tempDir, "sysxform-cache-fold");
+      const plugin = await createTestPlugin(projectDir);
+      await plugin["tool.execute.after"](
+        { tool: "Read", sessionID: "seed", callID: "c1", args: { file_path: "/y.ts" } },
+        { title: "Read", output: "y", metadata: {} },
+      );
+      await plugin["experimental.session.compacting"](
+        { sessionID: "seed" } as any,
+        { context: [] as string[], prompt: undefined },
+      );
+
+      const HEADER = "you are claude";
+      const BODY = "user system prompt here";
+      const out = { system: [HEADER, BODY] };
+      await plugin["experimental.chat.system.transform"](
+        { sessionID: "turn-cache", model: {} } as any,
+        out,
+      );
+      // The snapshot was inserted, but header at index 0 is preserved
+      // exactly as OpenCode saw it before the hook.
+      expect(out.system[0]).toBe(HEADER);
+      expect(out.system.length).toBe(3);
+      expect(out.system[1]).toContain("session_resume");
+      expect(out.system[2]).toBe(BODY);
+    });
+
+    it("does NOT re-inject on second call with the same sessionID (multi-turn)", async () => {
+      const projectDir = join(tempDir, "sysxform-once-per-session");
+      const plugin = await createTestPlugin(projectDir);
+
+      // Seed snapshot
+      await plugin["tool.execute.after"](
+        { tool: "Read", sessionID: "seed", callID: "c1", args: { file_path: "/x.ts" } },
+        { title: "Read", output: "x", metadata: {} },
+      );
+      await plugin["experimental.session.compacting"](
+        { sessionID: "seed" } as any,
+        { context: [] as string[], prompt: undefined },
+      );
+
+      const out1 = { system: [] as string[] };
+      await plugin["experimental.chat.system.transform"](
+        { sessionID: "turn-X", model: {} } as any,
+        out1,
+      );
+      expect(out1.system.length).toBe(1);
+
+      const out2 = { system: [] as string[] };
+      await plugin["experimental.chat.system.transform"](
+        { sessionID: "turn-X", model: {} } as any,
+        out2,
+      );
+      // Same session — already injected this process — silent.
+      expect(out2.system).toEqual([]);
     });
   });
 

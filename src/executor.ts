@@ -15,8 +15,10 @@ const isWin = process.platform === "win32";
 
 /**
  * Pure helper: extension map for temp script files per language.
- * On Windows, shell scripts get NO extension to avoid Windows file-association
- * for `.sh` (which spawns a visible Git Bash window over the user's IDE).
+ * On Windows, shell scripts usually get NO extension to avoid Windows
+ * file-association for `.sh` (which spawns a visible Git Bash window over the
+ * user's IDE). Windows PowerShell/pwsh is the exception because `-File`
+ * requires `.ps1` there.
  */
 const SCRIPT_EXT: Record<Language, string> = {
   javascript: "js",
@@ -33,8 +35,17 @@ const SCRIPT_EXT: Record<Language, string> = {
 };
 
 /** Pure helper — exported for unit testing. Returns "script" or "script.<ext>". */
-export function buildScriptFilename(language: Language, platform: NodeJS.Platform): string {
-  if (platform === "win32" && language === "shell") return "script";
+export function buildScriptFilename(
+  language: Language,
+  platform: NodeJS.Platform,
+  shellPath?: string | null,
+): string {
+  if (platform === "win32" && language === "shell") {
+    const shellName = shellPath?.toLowerCase() ?? "";
+    return shellName.includes("powershell") || shellName.includes("pwsh")
+      ? "script.ps1"
+      : "script";
+  }
   return `script.${SCRIPT_EXT[language]}`;
 }
 
@@ -144,7 +155,7 @@ export class PolyglotExecutor {
   }
 
   async execute(opts: ExecuteOptions): Promise<ExecResult> {
-    const { language, code, timeout = 30_000, background = false } = opts;
+    const { language, code, timeout, background = false } = opts;
     const tmpDir = mkdtempSync(join(OS_TMPDIR, ".ctx-mode-"));
 
     try {
@@ -179,7 +190,7 @@ export class PolyglotExecutor {
   }
 
   async executeFile(opts: ExecuteFileOptions): Promise<ExecResult> {
-    const { path: filePath, language, code, timeout = 30_000 } = opts;
+    const { path: filePath, language, code, timeout } = opts;
     const absolutePath = resolve(this.#projectRoot, filePath);
     const wrappedCode = this.#wrapWithFileContent(
       absolutePath,
@@ -206,7 +217,14 @@ export class PolyglotExecutor {
       code = `Path.wildcard(Path.join(${escaped}, "*/ebin"))\n|> Enum.each(&Code.prepend_path/1)\n\n${code}`;
     }
 
-    const fp = join(tmpDir, buildScriptFilename(language, process.platform));
+    const fp = join(
+      tmpDir,
+      buildScriptFilename(
+        language,
+        process.platform,
+        language === "shell" ? this.#runtimes.shell : null,
+      ),
+    );
     if (language === "shell") {
       writeFileSync(fp, code, { encoding: "utf-8", mode: 0o700 });
     } else {
@@ -218,16 +236,18 @@ export class PolyglotExecutor {
   async #compileAndRun(
     srcPath: string,
     cwd: string,
-    timeout: number,
+    timeout: number | undefined,
   ): Promise<ExecResult> {
     const binSuffix = isWin ? ".exe" : "";
     const binPath = srcPath.replace(/\.rs$/, "") + binSuffix;
 
-    // Compile
+    // Compile — cap rustc invocation at 60s when caller didn't bound the
+    // overall timeout (a hung compile shouldn't run forever even if the
+    // caller is fine with a long-running binary afterwards).
     try {
       execFileSync("rustc", [srcPath, "-o", binPath], {
         cwd,
-        timeout: Math.min(timeout, 60_000),
+        timeout: timeout === undefined ? 60_000 : Math.min(timeout, 60_000),
         encoding: "utf-8",
         stdio: ["pipe", "pipe", "pipe"],
       });
@@ -249,7 +269,7 @@ export class PolyglotExecutor {
     cmd: string[],
     cwd: string,
     sandboxTmpDir: string,
-    timeout: number,
+    timeout: number | undefined,
     background = false,
   ): Promise<ExecResult> {
     return new Promise((res) => {
@@ -287,7 +307,12 @@ export class PolyglotExecutor {
 
       let timedOut = false;
       let resolved = false;
-      const timer = setTimeout(() => {
+      // Issue #406 — if the caller didn't pass a timeout we don't fire one.
+      // Timeout policy belongs to the MCP host/client (Claude Code, VSCode,
+      // JetBrains all enforce their own RPC timeouts); imposing a second
+      // policy here turned 30-minute Gradle/Maven/SBT builds into spurious
+      // false negatives whenever the caller forgot the explicit value.
+      const timer: NodeJS.Timeout | undefined = timeout === undefined ? undefined : setTimeout(() => {
         timedOut = true;
         if (background) {
           // Background mode: detach process, return partial output, keep running

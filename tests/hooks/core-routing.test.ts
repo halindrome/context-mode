@@ -254,6 +254,35 @@ describe("routePreToolUse", () => {
       // stripped version removes quoted content → no gradle match → context
       expect(result!.action).toBe("context");
     });
+
+    // Issue #406 — sbt added alongside gradle/maven
+    it("redirects sbt compile to execute sandbox (Issue #406)", () => {
+      const result = routePreToolUse("Bash", {
+        command: "sbt compile",
+      });
+      expect(result).not.toBeNull();
+      expect(result!.action).toBe("modify");
+      expect((result!.updatedInput as Record<string, string>).command).toContain(
+        "Build tool redirected",
+      );
+    });
+
+    it("redirects ./sbt test to execute sandbox", () => {
+      const result = routePreToolUse("Bash", {
+        command: "./sbt test",
+      });
+      expect(result).not.toBeNull();
+      expect(result!.action).toBe("modify");
+    });
+
+    it("does not false-positive on substrings like gradle-wrapper-config or mvnDocker", () => {
+      // Word-boundary guard — these are NOT gradle/mvn invocations.
+      const r1 = routePreToolUse("Bash", { command: "ls gradle-wrapper-config" });
+      expect(r1?.action).not.toBe("modify");
+      const r2 = routePreToolUse("Bash", { command: "echo mvnDocker-image" });
+      // Quoted/echo passes context, not modify
+      expect(r2?.action).not.toBe("modify");
+    });
   });
 
   // ─── Read routing ──────────────────────────────────────

@@ -775,14 +775,19 @@ export interface BatchRunResult {
 }
 
 export interface BatchRunOptions {
-  timeout: number;
+  /**
+   * Total budget (concurrency=1, shared) or per-command (concurrency>1).
+   * When `undefined`, no server-side timer fires — the MCP host's RPC
+   * timeout governs (Issue #406).
+   */
+  timeout: number | undefined;
   concurrency: number;
   nodeOptsPrefix: string;
   onFsBytes?: (bytes: number) => void;
 }
 
 interface BatchExecutor {
-  execute(input: { language: "shell"; code: string; timeout: number }): Promise<{ stdout: string; timedOut?: boolean }>;
+  execute(input: { language: "shell"; code: string; timeout: number | undefined }): Promise<{ stdout: string; timedOut?: boolean }>;
 }
 
 function formatCommandOutput(label: string, raw: string, onFsBytes?: (bytes: number) => void): string {
@@ -813,22 +818,28 @@ export async function runBatchCommands(
 
   if (concurrency <= 1) {
     // Serial path — shared timeout budget, cascading skip on timeout.
+    // When `timeout` is undefined, no shared budget is enforced; each
+    // command runs to completion (Issue #406).
     const outputs: string[] = [];
     const startTime = Date.now();
     let timedOut = false;
     for (let i = 0; i < commands.length; i++) {
       const cmd = commands[i];
-      const elapsed = Date.now() - startTime;
-      const remaining = timeout - elapsed;
-      if (remaining <= 0) {
-        outputs.push(`# ${cmd.label}\n\n(skipped — batch timeout exceeded)\n`);
-        timedOut = true;
-        continue;
+      let perCmdTimeout: number | undefined;
+      if (timeout !== undefined) {
+        const elapsed = Date.now() - startTime;
+        const remaining = timeout - elapsed;
+        if (remaining <= 0) {
+          outputs.push(`# ${cmd.label}\n\n(skipped — batch timeout exceeded)\n`);
+          timedOut = true;
+          continue;
+        }
+        perCmdTimeout = remaining;
       }
       const result = await executor.execute({
         language: "shell",
         code: `${nodeOptsPrefix}${cmd.command} 2>&1`,
-        timeout: remaining,
+        timeout: perCmdTimeout,
       });
       outputs.push(formatCommandOutput(cmd.label, result.stdout, onFsBytes));
       if (result.timedOut) {
@@ -856,7 +867,7 @@ export async function runBatchCommands(
       // markers are stripped + counted, even when the command timed out.
       const formatted = formatCommandOutput(cmd.label, result.stdout, onFsBytes);
       const output = result.timedOut
-        ? formatted.replace(/\n$/, "") + `\n(timed out after ${timeout}ms)\n`
+        ? formatted.replace(/\n$/, "") + `\n(timed out after ${timeout ?? "?"}ms)\n`
         : formatted;
       return { output, timedOut: !!result.timedOut };
     },
@@ -912,8 +923,7 @@ server.registerTool(
       timeout: z
         .coerce.number()
         .optional()
-        .default(30000)
-        .describe("Max execution time in ms"),
+        .describe("Max execution time in ms. When omitted, no server-side timer fires — the MCP host's RPC timeout governs (which is the right layer for this policy). Pass an explicit value for long-running builds (Gradle/Maven/SBT)."),
       background: z
         .boolean()
         .optional()
@@ -1246,8 +1256,7 @@ server.registerTool(
       timeout: z
         .coerce.number()
         .optional()
-        .default(30000)
-        .describe("Max execution time in ms"),
+        .describe("Max execution time in ms. When omitted, no server-side timer fires — the MCP host's RPC timeout governs."),
       intent: z
         .string()
         .optional()
@@ -2291,8 +2300,7 @@ server.registerTool(
       timeout: z
         .coerce.number()
         .optional()
-        .default(60000)
-        .describe("Max execution time in ms (default: 60s). With concurrency=1, shared budget across commands; with concurrency>1, applied per-command."),
+        .describe("Max execution time in ms. When omitted, no server-side timer fires — the MCP host's RPC timeout governs. With concurrency=1, the value (when set) is a shared budget across commands; with concurrency>1, it is applied per-command."),
       concurrency: z
         .coerce.number()
         .int()
@@ -2496,24 +2504,32 @@ server.registerTool(
     title: "Run Diagnostics",
     description:
       "Diagnose context-mode installation. Runs all checks server-side and " +
-      "returns results as a markdown checklist. No CLI execution needed.",
+      "returns a plain-text status report with [OK]/[FAIL]/[WARN] prefixes " +
+      "(renderer-safe across MCP clients). No CLI execution needed.",
     inputSchema: z.object({}),
   },
   async () => {
-    const lines: string[] = ["## context-mode doctor", ""];
+    // Renderer-safe output (Mickey #3 — Z.ai GLM 4.7 ReferenceError):
+    // Z.ai's MCP renderer mounts a custom React component for GitHub-flavored
+    // markdown task-list syntax (`- [x]` / `- [ ]` / `- [-]`) that depends on
+    // a missing `client` context, throwing `ReferenceError: client is not
+    // defined`. We avoid both task-list syntax AND `## ` h2 headings to stay
+    // safe across all MCP renderers — using plain-text status prefixes
+    // (`[OK]` / `[FAIL]` / `[WARN]`) instead.
+    const lines: string[] = ["context-mode doctor", ""];
     // __pkg_dir is build/ for tsc, plugin root for bundle — resolve to plugin root
     const pluginRoot = existsSync(resolve(__pkg_dir, "package.json")) ? __pkg_dir : dirname(__pkg_dir);
 
     // Runtimes
     const total = 11;
     const pct = ((available.length / total) * 100).toFixed(0);
-    lines.push(`- [x] Runtimes: ${available.length}/${total} (${pct}%) — ${available.join(", ")}`);
+    lines.push(`[OK] Runtimes: ${available.length}/${total} (${pct}%) — ${available.join(", ")}`);
 
     // Performance
     if (hasBunRuntime()) {
-      lines.push("- [x] Performance: FAST (Bun)");
+      lines.push("[OK] Performance: FAST (Bun)");
     } else {
-      lines.push("- [-] Performance: NORMAL — install Bun for 3-5x speed boost");
+      lines.push("[WARN] Performance: NORMAL — install Bun for 3-5x speed boost");
     }
 
     // Server test — cleanup executor to prevent resource leaks (#247)
@@ -2522,13 +2538,13 @@ server.registerTool(
       try {
         const result = await testExecutor.execute({ language: "javascript", code: 'console.log("ok");', timeout: 5000 });
         if (result.exitCode === 0 && result.stdout.trim() === "ok") {
-          lines.push("- [x] Server test: PASS");
+          lines.push("[OK] Server test: PASS");
         } else {
           const detail = result.stderr?.trim() ? ` (${result.stderr.trim().slice(0, 200)})` : "";
-          lines.push(`- [ ] Server test: FAIL — exit ${result.exitCode}${detail}`);
+          lines.push(`[FAIL] Server test: FAIL — exit ${result.exitCode}${detail}`);
         }
       } catch (err: unknown) {
-        lines.push(`- [ ] Server test: FAIL — ${err instanceof Error ? err.message : err}`);
+        lines.push(`[FAIL] Server test: FAIL — ${err instanceof Error ? err.message : err}`);
       } finally {
         testExecutor.cleanupBackgrounded();
       }
@@ -2544,12 +2560,12 @@ server.registerTool(
         testDb.exec("INSERT INTO fts_test(content) VALUES ('hello world')");
         const row = testDb.prepare("SELECT * FROM fts_test WHERE fts_test MATCH 'hello'").get() as { content: string } | undefined;
         if (row && row.content === "hello world") {
-          lines.push("- [x] FTS5 / SQLite: PASS — native module works");
+          lines.push("[OK] FTS5 / SQLite: PASS — native module works");
         } else {
-          lines.push("- [ ] FTS5 / SQLite: FAIL — unexpected result");
+          lines.push("[FAIL] FTS5 / SQLite: FAIL — unexpected result");
         }
       } catch (err: unknown) {
-        lines.push(`- [ ] FTS5 / SQLite: FAIL — ${err instanceof Error ? err.message : err}`);
+        lines.push(`[FAIL] FTS5 / SQLite: FAIL — ${err instanceof Error ? err.message : err}`);
       } finally {
         try { testDb!?.close(); } catch { /* best effort */ }
       }
@@ -2558,13 +2574,13 @@ server.registerTool(
     // Hook script
     const hookPath = resolve(pluginRoot, "hooks", "pretooluse.mjs");
     if (existsSync(hookPath)) {
-      lines.push(`- [x] Hook script: PASS — ${hookPath}`);
+      lines.push(`[OK] Hook script: PASS — ${hookPath}`);
     } else {
-      lines.push(`- [ ] Hook script: FAIL — not found at ${hookPath}`);
+      lines.push(`[FAIL] Hook script: FAIL — not found at ${hookPath}`);
     }
 
     // Version
-    lines.push(`- [x] Version: v${VERSION}`);
+    lines.push(`[OK] Version: v${VERSION}`);
 
     return trackResponse("ctx_doctor", {
       content: [{ type: "text" as const, text: lines.join("\n") }],
@@ -2800,15 +2816,23 @@ server.registerTool(
       "First run installs dependencies (~30s). Subsequent runs open instantly.",
     inputSchema: z.object({
       port: z.coerce.number().optional().describe("Port to serve on (default: 4747)"),
+      sessionDir: z.string().optional().describe("Override INSIGHT_SESSION_DIR: directory containing context-mode session .db files"),
+      contentDir: z.string().optional().describe("Override INSIGHT_CONTENT_DIR: directory containing context-mode content/index .db files"),
+      insightSessionDir: z.string().optional().describe("Alias for sessionDir / INSIGHT_SESSION_DIR"),
+      insightContentDir: z.string().optional().describe("Alias for contentDir / INSIGHT_CONTENT_DIR"),
     }),
   },
-  async ({ port: userPort }) => {
+  async ({ port: userPort, sessionDir, contentDir, insightSessionDir, insightContentDir }) => {
     const port = userPort || 4747;
+    const explicitSessionDir = sessionDir || insightSessionDir;
+    const explicitContentDir = contentDir || insightContentDir;
     // __pkg_dir is build/ for tsc, plugin root for bundle — resolve to plugin root
     const pluginRoot = existsSync(resolve(__pkg_dir, "package.json")) ? __pkg_dir : dirname(__pkg_dir);
     const insightSource = resolve(pluginRoot, "insight");
-    // Use adapter-aware path: derive from sessions dir (works across all 12 adapters)
-    const sessDir = getSessionDir();
+    // Use adapter-aware path by default, but allow MCP callers to pass explicit
+    // Insight data dirs for hosts whose adapter/default detection is unavailable.
+    const sessDir = explicitSessionDir ? resolve(explicitSessionDir) : getSessionDir();
+    const insightContentDirResolved = explicitContentDir ? resolve(explicitContentDir) : join(dirname(sessDir), "content");
     const cacheDir = join(dirname(sessDir), "insight-cache");
 
     // Verify source exists
@@ -2929,8 +2953,8 @@ server.registerTool(
         env: {
           ...process.env,
           PORT: String(port),
-          INSIGHT_SESSION_DIR: getSessionDir(),
-          INSIGHT_CONTENT_DIR: join(dirname(getSessionDir()), "content"),
+          INSIGHT_SESSION_DIR: sessDir,
+          INSIGHT_CONTENT_DIR: insightContentDirResolved,
           INSIGHT_PARENT_PID: String(process.pid),
         },
         detached: true,

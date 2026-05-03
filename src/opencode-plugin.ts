@@ -19,7 +19,6 @@
  *   - Session cleanup happens at plugin init (no SessionStart)
  */
 
-import { randomUUID } from "node:crypto";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
@@ -77,6 +76,30 @@ interface CompactingHookOutput {
   prompt?: string;
 }
 
+/**
+ * OpenCode experimental.chat.system.transform — first parameter.
+ * Verified against sst/opencode/dev/packages/plugin/src/index.ts:
+ *   input: { sessionID?: string; model: Model }
+ * `sessionID` is optional in the SDK type but is in practice always set
+ * (the transform runs *for* a session). We treat it as required and
+ * skip injection when absent rather than fall back to a fabricated ID.
+ *
+ * NOTE: We deliberately do NOT use `experimental.chat.messages.transform`.
+ * Its SDK input shape is `{}` (no sessionID) and its output is
+ * `{ messages: { info: Message; parts: Part[] }[] }` — the prior code
+ * (`output.messages.unshift({ role, content })`) wrote a value of the
+ * wrong shape and was silently dropped (Mickey / PR #376 root cause).
+ */
+interface SystemTransformHookInput {
+  sessionID?: string;
+  model: unknown;
+}
+
+/** OpenCode experimental.chat.system.transform — second parameter */
+interface SystemTransformHookOutput {
+  system: string[];
+}
+
 // ── Helpers ───────────────────────────────────────────────
 /**
  * Detect whether the plugin is running under KiloCode or OpenCode.
@@ -124,19 +147,20 @@ async function createContextModePlugin(ctx: PluginContext) {
   const routing = await import(pathToFileURL(routingPath).href);
   await routing.initSecurity(buildDir);
   
-  // Initialize session
+  // Initialize per-process state. We do NOT fabricate a sessionId here —
+  // OpenCode/Kilo provide the real `input.sessionID` on every hook, and a
+  // process-global UUID would (a) never match prior-session resume rows and
+  // (b) collide across multi-session reuse (Mickey / PR #376 root cause).
   const projectDir = ctx.directory;
   const db = new SessionDB({ dbPath: adapter.getSessionDBPath(projectDir) });
-  const sessionId = randomUUID();
-  db.ensureSession(sessionId, projectDir);
-  
-  // Clean up old sessions on startup (replaces SessionStart hook)
+
+  // Clean up old sessions on startup (no SessionStart hook to do this).
   db.cleanupOldSessions(7);
 
-  // Track whether we've already injected the prior-session resume into
-  // a chat turn — `experimental.chat.messages.transform` fires on every
-  // turn, but we only want to inject once per process (SessionStart-equivalent).
-  let sessionStartInjected = false;
+  // Track per-session resume injection: persistent plugin process can host
+  // many sessions, so the gate must be keyed by sessionID — NOT a single
+  // boolean closure flag (Mickey #2 root cause).
+  const resumeInjected = new Set<string>();
 
   return {
     // ── PreToolUse: Routing enforcement ─────────────────
@@ -170,7 +194,10 @@ async function createContextModePlugin(ctx: PluginContext) {
     // ── PostToolUse: Session event capture ──────────────
 
     "tool.execute.after": async (input: AfterHookInput, output: AfterHookOutput) => {
+      const sessionId = input.sessionID;
+      if (!sessionId) return;
       try {
+        db.ensureSession(sessionId, projectDir);
         const hookInput: HookInput = {
           tool_name: input.tool ?? "",
           tool_input: input.args ?? {},
@@ -191,7 +218,10 @@ async function createContextModePlugin(ctx: PluginContext) {
     // ── PreCompact: Snapshot generation ─────────────────
 
     "experimental.session.compacting": async (input: CompactingHookInput, output: CompactingHookOutput) => {
+      const sessionId = input.sessionID;
+      if (!sessionId) return "";
       try {
+        db.ensureSession(sessionId, projectDir);
         const events = db.getEvents(sessionId);
         if (events.length === 0) return "";
 
@@ -213,31 +243,36 @@ async function createContextModePlugin(ctx: PluginContext) {
     },
 
     // ── SessionStart equivalent (PR #376) ───────────────
-    // OpenCode lacks a real SessionStart hook (#14808, #5409) but
-    // recently added `experimental.chat.messages.transform`, which
-    // fires once per chat turn before messages are sent to the model.
-    // We piggyback on the *first* invocation per process to inject the
-    // most-recent resume snapshot from a prior session — matching what
-    // every other adapter's SessionStart hook does.
-    "experimental.chat.messages.transform": async (
-      _input: unknown,
-      output: { messages?: Array<{ role: string; content: string }> } | undefined,
+    // OpenCode lacks a real SessionStart hook (#14808, #5409). The closest
+    // surrogate is `experimental.chat.system.transform` — verified shape:
+    //   input:  { sessionID?: string; model: Model }
+    //   output: { system: string[] }
+    // We claim the most-recent unconsumed resume snapshot atomically (race-
+    // safe across concurrent processes) and prepend it to the system prompt.
+    // First-injection-per-session is enforced by `resumeInjected` Set.
+    "experimental.chat.system.transform": async (
+      input: SystemTransformHookInput,
+      output: SystemTransformHookOutput,
     ) => {
-      if (sessionStartInjected) return;
-      sessionStartInjected = true;
+      const sessionId = input?.sessionID;
+      if (!sessionId) return;
+      if (resumeInjected.has(sessionId)) return;
+      resumeInjected.add(sessionId);
       try {
-        // Find the most recent resume snapshot for this project across
-        // any prior session. ContextSessionDB has no per-project resume
-        // lookup, so we fall back to the current session's resume row.
-        const row = db.getResume(sessionId);
-        const snapshot = row?.snapshot;
-        if (!snapshot || snapshot.length === 0) return;
-
-        if (output && Array.isArray(output.messages)) {
-          output.messages.unshift({
-            role: "system",
-            content: snapshot,
-          });
+        const row = db.claimLatestUnconsumedResume();
+        if (!row || !row.snapshot) return;
+        if (Array.isArray(output?.system)) {
+          // Insert at index 1 (after the header) — NOT unshift.
+          // OpenCode's llm.ts:117-128 saves `header = system[0]` BEFORE this
+          // hook runs and then folds the rest into a 2-part structure
+          // `[header, body]` only if `system[0] === header` after the hook.
+          // Prepending via unshift replaces system[0] with the snapshot,
+          // making the equality check fail → cache-fold is skipped → every
+          // system block is sent as a separate `role: "system"` message →
+          // provider prompt cache is invalidated on every resume injection.
+          // Inserting at index 1 keeps the header invariant and lets the
+          // snapshot ride along inside the cached body block.
+          output.system.splice(1, 0, row.snapshot);
         }
       } catch {
         // Silent — never break the chat turn
