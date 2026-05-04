@@ -9,7 +9,9 @@
  * Session Lifecycle Rules:
  * - "startup"  → Fresh session. Inject previous session knowledge. Cleanup old data.
  * - "compact"  → Auto-compact triggered. Inject resume snapshot + stats.
- * - "resume"   → User used --continue. Full history, no resume needed.
+ * - "resume"   → User invoked --continue, --resume, or /resume. CC sends the
+ *                ACTIVE session_id; for /resume this is typically a *fresh*
+ *                id, so live events miss → fall back to snapshot (#413).
  * - "clear"    → User cleared context. No resume.
  *
  * Crash-resilience: wrapped via runHook (#414) — all module loads happen
@@ -96,23 +98,34 @@ await runHook(async () => {
 
       db.close();
     } else if (source === "resume") {
-      // User used --continue — clear cleanup flag so startup doesn't wipe data
+      // User invoked --continue, --resume, or /resume — clear cleanup flag so
+      // startup doesn't wipe data on the next fresh boot.
       try { unlinkSync(getCleanupFlagPath()); } catch { /* no flag */ }
 
       const { SessionDB } = await loadSessionDB();
       const dbPath = getSessionDBPath();
       const db = new SessionDB({ dbPath });
 
-      // Filter events to the session being resumed. Falling back to
-      // getLatestSessionEvents(db) leaks events from any other session whose
-      // session_meta.started_at is more recent — observed cross-session bleed
-      // when a different worktree session started after this one and before
-      // the resume.
+      // 1) Try live events for the resumed session. Filter strictly to the
+      //    incoming session_id — falling back to getLatestSessionEvents(db)
+      //    leaks events from any other session whose session_meta.started_at
+      //    is more recent (cross-worktree bleed observed in the wild).
       const sessionId = getSessionId(input);
       const events = sessionId ? getSessionEvents(db, sessionId) : [];
       if (events.length > 0) {
         const eventMeta = writeSessionEventsFile(events, getSessionEventsPath());
         additionalContext += buildSessionDirective("resume", eventMeta, toolNamer);
+      } else if (sessionId) {
+        // 2) Snapshot fallback (#413). /resume hands us a *new* active session
+        //    id whose live event table is empty; the prior conversation lives
+        //    in `session_resume.snapshot`. Mirrors the OpenCode/OpenClaw resume
+        //    injection path (opencode-plugin.ts:454). claimLatestUnconsumedResume
+        //    excludes the current id, so we surface the latest unconsumed
+        //    snapshot from any prior session in this project.
+        const row = db.claimLatestUnconsumedResume(sessionId);
+        if (row?.snapshot) {
+          additionalContext += "\n\n" + row.snapshot;
+        }
       }
 
       db.close();

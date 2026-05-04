@@ -921,7 +921,9 @@ This means `--continue` sessions preserve indexed docs across restarts. No re-fe
 
 When the context window fills up, the agent compacts the conversation — dropping older messages to make room. Without session tracking, the model forgets which files it was editing, what tasks are in progress, what errors were resolved, and what you last asked for.
 
-Context Mode captures every meaningful event during your session and persists them in a per-project SQLite database. When the conversation compacts (or you resume with `--continue`), your working state is rebuilt automatically — the model continues from your last prompt without asking you to repeat anything.
+Context Mode captures every meaningful event during your session and persists them in a per-project SQLite database. When the conversation compacts (or you resume with `--continue`, `--resume`, or `/resume`), your working state is rebuilt automatically — the model continues from your last prompt without asking you to repeat anything.
+
+> Resuming a non-latest session via `/resume <picker>` works the same way: the SessionStart hook detects the empty live-event table for the freshly issued session id and falls back to the most recent unconsumed snapshot for the project (`session_resume` table). The picker selects the conversation; context-mode rehydrates the prior working state.
 
 Session continuity requires 5 hooks working together:
 
@@ -1017,7 +1019,7 @@ Detailed event data is also indexed into FTS5 for on-demand retrieval via `ctx_s
 <details>
 <summary><strong>Per-platform details</strong></summary>
 
-**Claude Code** — Full session support. All 5 hook types fire, capturing tool events, user decisions, building compaction snapshots, and restoring state after compaction or `--continue`.
+**Claude Code** — Full session support. All 5 hook types fire, capturing tool events, user decisions, building compaction snapshots, and restoring state after compaction, `--continue`, `--resume`, or `/resume`.
 
 **Gemini CLI** — High coverage. PostToolUse (AfterTool), PreCompact (PreCompress), and SessionStart all fire. Missing UserPromptSubmit, so user decisions and corrections aren't captured — but file edits, git ops, errors, and tasks are fully tracked.
 
