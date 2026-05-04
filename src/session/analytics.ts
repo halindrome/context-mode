@@ -497,6 +497,13 @@ export interface LifetimeStats {
   autoMemoryProjects: number;
   /** Per-prefix breakdown of auto-memory files (user/feedback/project/...). */
   autoMemoryByPrefix: Record<string, number>;
+  /**
+   * Per-category event counts aggregated across every SessionDB on disk.
+   * Keys are the raw category strings (file/cwd/rule/...) — the renderer
+   * looks them up against `categoryLabels` for display. Empty `{}` when no
+   * sidecar has any events. Optional for back-compat with older fixtures.
+   */
+  categoryCounts: Record<string, number>;
 }
 
 /** Extract leading prefix from auto-memory filename: `feedback_push.md` → `feedback`. */
@@ -526,6 +533,7 @@ export function getLifetimeStats(opts?: {
 
   let totalEvents = 0;
   let totalSessions = 0;
+  const categoryCounts: Record<string, number> = {};
 
   // ── SessionDB aggregation ──
   if (existsSync(sessionsDir)) {
@@ -553,6 +561,20 @@ export function getLifetimeStats(opts?: {
               const ss = sdb.prepare("SELECT COUNT(*) AS cnt FROM session_meta").get() as { cnt: number } | undefined;
               totalEvents += ev?.cnt ?? 0;
               totalSessions += ss?.cnt ?? 0;
+              // Per-category aggregation across every sidecar so the
+              // Persistent memory bars stay populated even when the
+              // current project's local DB is fresh / empty.
+              try {
+                const catRows = sdb.prepare(
+                  "SELECT category, COUNT(*) AS cnt FROM session_events GROUP BY category",
+                ).all() as Array<{ category: string; cnt: number }>;
+                for (const row of catRows) {
+                  if (!row.category) continue;
+                  categoryCounts[row.category] = (categoryCounts[row.category] ?? 0) + (row.cnt ?? 0);
+                }
+              } catch {
+                // older schema / no category column — ignore
+              }
             } finally {
               sdb.close();
             }
@@ -602,6 +624,7 @@ export function getLifetimeStats(opts?: {
     autoMemoryCount,
     autoMemoryProjects,
     autoMemoryByPrefix,
+    categoryCounts,
   };
 }
 
@@ -702,7 +725,24 @@ function renderProjectMemory(
   out.push(`  ${fmtNum(lifeEvents)} events · ${sessionLabel} · ~${tokensToUsd(lifetimeTokens)} saved lifetime`);
   out.push("");
 
-  const cats = pm.by_category;
+  // Prefer lifetime categoryCounts (aggregated across every SessionDB) so
+  // the bar block matches the lifetime header above. Falls back to the
+  // project-local pm.by_category when lifetime data is absent (tests, older
+  // callers) or when no sidecar has any events yet.
+  const lifetimeCats = opts?.lifetime?.categoryCounts;
+  let cats: Array<{ category: string; count: number; label: string }>;
+  if (lifetimeCats && Object.keys(lifetimeCats).length > 0) {
+    cats = Object.entries(lifetimeCats)
+      .filter(([, c]) => c > 0)
+      .map(([category, count]) => ({
+        category,
+        count,
+        label: categoryLabels[category] || category,
+      }))
+      .sort((a, b) => b.count - a.count);
+  } else {
+    cats = pm.by_category;
+  }
   const visible = cats.slice(0, topN);
   const maxCount = visible.length > 0 ? visible[0].count : 1;
   for (const cat of visible) {
@@ -732,8 +772,13 @@ function renderAutoMemory(lifetime: LifetimeStats | undefined): string[] {
   const entries = Object.entries(lifetime.autoMemoryByPrefix)
     .sort((a, b) => b[1] - a[1])
     .slice(0, 6);
+  // Top entry sets the bar scale so the visual stays proportional even when
+  // the absolute counts are tiny. Entries are pre-sorted desc.
+  const maxCount = entries.length > 0 ? entries[0][1] : 1;
   for (const [prefix, count] of entries) {
-    out.push(`  ${prefix.padEnd(12)} ${String(count).padStart(2)}`);
+    out.push(
+      `  ${prefix.padEnd(12)} ${String(count).padStart(2)}   ${dataBar(count, maxCount, 20)}`,
+    );
   }
   return out;
 }
