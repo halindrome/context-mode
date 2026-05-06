@@ -77,6 +77,13 @@ export class ClaudeCodeAdapter extends ClaudeCodeBaseAdapter implements HookAdap
    * `hooks/session-helpers.mjs::resolveConfigDir` already follows — including
    * tilde expansion for shells that pass `~/foo` through unchanged — so server
    * and hooks agree on where session-scoped state lives. See issue #453.
+   *
+   * Tilde regex `/^~[/\\]?/` only handles the current-user form (`~`, `~/`,
+   * `~\`); `~user/` is NOT expanded to a per-user homedir (matches
+   * `resolveConfigDir`). Non-tilde values are run through `resolve()` to
+   * normalize relative paths to absolute against cwd; the hook helper
+   * intentionally leaves them raw, but the adapter contract guarantees an
+   * absolute path (BaseAdapter.getConfigDir docstring).
    */
   getConfigDir(_projectDir?: string): string {
     const envVal = process.env.CLAUDE_CONFIG_DIR;
