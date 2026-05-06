@@ -74,13 +74,19 @@ export class ClaudeCodeAdapter extends ClaudeCodeBaseAdapter implements HookAdap
   /**
    * Honor `CLAUDE_CONFIG_DIR` (the canonical Claude Code config root) before
    * falling back to `~/.claude`. Mirrors the contract that
-   * `hooks/session-helpers.mjs` already follows so server and hooks agree on
-   * where session-scoped state lives. See issue #453.
+   * `hooks/session-helpers.mjs::resolveConfigDir` already follows — including
+   * tilde expansion for shells that pass `~/foo` through unchanged — so server
+   * and hooks agree on where session-scoped state lives. See issue #453.
    */
   getConfigDir(_projectDir?: string): string {
-    return process.env.CLAUDE_CONFIG_DIR
-      ? resolve(process.env.CLAUDE_CONFIG_DIR)
-      : resolve(homedir(), ".claude");
+    const envVal = process.env.CLAUDE_CONFIG_DIR;
+    if (envVal) {
+      if (envVal.startsWith("~")) {
+        return resolve(homedir(), envVal.replace(/^~[/\\]?/, ""));
+      }
+      return resolve(envVal);
+    }
+    return resolve(homedir(), ".claude");
   }
 
   getSessionDir(): string {

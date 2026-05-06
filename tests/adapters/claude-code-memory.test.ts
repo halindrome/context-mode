@@ -31,6 +31,16 @@ describe("ClaudeCodeAdapter memory conventions", () => {
     expect(adapter.getConfigDir()).toBe("/tmp/custom-claude-dir");
   });
 
+  it("getConfigDir expands leading ~ in CLAUDE_CONFIG_DIR (matches resolveConfigDir contract)", () => {
+    process.env.CLAUDE_CONFIG_DIR = "~/my-claude-cfg";
+    expect(adapter.getConfigDir()).toBe(join(homedir(), "my-claude-cfg"));
+  });
+
+  it("getConfigDir falls back to ~/.claude when CLAUDE_CONFIG_DIR is empty string", () => {
+    process.env.CLAUDE_CONFIG_DIR = "";
+    expect(adapter.getConfigDir()).toBe(join(homedir(), ".claude"));
+  });
+
   it("getInstructionFiles returns ['CLAUDE.md']", () => {
     expect(adapter.getInstructionFiles()).toEqual(["CLAUDE.md"]);
   });
