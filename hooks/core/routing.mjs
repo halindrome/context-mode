@@ -130,6 +130,89 @@ function stripQuotedContent(cmd) {
     .replace(/"[^"]*"/g, '""');                   // double-quoted strings
 }
 
+/**
+ * Built-in allowlist of structurally-bounded Bash commands (#463).
+ *
+ * The PreToolUse Bash nudge ("May produce large output. Use ctx_…") is
+ * tuned for unbounded commands like `find /` or `cat large-file`. On
+ * commands whose stdout is structurally bounded (system probes, version
+ * checks, simple git read subcommands), the nudge is pure noise — a
+ * recurring ~85 tokens that trains the agent to ignore the warning.
+ *
+ * isStructurallyBounded() returns true ONLY when the command:
+ *   1. Has no shell control operators (pipe, redirect, command
+ *      substitution, &&, ||, ;) — any of those can compose with an
+ *      unbounded command and re-introduce flooding.
+ *   2. Matches one of the conservative patterns below.
+ *
+ * Unknown commands are treated as unbounded (false) — fail-safe default.
+ */
+const SAFE_COMMAND_PATTERNS = [
+  // System probes (no stdout, or one short line)
+  /^pwd$/,
+  /^whoami$/,
+  /^hostname(?:\s+-[a-zA-Z]+)?$/,
+  /^date(?:\s+.+)?$/,
+  /^echo\s/,
+  /^printf\s/,
+  /^which\s+\S+(?:\s+\S+)*$/,
+  /^type\s+\S+(?:\s+\S+)*$/,
+  /^command\s+-v\s+\S+(?:\s+\S+)*$/,
+  /^readlink(?:\s+.+)?$/,
+  /^basename(?:\s+.+)?$/,
+  /^dirname(?:\s+.+)?$/,
+  // Filesystem ops (silent on success, errors on stderr only).
+  // For cp / mv / rm we explicitly refuse `-v` / `--verbose`: verbose
+  // mode prints one line per file and can flood on big trees
+  // (recursive copy of /etc, mass rename, etc.). The "silent on
+  // success" invariant only holds without -v.
+  /^cd(?:\s+.+)?$/,
+  /^mkdir(?:\s+.+)?$/,
+  /^touch\s+.+$/,
+  /^mv(?!\s+-[a-zA-Z]*v\b)(?!\s+--verbose\b)\s+.+$/,
+  /^cp(?!\s+-[a-zA-Z]*v\b)(?!\s+--verbose\b)\s+.+$/,
+  /^rm(?!\s+-[a-zA-Z]*v\b)(?!\s+--verbose\b)\s+.+$/,
+  // ls — refuse recursive (-R / --recursive) to keep output bounded.
+  /^ls(?!\s+-[a-zA-Z]*R)(?!\s+--recursive)(?:\s+.+)?$/,
+  // git read-only / status subcommands
+  /^git\s+status(?:\s+.+)?$/,
+  /^git\s+rev-parse(?:\s+.+)?$/,
+  /^git\s+remote(?:\s+-v|\s+show\s+\S+)?$/,
+  /^git\s+branch(?:\s+.+)?$/,
+  /^git\s+config\s+--get(?:\s+.+)?$/,
+  /^git\s+diff\s+--stat(?:\s+.+)?$/,
+  /^git\s+diff\s+--name-only(?:\s+.+)?$/,
+  /^git\s+stash\s+list$/,
+  /^git\s+tag(?:\s+-l(?:\s+.+)?)?$/,
+  // git log only when explicitly bounded by -<N> with N up to two digits
+  /^git\s+log\s+-\d{1,2}(?:\s+.+)?$/,
+  // Version probes (--version anywhere, or `cmd -V`)
+  /(?:^|\s)--version(?:\s|$)/,
+  /^\S+\s+-V(?:\s|$)/,
+];
+
+// Bash shell control operators that can compose a safe command with an
+// unbounded sink. Any match disqualifies the command from the allowlist.
+//
+// Note `&` (single — background + sequence): listed BEFORE `&&` in the
+// alternation so the regex engine doesn't accidentally short-match `&&`
+// when `&` is itself a separator (`date & cat huge.log`). Without this,
+// `^date(?:\s+.+)?$` would match the whole string and bypass the gate.
+const SHELL_CONTROL_OPERATORS = /[|`]|\$\(|>>|>|<(?!<)|&(?!&)|&&|\|\||;/;
+
+/**
+ * @param {string} command Raw Bash command string from the hook payload.
+ * @returns {boolean} true when the command's output is bounded enough that
+ *   the routing nudge would be noise. Conservative — unknown commands
+ *   return false.
+ */
+export function isStructurallyBounded(command) {
+  if (!command) return false;
+  const trimmed = command.trim();
+  if (SHELL_CONTROL_OPERATORS.test(trimmed)) return false;
+  return SAFE_COMMAND_PATTERNS.some(rx => rx.test(trimmed));
+}
+
 // Try to import security module — may not exist
 let security = null;
 let securityInitFailed = false;
@@ -366,6 +449,14 @@ export function routePreToolUse(toolName, toolInput, projectDir, platform, sessi
           command: `echo "context-mode: Build tool redirected. Think in Code — use ${t("ctx_execute")}(language: \\"shell\\", code: \\"${safeCmd} 2>&1 | tail -30\\") to run and print only errors/summary. Do NOT retry with Bash."`,
         },
       });
+    }
+
+    // Skip the routing nudge for commands whose output is structurally
+    // bounded (#463) — pwd, whoami, git status, --version probes, etc.
+    // Conservative: any pipe/redirect/chain disqualifies, unknown commands
+    // still get the nudge.
+    if (isStructurallyBounded(command)) {
+      return null;
     }
 
     // allow all other Bash commands, but inject routing nudge (once per session)
