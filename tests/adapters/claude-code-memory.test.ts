@@ -1,7 +1,7 @@
 import "../setup-home";
 import { afterEach, beforeEach, describe, it, expect } from "vitest";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { ClaudeCodeAdapter } from "../../src/adapters/claude-code/index.js";
 
 /**
@@ -27,8 +27,11 @@ describe("ClaudeCodeAdapter memory conventions", () => {
   });
 
   it("getConfigDir honors CLAUDE_CONFIG_DIR when set (issue #453)", () => {
-    process.env.CLAUDE_CONFIG_DIR = "/tmp/custom-claude-dir";
-    expect(adapter.getConfigDir()).toBe("/tmp/custom-claude-dir");
+    // Use resolve() in the expectation so the test passes on Windows, where
+    // resolve("/tmp/...") drive-letter-prefixes to "<DRIVE>:\tmp\...".
+    const customDir = resolve("/tmp/custom-claude-dir");
+    process.env.CLAUDE_CONFIG_DIR = customDir;
+    expect(adapter.getConfigDir()).toBe(customDir);
   });
 
   it("getConfigDir expands leading ~ in CLAUDE_CONFIG_DIR (matches resolveConfigDir contract)", () => {
@@ -50,7 +53,8 @@ describe("ClaudeCodeAdapter memory conventions", () => {
   });
 
   it("getMemoryDir derives from CLAUDE_CONFIG_DIR when set", () => {
-    process.env.CLAUDE_CONFIG_DIR = "/tmp/custom-claude-dir";
-    expect(adapter.getMemoryDir()).toBe("/tmp/custom-claude-dir/memory");
+    const customDir = resolve("/tmp/custom-claude-dir");
+    process.env.CLAUDE_CONFIG_DIR = customDir;
+    expect(adapter.getMemoryDir()).toBe(join(customDir, "memory"));
   });
 });
