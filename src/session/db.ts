@@ -232,6 +232,8 @@ export class SessionDB extends SQLiteBase {
         project_dir TEXT NOT NULL DEFAULT '',
         attribution_source TEXT NOT NULL DEFAULT 'unknown',
         attribution_confidence REAL NOT NULL DEFAULT 0,
+        bytes_avoided INTEGER NOT NULL DEFAULT 0,
+        bytes_returned INTEGER NOT NULL DEFAULT 0,
         source_hook TEXT NOT NULL,
         created_at TEXT NOT NULL DEFAULT (datetime('now')),
         data_hash TEXT NOT NULL DEFAULT ''
@@ -283,6 +285,12 @@ export class SessionDB extends SQLiteBase {
       }
       if (!cols.has("attribution_confidence")) {
         this.db.exec("ALTER TABLE session_events ADD COLUMN attribution_confidence REAL NOT NULL DEFAULT 0");
+      }
+      if (!cols.has("bytes_avoided")) {
+        this.db.exec("ALTER TABLE session_events ADD COLUMN bytes_avoided INTEGER NOT NULL DEFAULT 0");
+      }
+      if (!cols.has("bytes_returned")) {
+        this.db.exec("ALTER TABLE session_events ADD COLUMN bytes_returned INTEGER NOT NULL DEFAULT 0");
       }
       this.db.exec("CREATE INDEX IF NOT EXISTS idx_session_events_project ON session_events(session_id, project_dir)");
     } catch {
