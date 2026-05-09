@@ -619,3 +619,109 @@ describe("Shell-Escape Scanner", () => {
     assert.deepEqual(result, []);
   });
 });
+
+/**
+ * Issue #460 follow-up — security policy readers MUST honor CLAUDE_CONFIG_DIR.
+ *
+ * The adapter layer routes settings reads through `getConfigDir()`, but
+ * `readBashPolicies` / `readToolDenyPatterns` are called directly from
+ * runtime/SDK code paths that do not have an adapter handle. If they hardcode
+ * `~/.claude/settings.json` (the bug), users who relocate their config via
+ * `CLAUDE_CONFIG_DIR` get policy drift: hooks read overridden settings, the
+ * runtime reads the unset homedir copy, and deny rules silently disappear.
+ *
+ * Behavior under test (calling the function with NO explicit globalPath):
+ *   - env unset → reads ~/.claude/settings.json
+ *   - env set to a custom dir → reads <custom>/settings.json
+ *   - env empty → falls back to ~/.claude/settings.json
+ */
+describe("CLAUDE_CONFIG_DIR honors security policy reader", () => {
+  let cfgTmpBase: string;
+  let customConfigDir: string;
+  let savedEnv: string | undefined;
+
+  beforeAll(() => {
+    cfgTmpBase = join(tmpdir(), `security-cfg-test-${Date.now()}`);
+
+    // Custom CLAUDE_CONFIG_DIR target — has a deny that the homedir copy lacks.
+    customConfigDir = join(cfgTmpBase, "custom-cc");
+    mkdirSync(customConfigDir, { recursive: true });
+    writeFileSync(
+      join(customConfigDir, "settings.json"),
+      JSON.stringify({
+        permissions: {
+          allow: [],
+          deny: ["Bash(custom-marker *)"],
+        },
+      }),
+    );
+
+    // Homedir fallback — distinct content so we can detect which file was read.
+    const homeClaudeDir = join(homedir(), ".claude");
+    mkdirSync(homeClaudeDir, { recursive: true });
+    writeFileSync(
+      join(homeClaudeDir, "settings.json"),
+      JSON.stringify({
+        permissions: {
+          allow: [],
+          deny: ["Bash(homedir-marker *)"],
+        },
+      }),
+    );
+
+    savedEnv = process.env.CLAUDE_CONFIG_DIR;
+  });
+
+  afterAll(() => {
+    if (savedEnv === undefined) delete process.env.CLAUDE_CONFIG_DIR;
+    else process.env.CLAUDE_CONFIG_DIR = savedEnv;
+    rmSync(cfgTmpBase, { recursive: true, force: true });
+  });
+
+  test("readBashPolicies: env unset reads ~/.claude/settings.json", () => {
+    delete process.env.CLAUDE_CONFIG_DIR;
+    const policies = readBashPolicies();
+    assert.equal(policies.length, 1, "should load homedir policy");
+    assert.deepEqual(policies[0].deny, ["Bash(homedir-marker *)"]);
+  });
+
+  test("readBashPolicies: env=customDir reads <customDir>/settings.json", () => {
+    process.env.CLAUDE_CONFIG_DIR = customConfigDir;
+    const policies = readBashPolicies();
+    assert.equal(policies.length, 1, "should load custom-dir policy");
+    assert.deepEqual(
+      policies[0].deny,
+      ["Bash(custom-marker *)"],
+      "must NOT fall through to ~/.claude when env is set",
+    );
+  });
+
+  test("readBashPolicies: env empty string falls back to ~/.claude", () => {
+    process.env.CLAUDE_CONFIG_DIR = "";
+    const policies = readBashPolicies();
+    assert.equal(policies.length, 1);
+    assert.deepEqual(policies[0].deny, ["Bash(homedir-marker *)"]);
+  });
+
+  test("readToolDenyPatterns: env=customDir reads <customDir>/settings.json", () => {
+    process.env.CLAUDE_CONFIG_DIR = customConfigDir;
+    // Switch the marker to a Read(...) pattern so readToolDenyPatterns has
+    // something to extract — overwrite the file we wrote in beforeAll.
+    writeFileSync(
+      join(customConfigDir, "settings.json"),
+      JSON.stringify({
+        permissions: {
+          deny: ["Read(.env.custom)"],
+          allow: [],
+        },
+      }),
+    );
+    const result = readToolDenyPatterns("Read");
+    assert.ok(result.length > 0, "should read from custom CLAUDE_CONFIG_DIR");
+    const flat = result.flat();
+    assert.ok(
+      flat.includes(".env.custom"),
+      `expected '.env.custom' from custom dir, got ${JSON.stringify(flat)}`,
+    );
+  });
+});

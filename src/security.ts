@@ -1,6 +1,7 @@
 import { readFileSync, realpathSync } from "node:fs";
 import { resolve } from "node:path";
-import { homedir } from "node:os";
+
+import { resolveClaudeGlobalSettingsPath } from "./util/claude-config.js";
 
 // ==============================================================================
 // Types
@@ -272,8 +273,7 @@ export function readBashPolicies(
     if (sharedPolicy) policies.push(sharedPolicy);
   }
 
-  const globalPath =
-    globalSettingsPath ?? resolve(homedir(), ".claude", "settings.json");
+  const globalPath = globalSettingsPath ?? resolveClaudeGlobalSettingsPath();
   const globalPolicy = readSingleSettings(globalPath);
   if (globalPolicy) policies.push(globalPolicy);
 
@@ -338,8 +338,7 @@ export function readToolDenyPatterns(
     if (sharedGlobs !== null) result.push(sharedGlobs);
   }
 
-  const globalPath =
-    globalSettingsPath ?? resolve(homedir(), ".claude", "settings.json");
+  const globalPath = globalSettingsPath ?? resolveClaudeGlobalSettingsPath();
   const globalGlobs = extractGlobs(globalPath);
   if (globalGlobs !== null) result.push(globalGlobs);
 
