@@ -300,6 +300,26 @@ async function createContextModePlugin(ctx: PluginContext) {
     });
   }
 
+  /**
+   * Drop-in wrapper for `logger` that NEVER rejects (#448).
+   *
+   * The OPENCODE_DEBUG branch awaits `logger(...)` from inside the chat-turn
+   * hot path (chat.system.transform). If `ctx.client.app.log` rejects —
+   * transport error, closed stream, oversized payload — the promise rejection
+   * propagates back to OpenCode core and can break the turn. Debug logging
+   * is best-effort; swallow errors silently and let the turn proceed.
+   */
+  async function safeLog(
+    message?: string,
+    extra?: PluginClientAppLogBodyExtra,
+  ): Promise<void> {
+    try {
+      await logger(message, extra);
+    } catch {
+      // Never break the turn on debug-log failure.
+    }
+  }
+
   return {
     // ── PreToolUse: Routing enforcement ─────────────────
 
@@ -415,7 +435,7 @@ async function createContextModePlugin(ctx: PluginContext) {
         output.context.push(snapshot);
 
         if (process.env.OPENCODE_DEBUG) {
-          await logger(snapshot, {
+          await safeLog(snapshot, {
             sessionId,
             source: "on compaction - snapshot",
           });
@@ -432,7 +452,7 @@ async function createContextModePlugin(ctx: PluginContext) {
           }
 
           if (process.env.OPENCODE_DEBUG) {
-            await logger(autoBlock, {
+            await safeLog(autoBlock, {
               sessionId,
               source: "on compaction - autoBlock",
             });
@@ -482,10 +502,10 @@ async function createContextModePlugin(ctx: PluginContext) {
           }
 
           if (process.env.OPENCODE_DEBUG) {
-            await logger(output.system[1], {sessionId, source: 'on routing block injection'});
+            await safeLog(output.system[1], {sessionId, source: 'on routing block injection'});
           }
         } else if (process.env.OPENCODE_DEBUG) {
-          await logger(`routing block skipped — system prompt already contains context-mode instructions`, {sessionId, source: 'on routing block injection'});
+          await safeLog(`routing block skipped — system prompt already contains context-mode instructions`, {sessionId, source: 'on routing block injection'});
         }
       }
 
@@ -497,7 +517,7 @@ async function createContextModePlugin(ctx: PluginContext) {
         if (!row || !row.snapshot) return;        // no row → retry on next turn
 
         if (process.env.OPENCODE_DEBUG) {
-          await logger(row.snapshot, {
+          await safeLog(row.snapshot, {
             sessionId,
             source: "on resume - snapshot",
           });
@@ -517,7 +537,7 @@ async function createContextModePlugin(ctx: PluginContext) {
           output.system.splice(1, 0, row.snapshot);
           // Mark consumed only AFTER successful splice so failed paths can retry
           if (process.env.OPENCODE_DEBUG) {
-            await logger(output.system[1], { sessionId, source: "on resume" });
+            await safeLog(output.system[1], { sessionId, source: "on resume" });
           }
         }
       } catch {

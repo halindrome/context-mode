@@ -823,4 +823,99 @@ describe("ContextModePlugin", () => {
       expect(snapshot).toBe("");
     });
   });
+
+  // ── #448: debug-logger rejection must NOT break the turn ──
+  // OPENCODE_DEBUG=1 + a transport-rejecting `ctx.client.app.log` previously
+  // caused unhandled rejection from chat.system.transform → potential turn
+  // break. All `await logger(...)` sites in the OPENCODE_DEBUG branch must
+  // be wrapped so the handler still resolves and the routing block is still
+  // spliced into output.system.
+  describe("OPENCODE_DEBUG=1 + rejecting logger does not break the turn", () => {
+    async function createPluginWithRejectingLog(tempDir: string) {
+      const { ContextModePlugin } = await import("../src/adapters/opencode/plugin.js");
+      return ContextModePlugin({
+        directory: tempDir,
+        client: {
+          app: {
+            log: async () => {
+              throw new Error("transport");
+            },
+          },
+        },
+      });
+    }
+
+    let prevDebug: string | undefined;
+    beforeEach(() => {
+      prevDebug = process.env.OPENCODE_DEBUG;
+      process.env.OPENCODE_DEBUG = "1";
+    });
+    afterEach(() => {
+      if (prevDebug === undefined) delete process.env.OPENCODE_DEBUG;
+      else process.env.OPENCODE_DEBUG = prevDebug;
+    });
+
+    it("#448: rejecting logger on routing-block injection resolves and still injects", async () => {
+      const plugin = await createPluginWithRejectingLog(join(tempDir, "issue-448-routing"));
+      const out = { system: ["HEADER", "BODY"] };
+
+      // Must resolve — no rejection propagated to OpenCode core
+      await expect(
+        plugin["experimental.chat.system.transform"](
+          { sessionID: "issue-448-routing-sess", model: {} } as any,
+          out,
+        ),
+      ).resolves.not.toThrow();
+
+      // Routing block still spliced at index 1 (turn-break would skip this)
+      expect(out.system[0]).toBe("HEADER");
+      expect(out.system.join("\n")).toContain("<context_window_protection>");
+    });
+
+    it("#448: rejecting logger on compaction snapshot resolves and still pushes context", async () => {
+      const projectDir = join(tempDir, "issue-448-compact");
+      mkdirSync(projectDir, { recursive: true });
+      const plugin = await createPluginWithRejectingLog(projectDir);
+
+      // Seed an event so the snapshot path runs (events.length > 0)
+      const sessionID = "issue-448-compact-sess";
+      await plugin["chat.message"](
+        { sessionID, agent: "build", messageID: "m1" } as any,
+        { message: { role: "user" } as any, parts: [{ type: "text", text: "seed prompt for snapshot" }] } as any,
+      );
+
+      const compactOutput = { context: [] as string[], prompt: undefined };
+      await expect(
+        plugin["experimental.session.compacting"](
+          { sessionID } as any,
+          compactOutput,
+        ),
+      ).resolves.not.toThrow();
+
+      // Snapshot still pushed despite rejecting logger
+      expect(compactOutput.context.length).toBeGreaterThan(0);
+    });
+
+    it("#448: rejecting logger on dedup-skip branch still resolves", async () => {
+      const plugin = await createPluginWithRejectingLog(join(tempDir, "issue-448-dedup"));
+      const agentsContent = [
+        "# context-mode rules",
+        "Use ctx_execute for analysis",
+        "Use ctx_batch_execute for commands",
+        "Use ctx_fetch_and_index for URLs",
+      ].join("\n");
+      const out = { system: ["HEADER", agentsContent] };
+
+      await expect(
+        plugin["experimental.chat.system.transform"](
+          { sessionID: "issue-448-dedup-sess", model: {} } as any,
+          out,
+        ),
+      ).resolves.not.toThrow();
+
+      // Dedup branch unchanged (skipped routing block)
+      expect(out.system.length).toBe(2);
+      expect(out.system[1]).toBe(agentsContent);
+    });
+  });
 });
