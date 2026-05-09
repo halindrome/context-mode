@@ -357,6 +357,23 @@ function matchesContextModeTool(toolName, ctxName, legacyName) {
  *   invocations even when process.ppid shifts (Windows/Git Bash — see #298).
  */
 export function routePreToolUse(toolName, toolInput, projectDir, platform, sessionId) {
+  // ─── Opt-in fail-closed gate (#468 follow-up) ───
+  // Default behavior on security-module load failure is fail-OPEN (a stderr
+  // warning is emitted but routing continues). Security-conscious users can
+  // opt in to fail-CLOSED via CONTEXT_MODE_REQUIRE_SECURITY=1 — every PreToolUse
+  // event is denied with a clear reason until the security module loads cleanly.
+  // Universal gate (applies to all tools, not just Bash) since user `permissions.deny`
+  // patterns may target Read/Write paths that would otherwise leak before security loads.
+  if (process.env.CONTEXT_MODE_REQUIRE_SECURITY === "1" && securityInitFailed) {
+    return {
+      action: "deny",
+      reason:
+        "context-mode: security module unavailable and CONTEXT_MODE_REQUIRE_SECURITY=1 — fail-closed engaged. " +
+        "Run `npm run build` (or reinstall context-mode) to restore security enforcement. " +
+        "To bypass, unset or set CONTEXT_MODE_REQUIRE_SECURITY=0.",
+    };
+  }
+
   // Build platform-specific tool namer (defaults to claude-code for backward compat)
   const t = createToolNamer(platform || "claude-code");
 
