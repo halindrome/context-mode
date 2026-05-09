@@ -786,6 +786,124 @@ describe("ContextModePlugin", () => {
     });
   });
 
+  // ── OC-4 follow-up (#487 regression): AGENTS.md → rule_content ──
+  // PR #487 removed captureAgentsMd trusting host to deliver AGENTS.md
+  // events. But snapshot.ts:172 + analytics.ts:152 consume `rule_content`
+  // events that the OpenCode host does NOT auto-emit. Net effect: AGENTS.md
+  // never lands in snapshot/auto-memory for OpenCode users — silent
+  // regression. Restore capture path with idempotent per-session-id guard.
+  describe("OC-4 AGENTS.md capture restored", () => {
+    it("fires rule + rule_content events when AGENTS.md exists in project dir on first hook", async () => {
+      const projectDir = join(tempDir, "oc4-agents-md");
+      mkdirSync(projectDir, { recursive: true });
+      const agentsContent = "# Project rules\n- always prefer typescript\n- use tdd\n";
+      writeFileSync(join(projectDir, "AGENTS.md"), agentsContent);
+
+      const plugin = await createTestPlugin(projectDir);
+
+      // Trigger any hook that drives capture — using tool.execute.after is canonical
+      await plugin["tool.execute.after"](
+        { tool: "Read", sessionID: "oc4-sess-1", callID: "c1", args: { file_path: "/x.ts" } },
+        { title: "Read", output: "x", metadata: {} },
+      );
+
+      const { SessionDB } = await import("../src/session/db.js");
+      const { OpenCodeAdapter } = await import("../src/adapters/opencode/index.js");
+      const adapter = new OpenCodeAdapter("opencode");
+      const db = new SessionDB({ dbPath: adapter.getSessionDBPath(projectDir) });
+      const events = db.getEvents("oc4-sess-1") as any[];
+      db.close();
+
+      const ruleEvents = events.filter((e: any) => e.type === "rule");
+      const ruleContentEvents = events.filter((e: any) => e.type === "rule_content");
+      expect(ruleEvents.length).toBeGreaterThanOrEqual(1);
+      expect(ruleContentEvents.length).toBeGreaterThanOrEqual(1);
+      // rule event payload references AGENTS.md path; rule_content carries body
+      expect(ruleEvents.some((e: any) => String(e.data).endsWith("AGENTS.md"))).toBe(true);
+      expect(ruleContentEvents.some((e: any) => String(e.data).includes("always prefer typescript"))).toBe(true);
+    });
+
+    it("is idempotent — second hook invocation does NOT re-fire rule events", async () => {
+      const projectDir = join(tempDir, "oc4-agents-idempotent");
+      mkdirSync(projectDir, { recursive: true });
+      writeFileSync(join(projectDir, "AGENTS.md"), "# rules\n- one\n");
+
+      const plugin = await createTestPlugin(projectDir);
+
+      await plugin["tool.execute.after"](
+        { tool: "Read", sessionID: "oc4-idem", callID: "c1", args: { file_path: "/a.ts" } },
+        { title: "Read", output: "a", metadata: {} },
+      );
+      await plugin["tool.execute.after"](
+        { tool: "Read", sessionID: "oc4-idem", callID: "c2", args: { file_path: "/b.ts" } },
+        { title: "Read", output: "b", metadata: {} },
+      );
+
+      const { SessionDB } = await import("../src/session/db.js");
+      const { OpenCodeAdapter } = await import("../src/adapters/opencode/index.js");
+      const adapter = new OpenCodeAdapter("opencode");
+      const db = new SessionDB({ dbPath: adapter.getSessionDBPath(projectDir) });
+      const events = db.getEvents("oc4-idem") as any[];
+      db.close();
+
+      const ruleEvents = events.filter((e: any) => e.type === "rule");
+      const ruleContentEvents = events.filter((e: any) => e.type === "rule_content");
+      // Exactly one rule + one rule_content from AGENTS.md (no fallback files exist)
+      expect(ruleEvents.length).toBe(1);
+      expect(ruleContentEvents.length).toBe(1);
+    });
+
+    it("does NOT fire events when AGENTS.md / CLAUDE.md / CONTEXT.md all absent", async () => {
+      const projectDir = join(tempDir, "oc4-agents-missing");
+      mkdirSync(projectDir, { recursive: true });
+      // intentionally do NOT write any markdown rule files
+
+      const plugin = await createTestPlugin(projectDir);
+
+      // Should not throw when files absent
+      await expect(
+        plugin["tool.execute.after"](
+          { tool: "Read", sessionID: "oc4-missing", callID: "c1", args: { file_path: "/z.ts" } },
+          { title: "Read", output: "z", metadata: {} },
+        ),
+      ).resolves.toBeUndefined();
+
+      const { SessionDB } = await import("../src/session/db.js");
+      const { OpenCodeAdapter } = await import("../src/adapters/opencode/index.js");
+      const adapter = new OpenCodeAdapter("opencode");
+      const db = new SessionDB({ dbPath: adapter.getSessionDBPath(projectDir) });
+      const events = db.getEvents("oc4-missing") as any[];
+      db.close();
+
+      const ruleEvents = events.filter((e: any) => e.type === "rule" || e.type === "rule_content");
+      expect(ruleEvents.length).toBe(0);
+    });
+
+    it("falls back to CLAUDE.md when AGENTS.md absent", async () => {
+      const projectDir = join(tempDir, "oc4-claude-fallback");
+      mkdirSync(projectDir, { recursive: true });
+      writeFileSync(join(projectDir, "CLAUDE.md"), "# claude rules\n- be terse\n");
+
+      const plugin = await createTestPlugin(projectDir);
+
+      await plugin["tool.execute.after"](
+        { tool: "Read", sessionID: "oc4-claude", callID: "c1", args: { file_path: "/c.ts" } },
+        { title: "Read", output: "c", metadata: {} },
+      );
+
+      const { SessionDB } = await import("../src/session/db.js");
+      const { OpenCodeAdapter } = await import("../src/adapters/opencode/index.js");
+      const adapter = new OpenCodeAdapter("opencode");
+      const db = new SessionDB({ dbPath: adapter.getSessionDBPath(projectDir) });
+      const events = db.getEvents("oc4-claude") as any[];
+      db.close();
+
+      const ruleContentEvents = events.filter((e: any) => e.type === "rule_content");
+      expect(ruleContentEvents.length).toBeGreaterThanOrEqual(1);
+      expect(ruleContentEvents.some((e: any) => String(e.data).includes("be terse"))).toBe(true);
+    });
+  });
+
   // ── Integration: blocked tool flow ────────────────────
 
   describe("end-to-end flow (blocked)", () => {

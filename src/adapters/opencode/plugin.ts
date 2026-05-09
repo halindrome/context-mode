@@ -1,12 +1,12 @@
 /**
  * OpenCode / KiloCode TypeScript plugin entry point for context-mode.
  *
- * Provides five hooks (v1.0.107 — Mickey OC-1..OC-3 follow-up):
+ * Provides five hooks (v1.0.107 — Mickey OC-1..OC-4 follow-up):
  *   - tool.execute.before  — Routing enforcement (deny/modify/passthrough)
- *   - tool.execute.after   — Session event capture
+ *   - tool.execute.after   — Session event capture + first-fire AGENTS.md scan (OC-4)
  *   - experimental.session.compacting — Compaction snapshot + budget-capped auto-injection (OC-3)
  *   - experimental.chat.system.transform — ROUTING_BLOCK + resume snapshot injection (OC-1)
- *   - chat.message         — User-prompt capture w/ CCv2 inline filter (OC-2)
+ *   - chat.message         — User-prompt capture w/ CCv2 inline filter (OC-2) + AGENTS.md scan (OC-4)
  *
  * KiloCode loads this via: import("context-mode") → expects default export
  * with shape { server: (input) => Promise<Hooks> } (PluginModule).
@@ -21,7 +21,7 @@
  *   - Session cleanup happens at plugin init (no SessionStart)
  */
 
-import { dirname, resolve } from "node:path";
+import { dirname, resolve, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { existsSync, readFileSync } from "node:fs";
 
@@ -286,6 +286,50 @@ async function createContextModePlugin(ctx: PluginContext) {
   // Clean up old sessions on startup (no SessionStart hook to do this).
   db.cleanupOldSessions(7);
 
+  // OC-4 (#487 follow-up): per-session capture gate. PR #487 trusted the host
+  // to deliver AGENTS.md events, but OpenCode only fires `rule_content` events
+  // when the user explicitly reads the file. snapshot.ts:172 + analytics.ts:152
+  // CONSUME `rule_content` to render rules into the resume snapshot — without
+  // this capture path, AGENTS.md is silently absent from continuity output.
+  // Keyed by sessionId (NOT projectDir) so multi-session reuse within a long-
+  // lived plugin process still gets per-session capture exactly once.
+  const agentsMdCaptured = new Set<string>();
+
+  /**
+   * OC-4: Read AGENTS.md (with CLAUDE.md / CONTEXT.md fallbacks) from the
+   * project directory and persist as `rule` + `rule_content` events. Mirrors
+   * the CC SessionStart pattern at hooks/sessionstart.mjs:121-132 and the
+   * OpenCode instruction.ts FILES order. Idempotent via `agentsMdCaptured`
+   * Set keyed by sessionId. Fail-soft: missing/unreadable files do not throw.
+   */
+  function captureAgentsMd(sessionId: string): void {
+    if (agentsMdCaptured.has(sessionId)) return;
+    agentsMdCaptured.add(sessionId);
+    const candidates = ["AGENTS.md", "CLAUDE.md", "CONTEXT.md"];
+    for (const name of candidates) {
+      try {
+        const p = join(projectDir, name);
+        if (!existsSync(p)) continue;
+        const content = readFileSync(p, "utf-8");
+        if (!content.trim()) continue;
+        db.insertEvent(sessionId, {
+          type: "rule",
+          category: "rule",
+          data: p,
+          priority: 1,
+        } as SessionEvent, "PluginInit");
+        db.insertEvent(sessionId, {
+          type: "rule_content",
+          category: "rule",
+          data: content,
+          priority: 1,
+        } as SessionEvent, "PluginInit");
+      } catch {
+        // file missing or unreadable — skip silently
+      }
+    }
+  }
+
   function logger(
     message = "context-mode debug log",
     extra?: PluginClientAppLogBodyExtra,
@@ -359,6 +403,9 @@ async function createContextModePlugin(ctx: PluginContext) {
       if (!sessionId) return;
       try {
         db.ensureSession(sessionId, projectDir);
+        // OC-4 (#487 follow-up): AGENTS.md → rule_content capture for snapshot
+        // and auto-memory parity. Idempotent per-session via Set guard.
+        captureAgentsMd(sessionId);
 
         const hookInput: HookInput = {
           tool_name: input.tool ?? "",
@@ -394,7 +441,10 @@ async function createContextModePlugin(ctx: PluginContext) {
         if (isSyntheticMessage(message)) return;
 
         db.ensureSession(sessionId, projectDir);
-        
+        // OC-4 (#487 follow-up): also capture on chat.message so sessions that
+        // never invoke a tool still seed rule_content events for continuity.
+        captureAgentsMd(sessionId);
+
         // 1. Always save the raw prompt
         db.insertEvent(sessionId, {
           type: "user_prompt",
