@@ -307,7 +307,36 @@ Full setup guide: [`docs/jetbrains-copilot.md`](docs/jetbrains-copilot.md)
 
 **Prerequisites:** Node.js 18+, Cursor with agent mode.
 
-**Install:**
+> **🚧 Work in progress** — the Marketplace plugin is **awaiting Cursor team review**. Until it's listed, install via the local-folder path described in Option A. Tracking in [#485](https://github.com/mksglu/context-mode/issues/485) / [#489](https://github.com/mksglu/context-mode/pull/489).
+
+### Option A — Marketplace plugin (recommended once published)
+
+After Cursor lists context-mode in the [Marketplace](https://cursor.com/marketplace), install with one click. The plugin auto-registers MCP, hooks (`preToolUse`, `postToolUse`, `sessionStart`, `stop`, `afterAgentResponse`), rules, and skills. No manual config required.
+
+**Until then, use the local-folder path:**
+
+**Windows (PowerShell)** — Cursor does not follow Windows symlinks/junctions, so use `robocopy`:
+
+```powershell
+git clone https://github.com/mksglu/context-mode.git
+cd context-mode
+robocopy . "$env:USERPROFILE\.cursor\plugins\local\context-mode" /MIR `
+  /XD node_modules .git build insight web tests scripts .vscode `
+  /XF *.log .gitignore *.bundle.mjs.map
+```
+
+**macOS / Linux:**
+
+```bash
+git clone https://github.com/mksglu/context-mode.git
+ln -s "$PWD/context-mode" ~/.cursor/plugins/local/context-mode
+```
+
+Restart Cursor. The plugin appears in **Settings → Plugins** as "Context Mode (Local)". To pull updates, re-run the same `robocopy` / `ln -s` line.
+
+> **Note:** if `.cursor/hooks.json` already contains context-mode entries from a prior `Option B` install, `context-mode doctor` will warn about duplicate hook firings. Remove one configuration to keep events single-fire.
+
+### Option B — Manual install (existing path)
 
 1. Install context-mode globally:
 
