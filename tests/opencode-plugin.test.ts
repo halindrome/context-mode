@@ -1018,9 +1018,9 @@ describe("ContextModePlugin", () => {
       const plugin = await createPluginWithRejectingLog(join(tempDir, "issue-448-dedup"));
       const agentsContent = [
         "# context-mode rules",
-        "Use ctx_execute for analysis",
-        "Use ctx_batch_execute for commands",
-        "Use ctx_fetch_and_index for URLs",
+        "<context_window_protection>",
+        "Use ctx_search for queries",
+        "Use ctx_index for indexing",
       ].join("\n");
       const out = { system: ["HEADER", agentsContent] };
 

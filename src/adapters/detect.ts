@@ -357,6 +357,14 @@ export async function getAdapter(platform?: PlatformId): Promise<HookAdapter> {
       return new OMPAdapter();
     }
 
+    case "pi": {
+      // Issue #473 follow-up: without this case, getAdapter("pi") fell
+      // through to ClaudeCodeAdapter and Pi sessions wrote into
+      // ~/.claude/context-mode/. PiAdapter pins storage to ~/.pi/.
+      const { PiAdapter } = await import("./pi/index.js");
+      return new PiAdapter();
+    }
+
     default: {
       // Unsupported platform — fall back to Claude Code adapter
       // (MCP server works everywhere, hooks may not)
