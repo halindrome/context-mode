@@ -1952,6 +1952,32 @@ dnsPromises.lookup = async function patchedPromisesLookup(hostname, options) {
   };
 });
 
+// Generic dns.resolve is a polymorphic dispatcher (rrtype-driven). Internally
+// Node delegates to dns.resolve4/dns.resolve6 for A/AAAA, but the patches
+// above hook the *exported* references — Node's internal dispatcher holds
+// captured originals and bypasses our patch. Patch the wrapper explicitly:
+// classify A/AAAA records the same way; pass through CNAME/MX/TXT/SRV/etc.
+const _origResolveGeneric = dns.resolve;
+dns.resolve = function patchedResolveGeneric(hostname, rrtype, cb) {
+  if (typeof rrtype === 'function') { cb = rrtype; rrtype = 'A'; }
+  _origResolveGeneric.call(dns, hostname, rrtype, function(err, records) {
+    if (err) return cb(err);
+    if ((rrtype === 'A' || rrtype === 'AAAA') && Array.isArray(records)) {
+      for (var i = 0; i < records.length; i++) {
+        var ip = records[i];
+        var v = classifyIp(ip);
+        if (v === 'block' || (STRICT && v === 'private')) {
+          return cb(new Error(
+            'SSRF blocked at connect-time: ' + hostname +
+            ' resolves to ' + ip + ' (' + v + ')'
+          ));
+        }
+      }
+    }
+    cb(null, records);
+  });
+};
+
 function emit(ct, content) {
   // Write content to file to bypass executor stdout truncation (100KB limit).
   // Only the content-type marker goes to stdout.
@@ -2152,7 +2178,14 @@ async function ssrfGuard(rawUrl: string): Promise<FetchOneResult | null> {
  *
  * Exported (via the function name) so SSRF tests can exercise the matcher directly.
  */
-export function classifyIp(ip: string): "block" | "private" | "public" {
+export function classifyIp(rawIp: string): "block" | "private" | "public" {
+  // RFC 6874 zone identifiers (`fe80::1%eth0`, URL-encoded `%25eth0`) must
+  // be stripped BEFORE any prefix/equality classification. Without the strip,
+  // a loopback `::1%eth0` no longer matches `lower === "::1"` and falls
+  // through to "public" — silently bypassing the SSRF guard. Strip first,
+  // classify second.
+  const pctIdx = rawIp.indexOf("%");
+  const ip = pctIdx === -1 ? rawIp : rawIp.slice(0, pctIdx);
   const lower = ip.toLowerCase();
 
   // IPv6 takes priority — check for `:` first so IPv4-mapped addresses

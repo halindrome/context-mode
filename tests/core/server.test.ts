@@ -3419,6 +3419,44 @@ describe("buildFetchCode — embedded SSRF guard contract", () => {
 });
 
 // ═══════════════════════════════════════════════════════════════════════════
+// buildFetchCode — IPv6 zone-id + generic dns.resolve (#476 round-3)
+// ═══════════════════════════════════════════════════════════════════════════
+
+describe("buildFetchCode — IPv6 zone-id + generic dns.resolve", () => {
+  test("classifyIp strips IPv6 zone-id before classification (link-local)", () => {
+    // fe80::/10 link-local with %eth0 zone suffix must still be blocked.
+    // Today the lowercase prefix check `fe8`/`fe9`/`fea`/`feb` accidentally
+    // catches link-local even with a zone suffix — but only because the
+    // suffix is appended *after* the prefix. Pin the behavior explicitly so
+    // a future refactor cannot regress.
+    expect(classifyIp("fe80::1%eth0")).toBe("block");
+    expect(classifyIp("fe80::1%25eth0")).toBe("block"); // URL-encoded zone
+  });
+
+  test("classifyIp strips IPv6 zone-id before classification (non-link-local)", () => {
+    // RFC 6874 permits zone identifiers on any IPv6 address (not just
+    // link-local). Without zone stripping, a loopback `::1%eth0` would NOT
+    // match the strict equality `lower === "::1"` and would leak through as
+    // "public". Pin every class so the strip happens before classification.
+    expect(classifyIp("::1%eth0")).toBe("private");        // loopback w/ zone
+    expect(classifyIp("fc00::1%eth0")).toBe("private");    // ULA w/ zone
+    expect(classifyIp("ff00::1%eth0")).toBe("block");      // multicast w/ zone
+    expect(classifyIp("2001:db8::1%eth0")).toBe("public"); // doc range w/ zone
+  });
+
+  test("buildFetchCode patches generic dns.resolve (not just resolve4/resolve6)", () => {
+    // dns.resolve is the polymorphic entrypoint that dispatches on rrtype.
+    // Today only resolve4/resolve6 are patched; a caller using
+    // `dns.resolve(host, 'A', cb)` or default rrtype goes through an
+    // un-guarded code path. Patch the generic wrapper so every A/AAAA
+    // record runs through classifyIp.
+    const generated = buildFetchCode("https://example.com/x", "/tmp/x");
+    expect(generated).toMatch(/dns\.resolve\s*=\s*function/);
+    expect(generated).toMatch(/classifyIp/);
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
 // ctx_doctor resource cleanup regression (#247)
 // ═══════════════════════════════════════════════════════════════════════════
 
