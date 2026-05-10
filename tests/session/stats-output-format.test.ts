@@ -307,7 +307,8 @@ describe("formatReport — Bugs #5/#6/#7/#8", () => {
 
     // Opener — the headline tally.
     expect(text).toMatch(/Across\s+\d+\s+days you ran\s+\d+\s+conversations/);
-    expect(text).toMatch(/context-mode kept\s+356\.0 MB[^\n]*out of your context window/);
+    // Single-unit auto-decimals: >= 100 drops the decimal (356 MB, not 356.0 MB).
+    expect(text).toMatch(/context-mode kept\s+356 MB[^\n]*out of your context window/);
 
     // Section 1 — datetime + days alive + rescue.
     expect(text).toMatch(/started.*\d{4}.*at \d{2}:\d{2}/);

@@ -1454,32 +1454,41 @@ function adapterLabel(name: string): string {
 // ─────────────────────────────────────────────────────────
 
 /**
- * Format bytes with the next unit shown in parentheses for context.
+ * Format a byte count for the narrative dashboard.
  *
- * Mert: "232.6 KB bu kac MB ya da GB yapar onu gostersin" — small numbers in
- * isolation lose scale. Pair every primary unit with its next-bigger unit so
- * the reader can mentally locate the size on a 1 KB → 1 GB axis without
- * having to do the math themselves.
+ * Single-unit auto-scale (Grafana / CloudWatch / Datadog convention).
+ * Decimals shrink as the integer part grows so the number stays readable
+ * at every magnitude. Max output width is 8 characters which fits the
+ * existing `padStart(8)` callsites in Sections 1, 3, 4.
  *
- * Format rules:
- *   < 1 KB         → "X B"
- *   1 KB – < 1 MB  → "X KB (0.YY MB)"      ← new dual-unit, MB context
- *   1 MB – < 1 GB  → "X MB (0.YY GB)"      ← new dual-unit, GB context
- *   ≥ 1 GB         → "X GB"
+ *   < 1 KB              → "X B"        e.g. "100 B"
+ *   1 KB   – < 100 KB   → "X.Y KB"     e.g. "4.7 KB",   "92.8 KB"
+ *   100 KB – < 1 MB     → "X KB"       e.g. "227 KB",   "976 KB"
+ *   1 MB   – < 100 MB   → "X.Y MB"     e.g. "4.5 MB",   "11.6 MB"
+ *   100 MB – < 1 GB     → "X MB"       e.g. "178 MB",   "906 MB"
+ *   1 GB   – < 100 GB   → "X.YY GB"    e.g. "1.00 GB",  "11.36 GB"
+ *   ≥ 100 GB            → "X.Y GB"     e.g. "216.6 GB"
+ *
+ * Replaced the dual-unit "X KB (0.YY MB)" form because the parenthetical
+ * rounded to 0.00 / 0.01 in the common range and added noise without
+ * information. Scale awareness comes from the unit jump between rows.
  */
 function kb(b: number): string {
-  if (b >= 1024 * 1024 * 1024) return `${(b / 1024 / 1024 / 1024).toFixed(2)} GB`;
-  if (b >= 1024 * 1024) {
-    const mb = b / 1024 / 1024;
-    const gb = mb / 1024;
-    return `${mb.toFixed(1)} MB (${gb.toFixed(2)} GB)`;
+  if (!Number.isFinite(b) || b <= 0) return "0 B";
+  if (b < 1024) return `${Math.round(b)} B`;
+
+  const KB = b / 1024;
+  if (KB < 1024) {
+    return KB < 100 ? `${KB.toFixed(1)} KB` : `${Math.round(KB)} KB`;
   }
-  if (b >= 1024) {
-    const kbV = b / 1024;
-    const mbV = kbV / 1024;
-    return `${kbV.toFixed(1)} KB (${mbV.toFixed(2)} MB)`;
+
+  const MB = KB / 1024;
+  if (MB < 1024) {
+    return MB < 100 ? `${MB.toFixed(1)} MB` : `${Math.round(MB)} MB`;
   }
-  return `${Math.round(b)} B`;
+
+  const GB = MB / 1024;
+  return GB < 100 ? `${GB.toFixed(2)} GB` : `${GB.toFixed(1)} GB`;
 }
 
 /** Format session uptime as human-readable duration. */
