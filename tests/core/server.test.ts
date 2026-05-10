@@ -2326,24 +2326,28 @@ describe("Project dir hash consistency", () => {
   //    OpenCode, JetBrains, ...) silently aggregate from the wrong dir.
   //    Statusline at src/server.ts:540 already passes
   //    `{ sessionsDir: getSessionDir() }` — the three ctx_stats sites must
-  //    mirror that contract exactly (or wrap it via the multi-adapter helper).
+  //    mirror that contract exactly. Note: `getMultiAdapterLifetimeStats`
+  //    is NOT covered by this test because it takes `{ home }` and
+  //    intentionally defaults to homedir() to scan every adapter dir; the
+  //    bare-call form is correct for that helper.
   test("ctx_stats scopes lifetime aggregation to the active adapter sessionsDir", () => {
     const statsMatch = serverSrc.match(
       /server\.registerTool\(\s*"ctx_stats"[\s\S]*?^\);/m,
     );
     expect(statsMatch).not.toBeNull();
     const body = statsMatch![0];
-    // Every getLifetimeStats / getMultiAdapterLifetimeStats invocation inside
-    // ctx_stats MUST be argumented (sessionsDir-aware). A bare `()` call falls
-    // back to the hardcoded ~/.claude/context-mode/sessions default and
-    // silently mis-attributes lifetime counts on non-Claude platforms.
+    // Every `getLifetimeStats(` invocation inside ctx_stats MUST be argumented
+    // (sessionsDir-aware). A bare `()` call falls back to the hardcoded
+    // ~/.claude/context-mode/sessions default and silently mis-attributes
+    // lifetime counts on non-Claude platforms. Use a negative lookbehind to
+    // exclude `getMultiAdapterLifetimeStats(` whose default is intentional.
     const bareCalls = body.match(
-      /get(?:MultiAdapter)?LifetimeStats\(\s*\)/g,
+      /(?<!MultiAdapter)getLifetimeStats\(\s*\)/g,
     );
-    expect(bareCalls, "ctx_stats must not call getLifetimeStats()/getMultiAdapterLifetimeStats() with no args").toBeNull();
-    // Should pass an object literal containing `sessionsDir` to whichever
-    // helper it uses (mirrors the statusline contract at src/server.ts:540).
-    expect(body).toMatch(/get(?:MultiAdapter)?LifetimeStats\(\s*\{\s*sessionsDir:\s*getSessionDir\(\)/);
+    expect(bareCalls, "ctx_stats must not call getLifetimeStats() with no args").toBeNull();
+    // Should pass an object literal containing `sessionsDir` (mirrors the
+    // statusline contract at src/server.ts:540).
+    expect(body).toMatch(/getLifetimeStats\(\s*\{\s*sessionsDir:\s*getSessionDir\(\)/);
   });
 });
 

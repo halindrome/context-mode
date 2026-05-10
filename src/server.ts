@@ -40,7 +40,7 @@ import { searchAllSources } from "./search/unified.js";
 import { buildNodeCommand, type HookAdapter } from "./adapters/types.js";
 import { detectPlatform, getSessionDirSegments } from "./adapters/detect.js";
 import { loadDatabase } from "./db-base.js";
-import { AnalyticsEngine, formatReport, getLifetimeStats, OPUS_INPUT_PRICE_PER_TOKEN } from "./session/analytics.js";
+import { AnalyticsEngine, formatReport, getLifetimeStats, getMultiAdapterLifetimeStats, OPUS_INPUT_PRICE_PER_TOKEN } from "./session/analytics.js";
 const __pkg_dir = dirname(fileURLToPath(import.meta.url));
 const VERSION: string = (() => {
   for (const rel of ["../package.json", "./package.json"]) {
@@ -2604,7 +2604,13 @@ server.registerTool(
           // from THEIR sessions dir — not the hardcoded ~/.claude/ default.
           // Mirrors the statusline contract at src/server.ts:540.
           const lifetime = getLifetimeStats({ sessionsDir: getSessionDir() });
-          text = formatReport(report, VERSION, _latestVersion, { lifetime, mcpUsage });
+          // B3b Slices 3.2-3.6: cross-adapter aggregation so the renderer
+          // can show "Where it came from" + the "across N AI tools"
+          // headline. Best-effort — failures absorbed so a corrupt
+          // sidecar in any adapter dir cannot break ctx_stats.
+          let multiAdapter;
+          try { multiAdapter = getMultiAdapterLifetimeStats(); } catch { /* never block ctx_stats */ }
+          text = formatReport(report, VERSION, _latestVersion, { lifetime, mcpUsage, multiAdapter });
         } finally {
           sdb.close();
         }
@@ -2614,7 +2620,9 @@ server.registerTool(
         const engine = new AnalyticsEngine(createMinimalDb());
         const report = engine.queryAll(sessionStats);
         const lifetime = getLifetimeStats({ sessionsDir: getSessionDir() });
-        text = formatReport(report, VERSION, _latestVersion, { lifetime });
+        let multiAdapter;
+        try { multiAdapter = getMultiAdapterLifetimeStats(); } catch { /* never block ctx_stats */ }
+        text = formatReport(report, VERSION, _latestVersion, { lifetime, multiAdapter });
       }
     } catch {
       // Session DB not available or incompatible — build minimal report from runtime stats
@@ -2622,7 +2630,9 @@ server.registerTool(
       const report = engine.queryAll(sessionStats);
       let lifetime;
       try { lifetime = getLifetimeStats({ sessionsDir: getSessionDir() }); } catch { /* never block ctx_stats */ }
-      text = formatReport(report, VERSION, _latestVersion, lifetime ? { lifetime } : undefined);
+      let multiAdapter;
+      try { multiAdapter = getMultiAdapterLifetimeStats(); } catch { /* never block ctx_stats */ }
+      text = formatReport(report, VERSION, _latestVersion, (lifetime || multiAdapter) ? { lifetime, multiAdapter } : undefined);
     }
 
     return trackResponse("ctx_stats", {
