@@ -464,6 +464,20 @@ export class CursorAdapter extends BaseAdapter implements HookAdapter {
       }
     }
 
+    // #489 round-3 — pure plugin install (Marketplace) bundles MCP registration
+    // inside the plugin package. No native mcp.json exists, but the plugin
+    // manifest under ~/.cursor/plugins/{local,cache}/<name>/.cursor-plugin/plugin.json
+    // is enough to consider context-mode registered. Without this, doctor
+    // self-contradicts: `Plugin install: pass` alongside `MCP registration: warn`.
+    const pluginInstalls = this.detectPluginInstalls();
+    if (pluginInstalls.length > 0) {
+      return {
+        check: "MCP registration",
+        status: "pass",
+        message: `context-mode registered via plugin manifest at ${pluginInstalls[0]}`,
+      };
+    }
+
     return {
       check: "MCP registration",
       status: "warn",
