@@ -13,7 +13,6 @@
 
 import { createHash } from "node:crypto";
 import { existsSync, mkdirSync } from "node:fs";
-import { homedir } from "node:os";
 import { join, resolve, dirname } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { SessionDB } from "../../session/db.js";
@@ -22,6 +21,7 @@ import type { HookInput } from "../../session/extract.js";
 import { buildResumeSnapshot } from "../../session/snapshot.js";
 import type { SessionEvent } from "../../types.js";
 import { bootstrapMCPTools, type BridgeHandle } from "./mcp-bridge.js";
+import { PiAdapter } from "./index.js";
 
 // ── Pi Tool Name Mapping ─────────────────────────────────
 // Pi uses lowercase; shared extractors expect PascalCase (Claude Code convention).
@@ -115,8 +115,14 @@ async function getAutoInjection(
 
 // ── Helpers ──────────────────────────────────────────────
 
+// Single PiAdapter instance — owns the canonical session-dir contract
+// (~/.pi/context-mode/sessions). Routing the extension through it means
+// any future segment change in PiAdapter (or BaseAdapter) propagates
+// here automatically instead of silently desyncing (#473 round-3).
+const _piAdapter = new PiAdapter();
+
 function getSessionDir(): string {
-  const dir = join(homedir(), ".pi", "context-mode", "sessions");
+  const dir = _piAdapter.getSessionDir();
   mkdirSync(dir, { recursive: true });
   return dir;
 }

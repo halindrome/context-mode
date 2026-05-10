@@ -1338,3 +1338,75 @@ describe("Pi MCP bridge (#426)", () => {
     }, 30_000);
   });
 });
+
+// ────────────────────────────────────────────────────────────────────────
+// #473 round-3: extension MUST route session dir through PiAdapter
+// rather than re-encoding the ~/.pi/context-mode/sessions literal. Any
+// drift (e.g., PiAdapter changes the segment list) would silently desync
+// otherwise — extension keeps writing to ~/.pi while the rest of the
+// harness reads from the new location.
+// ────────────────────────────────────────────────────────────────────────
+
+describe("Pi extension respects PiAdapter session dir (#473 round-3)", () => {
+  let scratch: string;
+  let mockedSessionDir: string;
+
+  beforeEach(() => {
+    scratch = mkdtempSync(join(tmpdir(), "pi-ext-r3-"));
+    mockedSessionDir = join(scratch, "custom-pi-sess");
+    mkdirSync(mockedSessionDir, { recursive: true });
+    vi.resetModules();
+  });
+
+  afterEach(() => {
+    try {
+      rmSync(scratch, { recursive: true, force: true });
+    } catch {
+      /* best effort */
+    }
+    vi.doUnmock("../src/adapters/pi/index.js");
+    vi.resetModules();
+  });
+
+  it("opens SessionDB at the path returned by PiAdapter.getSessionDir, not at ~/.pi literal", async () => {
+    vi.doMock("../src/adapters/pi/index.js", () => {
+      class MockPiAdapter {
+        getSessionDir() {
+          return mockedSessionDir;
+        }
+      }
+      return { PiAdapter: MockPiAdapter };
+    });
+
+    const projectDir = join(scratch, "project");
+    mkdirSync(projectDir, { recursive: true });
+    process.env.PI_PROJECT_DIR = projectDir;
+    process.env.CLAUDE_PROJECT_DIR = projectDir;
+
+    const localApi = createMockPiApi();
+    const mod = await import("../src/adapters/pi/extension.js");
+    await mod.default(localApi);
+
+    await localApi._trigger("session_start", {}, {});
+
+    // DB file must be created under the mocked dir — proof that the
+    // extension routes through PiAdapter rather than the hardcoded
+    // ~/.pi/context-mode/sessions literal.
+    const expectedDbPath = join(mockedSessionDir, "context-mode.db");
+    const { existsSync: fileExists } = await import("node:fs");
+    expect(fileExists(expectedDbPath)).toBe(true);
+
+    // Also assert the doctor command surfaces the mocked path so
+    // future contributors do not silently regress (it reads getDBPath()).
+    const doctor = localApi._getCommand("ctx-doctor");
+    expect(doctor?.handler).toBeDefined();
+    const result = await doctor!.handler!({}, { hasUI: false });
+    const text = String((result as { text?: string } | undefined)?.text ?? "");
+    expect(text).toContain(mockedSessionDir);
+
+    await localApi._trigger("session_shutdown");
+
+    delete process.env.PI_PROJECT_DIR;
+    delete process.env.CLAUDE_PROJECT_DIR;
+  });
+});
