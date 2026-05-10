@@ -42,6 +42,7 @@ import { detectPlatform, getSessionDirSegments } from "./adapters/detect.js";
 import { resolveCodexConfigDir } from "./adapters/codex/paths.js";
 import { getHookScriptPaths } from "./util/hook-config.js";
 import { resolveClaudeConfigDir } from "./util/claude-config.js";
+import { resolveProjectDir } from "./util/project-dir.js";
 import { loadDatabase } from "./db-base.js";
 import { AnalyticsEngine, formatReport, getConversationStats, getLifetimeStats, getMultiAdapterLifetimeStats, getRealBytesStats, OPUS_INPUT_PRICE_PER_TOKEN } from "./session/analytics.js";
 const __pkg_dir = dirname(fileURLToPath(import.meta.url));
@@ -202,14 +203,15 @@ function getSessionDir(): string {
  * that don't set their own env var (Cursor, OpenClaw, Codex, Kiro, Zed).
  */
 function getProjectDir(): string {
-  return process.env.CLAUDE_PROJECT_DIR
-    || process.env.GEMINI_PROJECT_DIR
-    || process.env.VSCODE_CWD
-    || process.env.OPENCODE_PROJECT_DIR
-    || process.env.PI_PROJECT_DIR
-    || process.env.IDEA_INITIAL_DIRECTORY
-    || process.env.CONTEXT_MODE_PROJECT_DIR
-    || process.cwd();
+  // Delegated to the shared resolver so the env-var chain rejects plugin
+  // install paths (set by a prior MCP boot's start.mjs after `/ctx-upgrade`)
+  // and prefers the shell-set PWD before the chdir'd cwd. See
+  // src/util/project-dir.ts for the rationale + safety rules.
+  return resolveProjectDir({
+    env: process.env,
+    cwd: process.cwd(),
+    pwd: process.env.PWD,
+  });
 }
 
 /**

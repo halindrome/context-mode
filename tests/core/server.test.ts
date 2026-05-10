@@ -2304,21 +2304,33 @@ describe("Platform-aware session paths via adapter", () => {
   });
 
   // ── Comprehensive projectDir detection ──
-  test("getProjectDir checks verified platform env vars", () => {
+  test("getProjectDir delegates to resolveProjectDir; chain lives in util/project-dir.ts", () => {
     const fn = serverSrc.match(/function getProjectDir[\s\S]*?^}/m);
     expect(fn).not.toBeNull();
     const body = fn![0];
-    // Only env vars verified to be set by host IDEs before MCP server spawn
-    expect(body).toContain("CLAUDE_PROJECT_DIR");
-    expect(body).toContain("GEMINI_PROJECT_DIR");
-    expect(body).toContain("VSCODE_CWD");
-    expect(body).toContain("OPENCODE_PROJECT_DIR");
-    expect(body).toContain("PI_PROJECT_DIR");
-    // Universal fallback set by start.mjs for ALL platforms (Cursor, OpenClaw, etc.)
-    expect(body).toContain("CONTEXT_MODE_PROJECT_DIR");
-    expect(body).toContain("process.cwd()");
+    // Server.ts MUST delegate so the env-var chain + plugin-path rejection
+    // is unified with start.mjs (see v1.0.113 hotfix).
+    expect(body).toContain("resolveProjectDir");
+    expect(body).toContain("process.env.PWD");
+    // Env-var chain itself moved to the shared resolver — pin its contract there.
+    const utilSrc = readFileSync(
+      resolve(__dirname, "../../src/util/project-dir.ts"),
+      "utf-8",
+    );
+    for (const v of [
+      "CLAUDE_PROJECT_DIR",
+      "GEMINI_PROJECT_DIR",
+      "VSCODE_CWD",
+      "OPENCODE_PROJECT_DIR",
+      "PI_PROJECT_DIR",
+      "IDEA_INITIAL_DIRECTORY",
+      "CONTEXT_MODE_PROJECT_DIR",
+    ]) {
+      expect(utilSrc).toContain(v);
+    }
+    expect(utilSrc).toContain("isPluginInstallPath");
     // Must NOT contain semantically wrong env vars
-    expect(body).not.toContain("OPENCLAW_HOME"); // install dir, not project dir
+    expect(utilSrc).not.toContain("OPENCLAW_HOME");
   });
 
   // ── Content DB is platform-isolated (not shared) ──

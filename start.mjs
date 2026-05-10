@@ -9,15 +9,27 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const originalCwd = process.cwd();
 process.chdir(__dirname);
 
-if (!process.env.CLAUDE_PROJECT_DIR) {
-  process.env.CLAUDE_PROJECT_DIR = originalCwd;
+// Plugin-install-path guard (mirror of src/util/project-dir.ts isPluginInstallPath
+// — duplicated here because start.mjs ships as raw JS and cannot import TS).
+// When Claude Code runs `/ctx-upgrade` it kills + respawns the MCP server with
+// `cwd` pointing at the plugin install dir. Setting CLAUDE_PROJECT_DIR from
+// that path then poisons every downstream ctx_stats / SessionDB / hash
+// computation — sessions silently re-root under the plugin install dir. Skip
+// the env auto-set in that case; getProjectDir() defends a second time inside
+// server.ts via resolveProjectDir(). See src/util/project-dir.ts.
+const isPluginInstallPath = (p) =>
+  /[/\\]\.claude[/\\]plugins[/\\](cache|marketplaces)[/\\]/.test(p);
+const safeOriginalCwd = isPluginInstallPath(originalCwd) ? null : originalCwd;
+
+if (!process.env.CLAUDE_PROJECT_DIR && safeOriginalCwd) {
+  process.env.CLAUDE_PROJECT_DIR = safeOriginalCwd;
 }
 
 // Platform-agnostic project dir — guaranteed to be set for ALL platforms.
 // Adapters may set their own env var (GEMINI_PROJECT_DIR, etc.) but this
 // is the universal fallback so server.ts getProjectDir() never relies on cwd().
-if (!process.env.CONTEXT_MODE_PROJECT_DIR) {
-  process.env.CONTEXT_MODE_PROJECT_DIR = originalCwd;
+if (!process.env.CONTEXT_MODE_PROJECT_DIR && safeOriginalCwd) {
+  process.env.CONTEXT_MODE_PROJECT_DIR = safeOriginalCwd;
 }
 
 // Routing instructions file auto-write DISABLED for all platforms (#158, #164).
