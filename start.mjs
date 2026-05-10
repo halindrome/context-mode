@@ -108,6 +108,32 @@ if (cacheMatch) {
   }
 }
 
+// ── Self-heal Layer 3 + 4: installed_plugins.json registry repair ──
+// v1.0.113 hotfix follow-up. /ctx-upgrade can leave installed_plugins.json
+// with two distinct kinds of poison:
+//   HEAL 3: per-entry `version` drifts away from the actual cache dir's
+//           plugin.json `version` field. Claude Code's plugin loader then
+//           rejects the entry as a manifest mismatch and silently
+//           disconnects context-mode.
+//   HEAL 4: top-level `enabledPlugins[<key>]` is missing or emptied.
+//           Claude Code skips disabled plugins, so MCP never starts and
+//           the user has no /ctx-upgrade escape hatch.
+// Logic is shared verbatim with scripts/postinstall.mjs (single source of
+// truth) so users who fix themselves via `npm install -g context-mode`
+// follow the exact same code path. Best-effort, never blocks MCP boot.
+try {
+  const { healInstalledPlugins } = await import("./scripts/heal-installed-plugins.mjs");
+  const registryPath = resolve(homedir(), ".claude", "plugins", "installed_plugins.json");
+  const pluginCacheRoot = resolve(homedir(), ".claude", "plugins", "cache");
+  try {
+    healInstalledPlugins({
+      registryPath,
+      pluginCacheRoot,
+      pluginKey: "context-mode@context-mode",
+    });
+  } catch { /* best effort — never block MCP boot */ }
+} catch { /* best effort — never block MCP boot */ }
+
 // ── Self-heal Layer 4: Deploy global SessionStart hook + register in settings.json ──
 // This hook lives outside the plugin directory (~/.claude/hooks/) so it works
 // even when the plugin cache is completely broken. It creates symlinks for any
