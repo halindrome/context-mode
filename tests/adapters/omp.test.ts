@@ -3,6 +3,7 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { OMPAdapter } from "../../src/adapters/omp/index.js";
+import { hashProjectDirCanonical, resolveSessionDbPath } from "../../src/session/db.js";
 
 describe("OMPAdapter", () => {
   let adapter: OMPAdapter;
@@ -132,14 +133,14 @@ describe("OMPAdapter", () => {
     });
 
     it("session DB path contains project hash and lives under .omp", () => {
-      const dbPath = adapter.getSessionDBPath("/test/project");
+      const dbPath = resolveSessionDbPath({ projectDir: "/test/project", sessionsDir: adapter.getSessionDir() });
       expect(dbPath).toMatch(/[a-f0-9]{16}\.db$/);
       expect(dbPath).toContain(".omp");
       expect(dbPath).not.toContain(".claude");
     });
 
     it("session events path contains project hash and lives under .omp", () => {
-      const eventsPath = adapter.getSessionEventsPath("/test/project");
+      const eventsPath = join(adapter.getSessionDir(), `${hashProjectDirCanonical("/test/project")}-events.md`);
       expect(eventsPath).toMatch(/[a-f0-9]{16}-events\.md$/);
       expect(eventsPath).toContain(".omp");
       expect(eventsPath).not.toContain(".claude");

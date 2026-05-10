@@ -26,7 +26,6 @@ import { resolve, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { BaseAdapter } from "../base.js";
-import { getWorktreeSuffix, hashProjectDirCanonical, normalizeWorktreePath, resolveSessionDbPath } from "../../session/db.js";
 import { resolveCodexConfigDir } from "./paths.js";
 
 import {
@@ -312,20 +311,12 @@ export class CodexAdapter extends BaseAdapter implements HookAdapter {
     return dir;
   }
 
-  getSessionDBPath(projectDir: string): string {
-    return resolveSessionDbPath({
-      projectDir: normalizeWorktreePath(projectDir),
-      sessionsDir: this.getSessionDir(),
-    });
-  }
-
-  getSessionEventsPath(projectDir: string): string {
-    const normalized = normalizeWorktreePath(projectDir);
-    return join(
-      this.getSessionDir(),
-      `${hashProjectDirCanonical(normalized)}${getWorktreeSuffix(normalized)}-events.md`,
-    );
-  }
+  // C2 narrowing (2026-05): the historical `getSessionDBPath` /
+  // `getSessionEventsPath` overrides were removed. Both delegated to the
+  // same canonical helpers (`resolveSessionDbPath` / `hashProjectDirCanonical`
+  // + `getWorktreeSuffix`) which already normalize the path internally —
+  // the explicit `normalizeWorktreePath` here was a no-op. Callers now reach
+  // the helpers directly through `adapter.getSessionDir()`.
 
   getInstructionFiles(): string[] {
     // Codex CLI honors AGENTS.md plus an optional override file.

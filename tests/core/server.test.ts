@@ -2292,10 +2292,15 @@ describe("Platform-aware session paths via adapter", () => {
     expect(statsMatch![0]).not.toMatch(/["']\.claude["']/);
   });
 
-  // ── Adapter methods used for session paths ──
-  test("session paths derived from adapter.getSessionDir or getSessionDBPath", () => {
-    // Either directly uses adapter methods or a helper that delegates to them
-    expect(serverSrc).toMatch(/getSessionDir\(\)|getSessionDBPath\(/);
+  // ── Adapter methods used for session paths (post-C2 narrowing) ──
+  test("session paths derived from adapter.getSessionDir + resolveSessionDbPath", () => {
+    // C2 narrowing (2026-05): adapter no longer exposes getSessionDBPath /
+    // getSessionEventsPath. server.ts must derive per-project DB paths via
+    // resolveSessionDbPath while reading the adapter ONLY for the platform
+    // sessionDir. Pin both calls so an accidental regression to a missing
+    // helper or a deleted adapter method is caught at the test boundary.
+    expect(serverSrc).toMatch(/getSessionDir\(/);
+    expect(serverSrc).toMatch(/resolveSessionDbPath\(/);
   });
 
   // ── Comprehensive projectDir detection ──

@@ -25,7 +25,7 @@ import { dirname, resolve, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { existsSync, readFileSync } from "node:fs";
 
-import { SessionDB } from "../../session/db.js";
+import { resolveSessionDbPath, SessionDB } from "../../session/db.js";
 import { extractEvents, extractUserEvents } from "../../session/extract.js";
 import type { HookInput } from "../../session/extract.js";
 import { buildResumeSnapshot } from "../../session/snapshot.js";
@@ -281,7 +281,13 @@ async function createContextModePlugin(ctx: PluginContext) {
   // process-global UUID would (a) never match prior-session resume rows and
   // (b) collide across multi-session reuse (Mickey / PR #376 root cause).
   const projectDir = ctx?.directory ?? process.cwd();
-  const db = new SessionDB({ dbPath: adapter.getSessionDBPath(projectDir) });
+  // C2 narrowing: resolve DB path through the canonical helper directly.
+  // BaseAdapter no longer exposes getSessionDBPath; the adapter only owns
+  // the sessions DIR (per-platform), the helper owns the per-project FILE
+  // (case-fold + worktree-suffix + one-shot legacy migration).
+  const db = new SessionDB({
+    dbPath: resolveSessionDbPath({ projectDir, sessionsDir: adapter.getSessionDir() }),
+  });
 
   // Clean up old sessions on startup (no SessionStart hook to do this).
   db.cleanupOldSessions(7);

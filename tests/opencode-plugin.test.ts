@@ -708,10 +708,10 @@ describe("ContextModePlugin", () => {
       );
 
       // Verify SessionDB has the event
-      const { SessionDB } = await import("../src/session/db.js");
+      const { resolveSessionDbPath, SessionDB } = await import("../src/session/db.js");
       const { OpenCodeAdapter } = await import("../src/adapters/opencode/index.js");
       const adapter = new OpenCodeAdapter("opencode");
-      const db = new SessionDB({ dbPath: adapter.getSessionDBPath(projectDir) });
+      const db = new SessionDB({ dbPath: resolveSessionDbPath({ projectDir, sessionsDir: adapter.getSessionDir() }) });
       const events = db.getEvents("oc2-sess") as any[];
       db.close();
       const userPromptEvent = events.find((e: any) => e.type === "user_prompt");
@@ -730,10 +730,10 @@ describe("ContextModePlugin", () => {
         { message: { role: "user" } as any, parts: [{ type: "text", text: synthetic }] } as any,
       );
 
-      const { SessionDB } = await import("../src/session/db.js");
+      const { resolveSessionDbPath, SessionDB } = await import("../src/session/db.js");
       const { OpenCodeAdapter } = await import("../src/adapters/opencode/index.js");
       const adapter = new OpenCodeAdapter("opencode");
-      const db = new SessionDB({ dbPath: adapter.getSessionDBPath(projectDir) });
+      const db = new SessionDB({ dbPath: resolveSessionDbPath({ projectDir, sessionsDir: adapter.getSessionDir() }) });
       const events = db.getEvents("oc2-skip") as any[];
       db.close();
       const userPromptEvent = events.find((e: any) => e.type === "user_prompt");
@@ -807,10 +807,10 @@ describe("ContextModePlugin", () => {
         { title: "Read", output: "x", metadata: {} },
       );
 
-      const { SessionDB } = await import("../src/session/db.js");
+      const { resolveSessionDbPath, SessionDB } = await import("../src/session/db.js");
       const { OpenCodeAdapter } = await import("../src/adapters/opencode/index.js");
       const adapter = new OpenCodeAdapter("opencode");
-      const db = new SessionDB({ dbPath: adapter.getSessionDBPath(projectDir) });
+      const db = new SessionDB({ dbPath: resolveSessionDbPath({ projectDir, sessionsDir: adapter.getSessionDir() }) });
       const events = db.getEvents("oc4-sess-1") as any[];
       db.close();
 
@@ -839,10 +839,10 @@ describe("ContextModePlugin", () => {
         { title: "Read", output: "b", metadata: {} },
       );
 
-      const { SessionDB } = await import("../src/session/db.js");
+      const { resolveSessionDbPath, SessionDB } = await import("../src/session/db.js");
       const { OpenCodeAdapter } = await import("../src/adapters/opencode/index.js");
       const adapter = new OpenCodeAdapter("opencode");
-      const db = new SessionDB({ dbPath: adapter.getSessionDBPath(projectDir) });
+      const db = new SessionDB({ dbPath: resolveSessionDbPath({ projectDir, sessionsDir: adapter.getSessionDir() }) });
       const events = db.getEvents("oc4-idem") as any[];
       db.close();
 
@@ -868,10 +868,10 @@ describe("ContextModePlugin", () => {
         ),
       ).resolves.toBeUndefined();
 
-      const { SessionDB } = await import("../src/session/db.js");
+      const { resolveSessionDbPath, SessionDB } = await import("../src/session/db.js");
       const { OpenCodeAdapter } = await import("../src/adapters/opencode/index.js");
       const adapter = new OpenCodeAdapter("opencode");
-      const db = new SessionDB({ dbPath: adapter.getSessionDBPath(projectDir) });
+      const db = new SessionDB({ dbPath: resolveSessionDbPath({ projectDir, sessionsDir: adapter.getSessionDir() }) });
       const events = db.getEvents("oc4-missing") as any[];
       db.close();
 
@@ -891,10 +891,10 @@ describe("ContextModePlugin", () => {
         { title: "Read", output: "c", metadata: {} },
       );
 
-      const { SessionDB } = await import("../src/session/db.js");
+      const { resolveSessionDbPath, SessionDB } = await import("../src/session/db.js");
       const { OpenCodeAdapter } = await import("../src/adapters/opencode/index.js");
       const adapter = new OpenCodeAdapter("opencode");
-      const db = new SessionDB({ dbPath: adapter.getSessionDBPath(projectDir) });
+      const db = new SessionDB({ dbPath: resolveSessionDbPath({ projectDir, sessionsDir: adapter.getSessionDir() }) });
       const events = db.getEvents("oc4-claude") as any[];
       db.close();
 

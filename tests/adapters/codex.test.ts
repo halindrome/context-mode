@@ -5,7 +5,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, 
 import { homedir, tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { CodexAdapter } from "../../src/adapters/codex/index.js";
-import { SessionDB } from "../../src/session/db.js";
+import { resolveSessionDbPath, SessionDB } from "../../src/session/db.js";
 
 describe("CodexAdapter", () => {
   let adapter: CodexAdapter;
@@ -605,7 +605,10 @@ describe("Codex precompact hook script", () => {
     process.env.CODEX_HOME = codexHome;
 
     try {
-      const dbPath = new CodexAdapter().getSessionDBPath(projectDir);
+      const dbPath = resolveSessionDbPath({
+        projectDir,
+        sessionsDir: new CodexAdapter().getSessionDir(),
+      });
       const db = new SessionDB({ dbPath });
       db.ensureSession(sessionId, projectDir);
       db.insertEvent(sessionId, {
@@ -664,7 +667,10 @@ describe("Codex sessionstart hook script", () => {
     process.env.CODEX_HOME = codexHome;
 
     try {
-      const dbPath = new CodexAdapter().getSessionDBPath(projectDir);
+      const dbPath = resolveSessionDbPath({
+        projectDir,
+        sessionsDir: new CodexAdapter().getSessionDir(),
+      });
       const db = new SessionDB({ dbPath });
       db.ensureSession(sessionId, projectDir);
       db.upsertResume(sessionId, snapshot, 1);
