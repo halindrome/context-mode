@@ -97,6 +97,28 @@ export interface ConversationStats {
   snapshotsConsumed: number;
   /** Category breakdown for this session_id. */
   byCategory: Array<{ category: string; count: number; label: string }>;
+  /**
+   * Earliest event timestamp (ms epoch) for this session_id across every DB.
+   * Used by the section-1 "started X" line in the narrative renderer. 0 when
+   * the session has no events yet. Optional for back-compat with older
+   * callers / fixtures that pre-date the narrative layout.
+   */
+  firstEventMs?: number;
+  /** Latest event timestamp (ms epoch) — pairs with firstEventMs. */
+  lastEventMs?: number;
+  /**
+   * Wall-clock timestamp of the most recent /compact rescue for this session.
+   * Drives the "On <datetime>, /compact fired" line in section 1. Undefined
+   * when the conversation has never been compacted.
+   */
+  lastRescueMs?: number;
+  /**
+   * Per-day capture breakdown for the section-1 horizontal timeline. Each
+   * entry is one calendar day (UTC midnight ms) with that day's event count
+   * + optional rescueBytes when /compact fired on that day. Empty array
+   * when no events recorded yet.
+   */
+  byDay?: Array<{ ms: number; count: number; rescueBytes?: number }>;
 }
 
 // ─────────────────────────────────────────────────────────
@@ -855,6 +877,12 @@ export function getConversationStats(opts: {
   let snapshotsConsumed = 0;
   let firstMs = Number.POSITIVE_INFINITY;
   let lastMs = 0;
+  let lastRescueMs = 0;
+  // Per-day captures aggregated across every DB. Key is the UTC midnight ms
+  // of the day; value tracks both the event count and any rescueBytes (latter
+  // overlays the ◆ /compact glyph in the section-1 horizontal timeline).
+  const byDayMap = new Map<number, { count: number; rescueBytes: number }>();
+  const dayKey = (ms: number): number => Math.floor(ms / 86_400_000) * 86_400_000;
 
   for (const file of dbFiles) {
     const dbPath = join(sessionsDir, file);
@@ -882,12 +910,39 @@ export function getConversationStats(opts: {
           const t = Date.parse(range.mx + (range.mx.endsWith("Z") ? "" : "Z"));
           if (Number.isFinite(t) && t > lastMs) lastMs = t;
         }
+        // Per-day captures + per-day rescue overlay for the narrative timeline.
+        // Best-effort: silently skip when the schema lacks created_at.
+        try {
+          const dayRows = sdb.prepare(
+            "SELECT strftime('%s', created_at) AS sec, COUNT(*) AS cnt FROM session_events WHERE session_id = ? GROUP BY date(created_at)",
+          ).all(sessionId) as Array<{ sec: string | null; cnt: number }>;
+          for (const row of dayRows) {
+            if (!row.sec) continue;
+            const ms = parseInt(row.sec, 10) * 1000;
+            if (!Number.isFinite(ms)) continue;
+            const k = dayKey(ms);
+            const cur = byDayMap.get(k) ?? { count: 0, rescueBytes: 0 };
+            cur.count += row.cnt ?? 0;
+            byDayMap.set(k, cur);
+          }
+        } catch { /* old schema */ }
         try {
           const snap = sdb.prepare(
-            "SELECT COALESCE(SUM(length(snapshot)), 0) AS bytes, COUNT(*) AS n FROM session_resume WHERE session_id = ? AND consumed = 1",
-          ).get(sessionId) as { bytes: number; n: number } | undefined;
+            "SELECT COALESCE(SUM(length(snapshot)), 0) AS bytes, COUNT(*) AS n, MAX(strftime('%s', created_at)) AS lastSec FROM session_resume WHERE session_id = ? AND consumed = 1",
+          ).get(sessionId) as { bytes: number; n: number; lastSec: string | null } | undefined;
           if (snap?.bytes) snapshotBytes += snap.bytes;
           if (snap?.n) snapshotsConsumed += snap.n;
+          if (snap?.lastSec) {
+            const t = parseInt(snap.lastSec, 10) * 1000;
+            if (Number.isFinite(t) && t > lastRescueMs) lastRescueMs = t;
+            // Overlay the rescue bytes onto the day bucket for the timeline.
+            if (Number.isFinite(t) && (snap?.bytes ?? 0) > 0) {
+              const k = dayKey(t);
+              const cur = byDayMap.get(k) ?? { count: 0, rescueBytes: 0 };
+              cur.rescueBytes = Math.max(cur.rescueBytes, snap.bytes);
+              byDayMap.set(k, cur);
+            }
+          }
         } catch { /* old schema */ }
       } finally {
         sdb.close();
@@ -905,8 +960,27 @@ export function getConversationStats(opts: {
       label: categoryLabels[category] || category,
     }))
     .sort((a, b) => b.count - a.count);
+  const byDay = [...byDayMap.entries()]
+    .sort((a, b) => a[0] - b[0])
+    .map(([ms, v]) => ({
+      ms,
+      count: v.count,
+      ...(v.rescueBytes > 0 ? { rescueBytes: v.rescueBytes } : {}),
+    }));
 
-  return { sessionId, events, dbCount, daysAlive, snapshotBytes, snapshotsConsumed, byCategory };
+  return {
+    sessionId,
+    events,
+    dbCount,
+    daysAlive,
+    snapshotBytes,
+    snapshotsConsumed,
+    byCategory,
+    firstEventMs: Number.isFinite(firstMs) ? firstMs : 0,
+    lastEventMs:  lastMs > 0 ? lastMs : 0,
+    lastRescueMs: lastRescueMs > 0 ? lastRescueMs : undefined,
+    byDay,
+  };
 }
 
 // ─────────────────────────────────────────────────────────
@@ -1390,6 +1464,66 @@ function formatDuration(uptimeMin: string): string {
 }
 
 /**
+ * Locale + IANA-timezone detection for the narrative renderer.
+ *
+ * Cascade (each level overrides the next):
+ *   1. CONTEXT_MODE_LOCALE / CONTEXT_MODE_TZ env overrides
+ *      (used by tests + by users who want to pin output regardless of OS).
+ *   2. macOS `defaults read -g AppleLocale` → `en_TR` style → `en-TR`.
+ *   3. Linux `LANG` / `LC_TIME` env vars.
+ *   4. Fallback: `Intl.DateTimeFormat().resolvedOptions().locale`.
+ *
+ * Timezone always uses `Intl.DateTimeFormat().resolvedOptions().timeZone`
+ * — that one's always available and correct regardless of platform.
+ */
+export function detectLocaleAndTz(): { locale: string; tz: string } {
+  const env = (process.env ?? {}) as Record<string, string | undefined>;
+  let locale = env.CONTEXT_MODE_LOCALE ?? "";
+  if (!locale) {
+    if (process.platform === "darwin") {
+      try {
+        // Lazy-require — keeps the helper test-friendly when child_process is stubbed.
+        const cp: typeof import("node:child_process") = require("node:child_process");
+        const out = cp.execFileSync("defaults", ["read", "-g", "AppleLocale"], {
+          encoding: "utf8",
+          timeout: 500,
+        }).trim();
+        if (out) locale = out.replace(/_/g, "-");
+      } catch { /* defaults missing or sandbox */ }
+    }
+    if (!locale && (env.LC_TIME || env.LANG)) {
+      const raw = (env.LC_TIME || env.LANG || "").split(".")[0];
+      if (raw) locale = raw.replace(/_/g, "-");
+    }
+    if (!locale) {
+      try {
+        locale = new Intl.DateTimeFormat().resolvedOptions().locale;
+      } catch { locale = "en-US"; }
+    }
+  }
+
+  let tz = env.CONTEXT_MODE_TZ ?? "";
+  if (!tz) {
+    try {
+      tz = new Intl.DateTimeFormat().resolvedOptions().timeZone;
+    } catch { tz = "UTC"; }
+  }
+  return { locale: locale || "en-US", tz: tz || "UTC" };
+}
+
+/**
+ * Format an absolute path as a human-friendly display string by
+ * collapsing `$HOME` → `~`. Returns the input unchanged when no home
+ * prefix matches (e.g. for paths outside $HOME on a CI box).
+ */
+function shortPath(abs: string): string {
+  const home = homedir();
+  if (home && abs === home)            return "~";
+  if (home && abs.startsWith(home + "/")) return "~" + abs.slice(home.length);
+  return abs;
+}
+
+/**
  * Render the section-4 "For example: what would that cost?" block.
  *
  * Translates a lifetime token total into a relatable Opus-4 dollar figure
@@ -1467,6 +1601,245 @@ export function renderCostExample(
   out.push(
     "  These are EXAMPLES, not your actual bill — your model and rates may differ.",
   );
+  return out;
+}
+
+/**
+ * Render the full 5-section narrative ("kitap gibi") layout — the
+ * Mert-approved screenshot format the production ctx_stats handler
+ * produces for users with conversation + lifetime + multi-adapter data.
+ *
+ * Order:
+ *   Opener
+ *   Section 1 — Where you are now            (datetime, /compact, timeline)
+ *   Section 2 — What this chat captured      (per-category bars)
+ *   Section 3 — The receipt — getting wider  (this conv vs all-work)
+ *   Section 4 — For example: what would that cost?
+ *   Section 5 — What context-mode learned about how you work (auto-memory)
+ *   Footer
+ *
+ * Pure renderer: every input arrives via the args object so this
+ * function is trivially testable end-to-end without mocking process or
+ * Date. The caller (formatReport) is responsible for choosing a `now`
+ * value that matches the conversation's age math and a `cwd` that
+ * matches the user's project — defaults are sensible for production.
+ */
+function renderNarrative5Section(args: {
+  conversation: ConversationStats;
+  lifetime?: LifetimeStats;
+  multiAdapter?: MultiAdapterLifetimeStats;
+  realBytes?: { lifetime?: RealBytesStats; conversation?: RealBytesStats };
+  cwd: string;
+  locale: string;
+  tz: string;
+  now: number;
+  version?: string;
+  latestVersion?: string | null;
+}): string[] {
+  const { conversation, lifetime, multiAdapter, realBytes, cwd, locale, tz, now, version, latestVersion } = args;
+  const out: string[] = [];
+
+  // ── Token math (same monotonic-growth invariant as the legacy branch).
+  const convEventsTokens = conversation.events * TOKENS_PER_EVENT;
+  const convRescueTokens = Math.round((conversation.snapshotBytes ?? 0) / 4);
+  const convLegacyTokens = convEventsTokens + convRescueTokens;
+  const convRealTokens   = realBytes?.conversation?.totalSavedTokens ?? 0;
+  const conversationTokens = Math.max(convLegacyTokens, convRealTokens);
+
+  const lifetimeEventsTokens = (lifetime?.totalEvents ?? 0) * TOKENS_PER_EVENT;
+  const lifetimeRescueTokens = Math.round((lifetime?.rescueBytes ?? 0) / 4);
+  const lifetimeLegacyTokens = lifetimeEventsTokens + lifetimeRescueTokens;
+  const lifetimeRealTokens   = realBytes?.lifetime?.totalSavedTokens ?? 0;
+  const lifetimeTokensWithout = Math.max(lifetimeLegacyTokens, lifetimeRealTokens);
+  const lifetimeTokensWith    = Math.max(1, Math.round(lifetimeTokensWithout * 0.02));
+
+  // Bytes from realBytes when present, else derive from tokens (×4 — same
+  // ratio Phase 8 uses everywhere). All-work bytes drives the opener tally
+  // + the section-3 receipt + section-4 cost example.
+  const lifetimeBytes = (multiAdapter?.totalBytes && multiAdapter.totalBytes > 0)
+    ? multiAdapter.totalBytes
+    : lifetimeTokensWithout * 4;
+  const convBytes = realBytes?.conversation
+    ? (realBytes.conversation.eventDataBytes + realBytes.conversation.bytesAvoided + realBytes.conversation.snapshotBytes)
+    : conversationTokens * 4;
+
+  // ── Days alive of THE CONVERSATION (section 1).
+  const convDays = conversation.daysAlive >= 1
+    ? `${conversation.daysAlive.toFixed(1)} days alive · still going`
+    : `${Math.max(1, Math.round(conversation.daysAlive * 24))} hr alive · still going`;
+
+  // ── Lifetime span (opener + receipt) — across every adapter / DB on disk.
+  const sinceMs = lifetime?.firstEventMs ?? multiAdapter?.perAdapter?.[0]?.firstMs ?? 0;
+  const lifetimeDays = sinceMs > 0
+    ? Math.max(1, Math.round((now - sinceMs) / 86_400_000))
+    : 0;
+  const totalConversations = multiAdapter?.totalSessions ?? lifetime?.totalSessions ?? 1;
+  const realAdapterCount = multiAdapter?.perAdapter.filter((a) => a.isReal).length ?? 0;
+  let where: string;
+  if (multiAdapter && realAdapterCount >= 2) {
+    where = `across ${realAdapterCount} AI tools`;
+  } else if (multiAdapter && realAdapterCount === 1) {
+    const onlyReal = multiAdapter.perAdapter.find((a) => a.isReal);
+    where = `in ${onlyReal ? adapterLabel(onlyReal.name) : "Claude Code"}`;
+  } else {
+    where = "in Claude Code";
+  }
+
+  // ── Opener.
+  if (lifetimeDays > 0) {
+    out.push(`  Across ${lifetimeDays} days you ran ${fmtNum(totalConversations)} conversations ${where}.`);
+  } else {
+    out.push(`  You ran ${fmtNum(totalConversations)} conversations ${where}.`);
+  }
+  // Daily-average sub-line — never tease users with a tiny number when the
+  // average is sub-MB (still informative); fall back to KB display.
+  const dailyBytes = lifetimeDays > 0 ? lifetimeBytes / lifetimeDays : 0;
+  out.push(`  context-mode kept ${kb(lifetimeBytes)} out of your context window — about ${kb(dailyBytes)} every single day.`);
+  out.push("");
+  out.push("");
+
+  // ── Section 1 — Where you are now.
+  out.push("  ─── 1. Where you are now ───");
+  out.push("");
+  const startedStr = conversation.firstEventMs && conversation.firstEventMs > 0
+    ? formatLocalDateTime(conversation.firstEventMs, locale, tz)
+    : "";
+  if (startedStr) {
+    out.push(`  This conversation started ${startedStr} in ${shortPath(cwd)}.`);
+  } else {
+    out.push(`  This conversation lives in ${shortPath(cwd)}.`);
+  }
+  out.push(`  ${convDays}.`);
+  if (conversation.snapshotsConsumed > 0 && conversation.snapshotBytes > 0) {
+    const rescueAt = conversation.lastRescueMs && conversation.lastRescueMs > 0
+      ? formatLocalDateTime(conversation.lastRescueMs, locale, tz)
+      : "";
+    const rescueKb = Math.round(conversation.snapshotBytes / 1024);
+    if (rescueAt) {
+      out.push(`  On ${rescueAt}, /compact fired — ${rescueKb} KB rescued from snapshot.`);
+    } else {
+      out.push(`  /compact fired — ${rescueKb} KB rescued from snapshot.`);
+    }
+    out.push(`  Without that, you'd be re-explaining everything to a blank model right now.`);
+  }
+  out.push("");
+
+  // Without/With bars — the screenshottable proof for THIS conversation.
+  const convTokensWith = Math.max(1, Math.round(conversationTokens * 0.02));
+  const withoutBar = dataBar(conversationTokens, conversationTokens, 32);
+  const withBar    = dataBar(convTokensWith,     conversationTokens, 32);
+  const convPct    = conversationTokens > 0 ? (1 - convTokensWith / conversationTokens) * 100 : 0;
+  out.push(`  Without context-mode  ${kb(convBytes).padStart(8)}  ${withoutBar}   ${fmtNum(conversationTokens).padStart(7)} tokens`);
+  out.push(`  With context-mode     ${kb(Math.max(1, Math.round(convBytes * 0.02))).padStart(8)}  ${withBar}   ${fmtNum(convTokensWith).padStart(7)} tokens`);
+  out.push(`                          ${convPct.toFixed(0)}% kept out of context · your AI ran ${Math.max(1, Math.round(conversationTokens / convTokensWith))}× longer before /compact fired`);
+  out.push("");
+
+  // Timeline — drop-in if conversation has byDay.
+  if (conversation.byDay && conversation.byDay.length > 0) {
+    const totalConvDays = conversation.lastEventMs && conversation.firstEventMs
+      ? Math.max(1, Math.round((conversation.lastEventMs - conversation.firstEventMs) / 86_400_000) + 1)
+      : conversation.byDay.length;
+    out.push(`  How that ${kb(convBytes)} built up — ${totalConvDays} days, ${conversation.byDay.length} active:`);
+    out.push("");
+    out.push(...renderHorizontalTimeline(conversation.byDay, locale, tz));
+  }
+  out.push("");
+  out.push("");
+
+  // ── Section 2 — What this chat captured.
+  out.push("  ─── 2. What this chat captured (used when you --continue or /resume here) ───");
+  out.push("");
+  const capturedTotal = conversation.byCategory.reduce((s, c) => s + c.count, 0);
+  // Format with locale separator (en-* → "1,277"; en-TR → "1.277").
+  const totalStr = capturedTotal.toLocaleString(locale);
+  out.push(`  ${totalStr} things — files, errors, decisions, agent runs:`);
+  out.push("");
+  // ALL categories, no truncation (Slice 5).
+  const max = conversation.byCategory[0]?.count ?? 1;
+  for (const cat of conversation.byCategory) {
+    out.push(`    ${cat.label.padEnd(26)} ${String(cat.count).padStart(5)}   ${dataBar(cat.count, max, 28)}`);
+  }
+  out.push("");
+  out.push("");
+
+  // ── Section 3 — The receipt — getting wider.
+  out.push("  ─── 3. The receipt — getting wider ───");
+  out.push("");
+  // Two rows: this conversation + all real work.
+  const convStartedYMD = conversation.firstEventMs && conversation.firstEventMs > 0
+    ? new Intl.DateTimeFormat(locale, { timeZone: tz, year: "numeric", month: "short", day: "numeric" })
+        .format(new Date(conversation.firstEventMs))
+    : "";
+  const lifeStartedYMD = sinceMs > 0
+    ? new Intl.DateTimeFormat(locale, { timeZone: tz, year: "numeric", month: "short", day: "numeric" })
+        .format(new Date(sinceMs))
+    : "";
+  const distinctProj = lifetime?.distinctProjects ?? 0;
+  out.push(
+    `    This conversation                     ${kb(convBytes).padStart(7)}  ${(fmtNum(conversationTokens) + " tokens").padStart(13)}    ${(conversation.events.toLocaleString(locale) + " captures").padStart(15)}   ${convStartedYMD ? `started ${convStartedYMD}` : ""}`,
+  );
+  const allCaps = lifetime?.totalEvents ?? multiAdapter?.totalEvents ?? 0;
+  out.push(
+    `    All your real work everywhere    ${kb(lifetimeBytes).padStart(8)}   ${(fmtNum(lifetimeTokensWithout) + " tokens").padStart(11)}   ${(allCaps.toLocaleString(locale) + " captures").padStart(15)}   ${totalConversations} chats × ${distinctProj} projects${lifeStartedYMD ? `, since ${lifeStartedYMD}` : ""}`,
+  );
+  out.push("");
+  out.push("");
+
+  // ── Section 4 — Cost example.
+  out.push("  ─── 4. For example: what would that cost? ───");
+  out.push("");
+  out.push(...renderCostExample(lifetimeBytes, lifetimeTokensWithout, lifetimeDays));
+  out.push("");
+  out.push("");
+
+  // ── Section 5 — What context-mode learned about how you work.
+  out.push("  ─── 5. What context-mode learned about how you work ───");
+  out.push("");
+  if (lifetime && lifetime.autoMemoryCount > 0) {
+    out.push(`  ${lifetime.autoMemoryCount} preferences picked up across ${lifetime.autoMemoryProjects} project${lifetime.autoMemoryProjects === 1 ? "" : "s"}:`);
+    const entries = Object.entries(lifetime.autoMemoryByPrefix).sort((a, b) => b[1] - a[1]);
+    const maxAm = entries.length > 0 ? entries[0][1] : 1;
+    for (const [prefix, count] of entries) {
+      const label = autoMemoryLabels[prefix] ?? prefix;
+      out.push(`    ${label.padEnd(26)} ${String(count).padStart(2)}   ${dataBar(count, maxAm, 20)}`);
+    }
+  } else {
+    out.push("  No preferences learned yet — context-mode picks them up automatically.");
+  }
+  out.push("");
+  out.push("");
+
+  // ── Footer.
+  out.push("  Your AI talks less, remembers more, costs less.");
+  out.push(`  Locale ${locale} · timezone ${tz} · pricing examples for illustration only.`);
+  out.push("");
+  const versionStr = version ? `v${version}` : "context-mode";
+  out.push(`  ${versionStr}`);
+  if (version && latestVersion && latestVersion !== "unknown" && semverNewer(latestVersion, version)) {
+    out.push(`  Update available: v${version} -> v${latestVersion}  |  ctx_upgrade`);
+  }
+
+  // Suppress consecutive blank lines / leading blanks for tidier output —
+  // we use `push("")` liberally above as paragraph separators, easier to
+  // collapse here than to track flag state inline.
+  return collapseBlanks(out);
+}
+
+/** Drop runs of >2 consecutive blank strings so the renderer never emits visual gaps. */
+function collapseBlanks(lines: string[]): string[] {
+  const out: string[] = [];
+  let blankRun = 0;
+  for (const ln of lines) {
+    if (ln === "") {
+      blankRun++;
+      if (blankRun <= 2) out.push(ln);
+    } else {
+      blankRun = 0;
+      out.push(ln);
+    }
+  }
+  // Trim trailing blanks.
+  while (out.length > 0 && out[out.length - 1] === "") out.pop();
   return out;
 }
 
@@ -1961,6 +2334,15 @@ export function formatReport(
      * single-adapter renderer output unchanged.
      */
     multiAdapter?: MultiAdapterLifetimeStats;
+    /**
+     * 5-section narrative renderer overrides. Defaults to ambient
+     * `process.cwd()` + `Date.now()` + `detectLocaleAndTz()` for production
+     * use; tests inject deterministic values so output is byte-stable.
+     */
+    cwd?: string;
+    now?: number;
+    locale?: string;
+    tz?: string;
   },
 ): string {
   const lines: string[] = [];
@@ -2004,81 +2386,31 @@ export function formatReport(
     lines.push("");
   }
 
-  // ── New layout: source-of-truth from session_events + session_resume.
-  //    Used when the MCP handler has wired the current Claude Code session_id
-  //    through to the renderer. Bypasses the broken in-memory tool-call counter
-  //    (which only saw ctx_* MCP calls and showed "1 call · 5 KB" after hours
-  //    of real conversation work).
+  // ── 5-section narrative ("kitap gibi") layout — Mert-approved
+  //    screenshot format produced when the MCP handler has wired
+  //    conversation + lifetime + multi-adapter through. Replaces the
+  //    legacy hero/contribution/auto-memory stack with the:
+  //      Opener
+  //      1. Where you are now            (datetime, /compact, timeline)
+  //      2. What this chat captured      (per-category bars)
+  //      3. The receipt — getting wider
+  //      4. For example: what would that cost?
+  //      5. What context-mode learned about how you work
+  //      Footer
+  //    The opener block above (lines 1989-2005) is suppressed because
+  //    renderNarrative5Section emits its own.
   if (conversation && conversation.events > 0) {
-    // Conversation tokens (this chat's contribution).
-    const convEventsTokens = conversation.events * TOKENS_PER_EVENT;
-    const convRescueTokens = Math.round((conversation.snapshotBytes ?? 0) / 4);
-    const convLegacyTokens = convEventsTokens + convRescueTokens;
-    // Phase 8: prefer realBytes.totalSavedTokens when present and bigger.
-    // Monotonic-growth invariant — never SHRINK an existing $ number.
-    const convRealTokens = realBytes?.conversation?.totalSavedTokens ?? 0;
-    const conversationTokens = Math.max(convLegacyTokens, convRealTokens);
-    const conversationUsd = tokensToUsd(conversationTokens);
-
-    // Lifetime tokens — the screenshottable receipt. Includes events × 256
-    // PLUS rescue benefit aggregated across every DB on disk so the killer
-    // continuity-after-/compact feature isn't silently undercounted.
-    const lifetimeEventsTokens = (lifetime?.totalEvents ?? 0) * TOKENS_PER_EVENT;
-    const lifetimeRescueTokens = Math.round((lifetime?.rescueBytes ?? 0) / 4);
-    const lifetimeLegacyTokens = lifetimeEventsTokens + lifetimeRescueTokens;
-    // Phase 8: same monotonic-growth invariant for lifetime — prefer
-    // realBytes when bigger (which it almost always is once sandbox-execute
-    // events accumulate), fall back to the legacy estimate otherwise.
-    const lifetimeRealTokens = realBytes?.lifetime?.totalSavedTokens ?? 0;
-    const lifetimeTokensWithout = Math.max(lifetimeLegacyTokens, lifetimeRealTokens);
-    // 2% heuristic — matches measured ratio across the test suite (~98% saved).
-    // We don't have per-session bytes_returned on disk yet (D2 PRD scope).
-    const lifetimeTokensWith = Math.max(1, Math.round(lifetimeTokensWithout * 0.02));
-    const lifetimeUsd = tokensToUsd(lifetimeTokensWithout);
-    const lifetimeWithUsd = tokensToUsd(lifetimeTokensWith);
-    const savedPct = lifetimeTokensWithout > 0
-      ? (1 - lifetimeTokensWith / lifetimeTokensWithout) * 100
-      : 0;
-    const contribPct = lifetimeTokensWithout > 0
-      ? (conversationTokens / lifetimeTokensWithout) * 100
-      : 0;
-    const totalConversations = lifetime?.totalSessions ?? 1;
-    const firstDate = lifetime?.firstEventMs
-      ? new Date(lifetime.firstEventMs).toISOString().slice(0, 10)
-      : undefined;
-
-    lines.push("");
-    lines.push(...renderHero({
-      lifetimeTokensWithout,
-      lifetimeTokensWith,
-      lifetimeUsd,
-      lifetimeWithUsd,
-      savedPct,
-      totalConversations,
-      firstDate,
+    // Strip the previous-block opener — narrative renderer emits its own.
+    if (lines.length > 0) lines.length = 0;
+    const detected = detectLocaleAndTz();
+    const cwd    = opts?.cwd    ?? process.cwd();
+    const now    = opts?.now    ?? Date.now();
+    const locale = opts?.locale ?? detected.locale;
+    const tz     = opts?.tz     ?? detected.tz;
+    lines.push(...renderNarrative5Section({
+      conversation, lifetime, multiAdapter, realBytes,
+      cwd, locale, tz, now, version, latestVersion,
     }));
-    lines.push("");
-    lines.push("");
-    // ALL YOUR WORK block — full lifetime breakdown, the proof beneath the receipt.
-    // sessionTokensSaved=0: conversation events are already in lifetime.totalEvents,
-    // adding conversationTokens again would double-count.
-    lines.push(...renderProjectMemory(report.projectMemory, { lifetime, multiAdapter, sessionTokensSaved: 0, topN: Number.POSITIVE_INFINITY }));
-    // B3b Slice 3.2/3.3 — per-adapter "Where it came from" sub-block.
-    lines.push(...renderMultiAdapter(multiAdapter));
-    lines.push("");
-    // THIS CONVERSATION CONTRIBUTION — narrative slice of lifetime, not a competing hero.
-    lines.push(...renderConversation(conversation, conversationUsd, contribPct));
-    lines.push("");
-    lines.push(...renderAutoMemory(lifetime));
-    lines.push("");
-    lines.push("  Your AI talks less, remembers more, costs less.");
-    lines.push(`  Saved ${lifetimeUsd} across all your work  ·  ${conversationUsd} from this conversation`);
-    lines.push("");
-    const versionStr = version ? `v${version}` : "context-mode";
-    lines.push(`  ${versionStr}`);
-    if (version && latestVersion && latestVersion !== "unknown" && semverNewer(latestVersion, version)) {
-      lines.push(`  Update available: v${version} -> v${latestVersion}  |  ctx_upgrade`);
-    }
     return lines.join("\n");
   }
 

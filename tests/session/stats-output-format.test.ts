@@ -9,7 +9,13 @@
 
 import { describe, expect, test } from "vitest";
 import { formatReport, tokensToUsd } from "../../src/session/analytics.js";
-import type { FullReport, LifetimeStats } from "../../src/session/analytics.js";
+import type {
+  AdapterScanResult,
+  ConversationStats,
+  FullReport,
+  LifetimeStats,
+  MultiAdapterLifetimeStats,
+} from "../../src/session/analytics.js";
 
 function baseReport(): FullReport {
   return {
@@ -140,6 +146,148 @@ describe("formatReport — Bugs #5/#6/#7/#8", () => {
     expect(projectBar.length).toBeGreaterThan(0);
     expect(referenceBar.length).toBeGreaterThan(0);
     expect(projectBar.length).toBeGreaterThan(referenceBar.length);
+  });
+
+  // ── Slice 4 (5-section narrative): formatReport must produce the
+  // Mert-approved "kitap gibi" 5-section layout when conversation +
+  // realBytes + multiAdapter are all present. Pin the section headers
+  // + key openers + footer order so the renderer can never drift.
+  test("narrative renderer emits all 5 section headers in order", () => {
+    const conv: ConversationStats = {
+      sessionId: "narrative-fixture",
+      events: 1277,
+      dbCount: 2,
+      daysAlive: 12.0,
+      snapshotBytes: 1552 * 1024,
+      snapshotsConsumed: 1,
+      byCategory: [
+        { category: "external-ref",      count: 500, label: "External docs indexed" },
+        { category: "file",              count: 132, label: "Files tracked" },
+        { category: "error",             count: 119, label: "Errors caught" },
+        { category: "constraint",        count: 100, label: "Constraints you set" },
+        { category: "git",               count:  78, label: "Git operations" },
+      ],
+      // Section-1 datetime fields — the production handler always
+      // populates these via getConversationStats; this fixture mirrors
+      // the demo target (started 28 Apr 12:16 Istanbul, /compact 9 May 20:54).
+      firstEventMs: Date.UTC(2026, 3, 28, 9, 16, 0),
+      lastEventMs:  Date.UTC(2026, 4, 10, 9, 16, 0),
+      lastRescueMs: Date.UTC(2026, 4,  9, 17, 54, 0),
+      byDay: [
+        { ms: Date.UTC(2026, 3, 28),  count: 277 },
+        { ms: Date.UTC(2026, 4,  3),  count: 201 },
+        { ms: Date.UTC(2026, 4,  4),  count: 438 },
+        { ms: Date.UTC(2026, 4,  9),  count: 261, rescueBytes: 1552 * 1024 },
+        { ms: Date.UTC(2026, 4, 10),  count: 100 },
+      ],
+    };
+    const lifetime: LifetimeStats = {
+      totalEvents: 17_493,
+      totalSessions: 128,
+      autoMemoryCount: 22,
+      autoMemoryProjects: 6,
+      autoMemoryByPrefix: { project: 11, feedback: 7, user: 3, reference: 1 },
+      categoryCounts: {
+        "external-ref": 500, file: 132, error: 119, constraint: 100, git: 78,
+        subagent: 62, "agent-finding": 58,
+      },
+      rescueBytes: 1552 * 1024,
+      firstEventMs: Date.UTC(2026, 2, 4),
+      distinctProjects: 123,
+    };
+    const ma: MultiAdapterLifetimeStats = {
+      totalEvents: 17_493,
+      totalSessions: 128,
+      totalBytes: 356 * 1024 * 1024,
+      perAdapter: [
+        {
+          name: "claude-code",
+          eventCount: 17_493,
+          sessionCount: 128,
+          dataBytes: 356 * 1024 * 1024,
+          rescueBytes: 1552 * 1024,
+          contentBytes: 0,
+          uuidConvs: 128,
+          projectDirs: new Array(123).fill(0).map((_, i) => `/p/${i}`),
+          firstMs: Date.UTC(2026, 2, 4),
+          lastMs:  Date.UTC(2026, 4, 10),
+          isReal: true,
+        } satisfies AdapterScanResult,
+      ],
+    };
+
+    const text = formatReport(baseReport(), "1.0.111", null, {
+      conversation: conv,
+      lifetime,
+      multiAdapter: ma,
+      realBytes: {
+        // Lifetime: ~93.3M tokens (target's 356 MB / ~3.81 ratio).
+        lifetime: {
+          eventDataBytes:   80_000_000,
+          bytesAvoided:    285_000_000,
+          bytesReturned:     2_000_000,
+          snapshotBytes:    8_261_000,
+          totalSavedTokens: 93_315_333,
+        },
+        // Conversation: ~776K tokens.
+        conversation: {
+          eventDataBytes: 1_500_000,
+          bytesAvoided:   1_400_000,
+          bytesReturned:    100_000,
+          snapshotBytes:  1_552 * 1024,
+          totalSavedTokens: 776_300,
+        },
+      },
+      // Pin locale/tz/cwd/now so the assertion is byte-stable across
+      // CI machines (no ambient process.env / process.cwd dependency).
+      cwd:    "/home/u/Server/Mert/context-mode/.cw/ctx-analytics",
+      now:    Date.UTC(2026, 4, 10, 18, 0, 0),
+      locale: "en-TR",
+      tz:     "Europe/Istanbul",
+    });
+
+    // Five mandatory section headers, in order.
+    const idx1 = text.indexOf("─── 1. Where you are now ───");
+    const idx2 = text.indexOf("─── 2. What this chat captured");
+    const idx3 = text.indexOf("─── 3. The receipt — getting wider ───");
+    const idx4 = text.indexOf("─── 4. For example: what would that cost? ───");
+    const idx5 = text.indexOf("─── 5. What context-mode learned about how you work ───");
+    expect(idx1).toBeGreaterThan(-1);
+    expect(idx2).toBeGreaterThan(idx1);
+    expect(idx3).toBeGreaterThan(idx2);
+    expect(idx4).toBeGreaterThan(idx3);
+    expect(idx5).toBeGreaterThan(idx4);
+
+    // Opener — the headline tally.
+    expect(text).toMatch(/Across\s+\d+\s+days you ran\s+\d+\s+conversations/);
+    expect(text).toMatch(/context-mode kept\s+356\.0 MB\s+out of your context window/);
+
+    // Section 1 — datetime + days alive + rescue.
+    expect(text).toMatch(/started.*\d{4}.*at \d{2}:\d{2}/);
+    expect(text).toMatch(/days alive · still going/);
+    expect(text).toMatch(/\/compact fired — 1552 KB rescued from snapshot/);
+    expect(text).toMatch(/How that .* built up/);
+
+    // Section 2 — captures heading + ALL conversation categories.
+    expect(text).toMatch(/things — files, errors, decisions, agent runs:/);
+    expect(text).toMatch(/External docs indexed\s+500/);
+    expect(text).toMatch(/Files tracked\s+132/);
+
+    // Section 3 — receipt-style rows (no "$X · Y%" framing anymore).
+    expect(text).toMatch(/This conversation\s+/);
+    expect(text).toMatch(/All your real work everywhere/);
+    expect(text).toMatch(/128 chats × 123 projects/);
+
+    // Section 4 — cost example + EXAMPLES disclaimer.
+    expect(text).toMatch(/\$1399\.73\s+on Opus 4 input alone/);
+    expect(text).toMatch(/These are EXAMPLES, not your actual bill/);
+
+    // Section 5 — auto-memory tally.
+    expect(text).toMatch(/22 preferences picked up across 6 projects/);
+
+    // Footer.
+    expect(text).toMatch(/Your AI talks less, remembers more, costs less/);
+    expect(text).toMatch(/v1\.0\.111/);
   });
 
   // ── Cycle 2: Persistent memory bar block must use lifetime category counts ──
