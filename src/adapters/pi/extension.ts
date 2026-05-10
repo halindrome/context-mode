@@ -74,10 +74,6 @@ let _mcpBridge: BridgeHandle | null = null;
  */
 export let _mcpBridgeReady: Promise<void> = Promise.resolve();
 
-// Per-session gate: routing block injected at most once per session_id.
-const _routingInjected: Set<string> = new Set();
-
-
 // Cached routing-block string (built once per process from hooks/routing-block.mjs).
 let _routingBlock: string | null = null;
 async function getRoutingBlock(pluginRoot: string): Promise<string> {
