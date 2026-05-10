@@ -205,12 +205,16 @@ function getSessionDir(): string {
 function getProjectDir(): string {
   // Delegated to the shared resolver so the env-var chain rejects plugin
   // install paths (set by a prior MCP boot's start.mjs after `/ctx-upgrade`)
-  // and prefers the shell-set PWD before the chdir'd cwd. See
-  // src/util/project-dir.ts for the rationale + safety rules.
+  // and prefers the shell-set PWD before the chdir'd cwd. v1.0.115 adds
+  // the Claude Code transcript heuristic — read `cwd` from the most-recently-
+  // modified `~/.claude/projects/<encoded>/<session>.jsonl` to recover the
+  // real project dir when MCP was launched from a non-project cwd (desktop-
+  // app launch, /ctx-upgrade respawn). See src/util/project-dir.ts.
   return resolveProjectDir({
     env: process.env,
     cwd: process.cwd(),
     pwd: process.env.PWD,
+    transcriptsRoot: join(homedir(), ".claude", "projects"),
   });
 }
 

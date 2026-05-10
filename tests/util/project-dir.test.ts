@@ -1,8 +1,40 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync, utimesSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
   isPluginInstallPath,
   resolveProjectDir,
+  resolveProjectDirFromTranscript,
 } from "../../src/util/project-dir.js";
+
+const cleanup: string[] = [];
+afterEach(() => {
+  while (cleanup.length) {
+    const p = cleanup.pop();
+    if (p) try { rmSync(p, { recursive: true, force: true }); } catch {}
+  }
+});
+
+function makeTranscriptsRoot(): string {
+  const d = mkdtempSync(join(tmpdir(), "ctx-transcripts-"));
+  cleanup.push(d);
+  return d;
+}
+
+function writeTranscript(root: string, encodedDir: string, sessionId: string, cwd: string, mtime?: Date) {
+  const dir = join(root, encodedDir);
+  mkdirSync(dir, { recursive: true });
+  const file = join(dir, `${sessionId}.jsonl`);
+  // Mirror Claude Code's transcript shape: line 1 = session metadata, line 2+ has cwd
+  const lines = [
+    JSON.stringify({ type: "session-meta", sessionId, permissionMode: "default" }),
+    JSON.stringify({ type: "user", cwd, sessionId }),
+  ];
+  writeFileSync(file, lines.join("\n") + "\n");
+  if (mtime) utimesSync(file, mtime, mtime);
+  return file;
+}
 
 describe("isPluginInstallPath", () => {
   it("matches macOS / Linux plugin cache paths", () => {
@@ -91,5 +123,64 @@ describe("resolveProjectDir", () => {
       env: { IDEA_INITIAL_DIRECTORY: "/i/proj" },
       cwd: "/x", pwd: undefined,
     })).toBe("/i/proj");
+  });
+});
+
+describe("resolveProjectDirFromTranscript", () => {
+  it("returns cwd from the most-recently-modified Claude Code transcript", () => {
+    const root = makeTranscriptsRoot();
+    writeTranscript(root, "-Users-x-old", "old-session", "/Users/x/old-proj", new Date(Date.now() - 60_000));
+    writeTranscript(root, "-Users-x-new", "new-session", "/Users/x/new-proj", new Date());
+
+    const result = resolveProjectDirFromTranscript({ projectsRoot: root });
+    expect(result).toBe("/Users/x/new-proj");
+  });
+
+  it("returns undefined when projects dir does not exist", () => {
+    const result = resolveProjectDirFromTranscript({ projectsRoot: "/nonexistent/path" });
+    expect(result).toBeUndefined();
+  });
+
+  it("returns undefined when no jsonl files exist", () => {
+    const root = makeTranscriptsRoot();
+    mkdirSync(join(root, "-Users-x-empty"), { recursive: true });
+    const result = resolveProjectDirFromTranscript({ projectsRoot: root });
+    expect(result).toBeUndefined();
+  });
+
+  it("skips transcripts without a cwd field in any of their first lines", () => {
+    const root = makeTranscriptsRoot();
+    const dir = join(root, "-Users-x-cwd-less");
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(
+      join(dir, "session.jsonl"),
+      JSON.stringify({ type: "session-meta", sessionId: "s1" }) + "\n" +
+      JSON.stringify({ type: "user", text: "hi" }) + "\n",
+    );
+    const result = resolveProjectDirFromTranscript({ projectsRoot: root });
+    expect(result).toBeUndefined();
+  });
+
+  it("resolveProjectDir prefers transcript cwd over PWD when env is empty and cwd is plugin path", () => {
+    const root = makeTranscriptsRoot();
+    writeTranscript(root, "-Users-x-real", "active-session", "/Users/x/real-proj");
+
+    const result = resolveProjectDir({
+      env: {},
+      cwd: "/Users/x/.claude/plugins/cache/foo/foo/1.0.0", // plugin path → rejected
+      pwd: "/Users/x", // home dir, not a real project
+      transcriptsRoot: root,
+    });
+    expect(result).toBe("/Users/x/real-proj");
+  });
+
+  it("resolveProjectDir falls back to PWD when transcript yields nothing", () => {
+    const result = resolveProjectDir({
+      env: {},
+      cwd: "/Users/x/.claude/plugins/cache/foo/foo/1.0.0",
+      pwd: "/Users/x/proj",
+      transcriptsRoot: "/nonexistent/transcripts",
+    });
+    expect(result).toBe("/Users/x/proj");
   });
 });
