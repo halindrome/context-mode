@@ -29,7 +29,8 @@ import {
 } from "./runtime.js";
 import { classifyNonZeroExit } from "./exit-classify.js";
 import { startLifecycleGuard } from "./lifecycle.js";
-import { getWorktreeSuffix, hashProjectDirCanonical, hashProjectDirLegacy, resolveSessionDbPath, SessionDB } from "./session/db.js";
+import { hashProjectDirCanonical, resolveSessionDbPath, SessionDB } from "./session/db.js";
+import { purgeSession } from "./session/purge.js";
 import {
   emitCacheHitEvent,
   emitIndexWriteEvent,
@@ -3137,59 +3138,27 @@ server.registerTool(
       });
     }
 
-    const deleted: string[] = [];
-
-    // 1. Wipe the persistent FTS5 content store
+    // Close the persistent FTS5 content store handle BEFORE delegating to
+    // purgeSession so the store's lock is released on Windows. The handle
+    // is recreated lazily on the next getStore() call.
+    let storePathForPurge: string | undefined;
+    try {
+      storePathForPurge = getStorePath();
+    } catch { /* best effort — store path may be unresolvable on fresh install */ }
     if (_store) {
-      let storeFound = false;
-      try { _store.cleanup(); storeFound = true; } catch { /* best effort */ }
+      try { _store.cleanup(); } catch { /* best effort */ }
       _store = null;
-      if (storeFound) deleted.push("knowledge base (FTS5)");
-    } else {
-      const dbPath = getStorePath();
-      let found = false;
-      for (const suffix of ["", "-wal", "-shm"]) {
-        try { unlinkSync(dbPath + suffix); found = true; } catch { /* file may not exist */ }
-      }
-      if (found) deleted.push("knowledge base (FTS5)");
     }
 
-    // 2. Wipe legacy shared content DB (~/.context-mode/content/<hash>.db)
-    try {
-      const legacyPath = join(homedir(), ".context-mode", "content", `${hashProjectDir()}.db`);
-      for (const suffix of ["", "-wal", "-shm"]) {
-        try { unlinkSync(legacyPath + suffix); } catch { /* ignore */ }
-      }
-    } catch { /* best effort */ }
+    const { deleted } = purgeSession({
+      projectDir: getProjectDir(),
+      sessionsDir: getSessionDir(),
+      storePath: storePathForPurge,
+      legacyContentDir: join(homedir(), ".context-mode", "content"),
+      contentHash: hashProjectDir(),
+    });
 
-    // 3. Wipe session events DB (analytics, metadata, resume snapshots).
-    // Wipe BOTH canonical and legacy raw-casing filenames so a partial
-    // upgrade leaves no orphaned DB behind on case-insensitive FS.
-    try {
-      const projectDir = getProjectDir();
-      const worktreeSuffix = getWorktreeSuffix(projectDir);
-      const sessDir = getSessionDir();
-      const canonicalHash = hashProjectDirCanonical(projectDir);
-      const legacyHash = hashProjectDirLegacy(projectDir);
-      const hashes = canonicalHash === legacyHash ? [canonicalHash] : [canonicalHash, legacyHash];
-
-      let sessDbFound = false;
-      let eventsFound = false;
-      for (const h of hashes) {
-        const sessDbPath = join(sessDir, `${h}${worktreeSuffix}.db`);
-        const eventsPath = join(sessDir, `${h}${worktreeSuffix}-events.md`);
-        const cleanupFlag = join(sessDir, `${h}${worktreeSuffix}.cleanup`);
-        for (const suffix of ["", "-wal", "-shm"]) {
-          try { unlinkSync(sessDbPath + suffix); sessDbFound = true; } catch { /* ignore */ }
-        }
-        try { unlinkSync(eventsPath); eventsFound = true; } catch { /* ignore */ }
-        try { unlinkSync(cleanupFlag); } catch { /* ignore */ }
-      }
-      if (sessDbFound) deleted.push("session events DB");
-      if (eventsFound) deleted.push("session events markdown");
-    } catch { /* best effort */ }
-
-    // 3. Reset in-memory session stats
+    // Reset in-memory session stats
     sessionStats.calls = {};
     sessionStats.bytesReturned = {};
     sessionStats.bytesIndexed = 0;

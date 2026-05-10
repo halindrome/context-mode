@@ -2242,19 +2242,20 @@ describe("ctx_purge is the sole reset/wipe mechanism", () => {
     );
     expect(purgeMatch).not.toBeNull();
     const purgeBody = purgeMatch![0];
-    // 1. Wipes FTS5 knowledge base
+    // 1. Closes the FTS5 knowledge base BEFORE wiping (releases Windows lock)
     expect(purgeBody).toContain("_store.cleanup()");
     expect(purgeBody).toContain("_store = null");
-    // 2. Wipes session events DB
-    expect(purgeBody).toContain("sessDbPath");
-    expect(purgeBody).toContain("session events DB");
-    // 3. Wipes session events markdown
-    expect(purgeBody).toContain("eventsPath");
-    expect(purgeBody).toContain("-events.md");
-    // 4. Resets in-memory stats
+    // 2. Delegates the on-disk wipe to the purgeSession deep module so all
+    //    file-kind sweeps (session DB, events.md, cleanup flag, FTS5 store,
+    //    legacy content) flow through ONE code path with uniform dual-hash.
+    expect(purgeBody).toContain("purgeSession({");
+    expect(purgeBody).toContain("projectDir: getProjectDir()");
+    expect(purgeBody).toContain("sessionsDir: getSessionDir()");
+    expect(purgeBody).toContain("storePath: storePathForPurge");
+    // 3. Resets in-memory stats
     expect(purgeBody).toContain("sessionStats.calls = {}");
     expect(purgeBody).toContain("sessionStats.sessionStart = Date.now()");
-    // Confirms with list of deleted items
+    // 4. Confirms with list of deleted items
     expect(purgeBody).toContain("Purged:");
   });
 });
@@ -2414,26 +2415,36 @@ describe("ctx_purge deleted array is honest", () => {
   );
 
   test("every deleted.push in ctx_purge is guarded by a success check", () => {
-    const purgeMatch = serverSrc.match(
+    // After the purgeSession() deep-module extraction, the per-file-kind
+    // success guards live in src/session/purge.ts. The handler itself only
+    // ever pushes "session stats" — which is the always-truthful in-memory
+    // reset and explicitly exempted from the guard rule. The deep module
+    // is independently covered by tests/session/purge-session.test.ts which
+    // proves each label appears only when at least one file was unlinked.
+    const purgeBody = serverSrc.match(
       /server\.registerTool\(\s*"ctx_purge"[\s\S]*?^\);/m,
-    );
-    expect(purgeMatch).not.toBeNull();
-    const body = purgeMatch![0];
-
-    // Find all deleted.push calls and check each one
-    const pushes = [...body.matchAll(/deleted\.push\("([^"]+)"\)/g)];
-    expect(pushes.length).toBeGreaterThanOrEqual(4);
-
+    )![0];
+    const pushes = [...purgeBody.matchAll(/deleted\.push\("([^"]+)"\)/g)];
     for (const push of pushes) {
-      const label = push[1];
-      if (label === "session stats") continue; // always truthful (in-memory)
+      expect(push[1]).toBe("session stats");
+    }
 
-      // Get the 120 chars before this push — must contain a conditional guard
+    const moduleSrc = readFileSync(
+      resolve(__dirname, "../../src/session/purge.ts"),
+      "utf-8",
+    );
+    // Each user-facing label inside purgeSession() must be conditionally
+    // pushed (success check).  We grep every push and verify the 120 chars
+    // before it contain a guard.
+    const modulePushes = [...moduleSrc.matchAll(/deleted\.push\("([^"]+)"\)/g)];
+    expect(modulePushes.length).toBeGreaterThanOrEqual(2);
+    for (const push of modulePushes) {
       const idx = push.index!;
-      const context = body.slice(Math.max(0, idx - 120), idx);
+      const context = moduleSrc.slice(Math.max(0, idx - 160), idx);
       const isGuarded = /if\s*\(\s*\w*[Ff]ound/.test(context)
-        || /if\s*\(_store\)/.test(context);
-      expect(isGuarded, `"${label}" push must be guarded by a found/success check`).toBe(true);
+        || /if\s*\(\s*removed\s*\)/.test(context)
+        || /if\s*\(\s*_store\s*\)/.test(context);
+      expect(isGuarded, `"${push[1]}" in purge.ts must be guarded by a success check`).toBe(true);
     }
   });
 });
@@ -2520,22 +2531,36 @@ describe("ContentStore purge behavior", () => {
   });
 
   test("ctx_purge handler deletes DB file even when _store is null (--continue scenario)", () => {
-    // This tests the server.ts logic: when _store is null, ctx_purge should
-    // still delete the DB file on disk using getStorePath()
+    // After the purgeSession() extraction (src/session/purge.ts) the
+    // _store-is-null branch lives there: the handler ALWAYS resolves
+    // getStorePath() and passes it as `storePath`, regardless of whether
+    // _store was open.  purgeSession unlinks the file unconditionally,
+    // which is exactly the --continue scenario this test was created for.
+    // Behavioral coverage: tests/session/purge-session.test.ts slice 5.
     const serverSrc = readFileSync(
       resolve(__dirname, "../../src/server.ts"),
       "utf-8",
     );
-    const purgeMatch = serverSrc.match(
+    const purgeBody = serverSrc.match(
       /server\.registerTool\(\s*"ctx_purge"[\s\S]*?^\);/m,
-    );
-    expect(purgeMatch).not.toBeNull();
-    const purgeBody = purgeMatch![0];
+    )![0];
 
-    // Must have an else branch for when _store is null
-    expect(purgeBody).toContain("} else {");
-    expect(purgeBody).toContain("getStorePath()");
-    expect(purgeBody).toContain("unlinkSync");
+    // Handler resolves storePath BEFORE the optional _store.cleanup() so
+    // the disk wipe runs whether _store was open or not.
+    const storePathIdx = purgeBody.indexOf("getStorePath()");
+    const storeCleanupIdx = purgeBody.indexOf("_store.cleanup()");
+    expect(storePathIdx).toBeGreaterThan(-1);
+    expect(storePathIdx).toBeLessThan(storeCleanupIdx === -1 ? Infinity : storeCleanupIdx);
+    // Handler always passes storePath into the deep module — that is what
+    // makes the wipe unconditional.
+    expect(purgeBody).toContain("storePath: storePathForPurge");
+
+    // Deep module is the one calling unlinkSync on the FTS5 store path.
+    const moduleSrc = readFileSync(
+      resolve(__dirname, "../../src/session/purge.ts"),
+      "utf-8",
+    );
+    expect(moduleSrc).toContain("unlinkSync");
   });
 });
 
