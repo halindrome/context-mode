@@ -725,3 +725,143 @@ describe("CLAUDE_CONFIG_DIR honors security policy reader", () => {
     );
   });
 });
+
+/**
+ * Issue #451 round-3 — cross-adapter deny-policy parity.
+ *
+ * `resolveClaudeGlobalSettingsPath` hardcoded the `.claude` segment, so
+ * non-Claude adapters (Cursor, Codex, Qwen, Gemini, JetBrains, VS Code, etc.)
+ * received zero file-deny enforcement: their global settings.json (e.g.
+ * ~/.cursor/settings.json) was never consulted by `readBashPolicies` or
+ * `readToolDenyPatterns`. This is a cross-adapter security parity gap.
+ *
+ * Behavior under test:
+ *   - When CONTEXT_MODE_PLATFORM identifies a non-claude adapter, the security
+ *     reader MUST consult <home>/<adapter-segments>/settings.json.
+ *   - Union semantics (defense in depth): even when an adapter is detected,
+ *     ~/.claude/settings.json is ALSO read so a rule defined there still wins.
+ *
+ * Each test sandboxes HOME so the home-rooted lookup hits a tmp dir.
+ */
+describe("cross-adapter deny-policy parity (#451 round-3)", () => {
+  const ADAPTER_SEGMENTS: ReadonlyArray<readonly [string, readonly string[]]> = [
+    ["cursor",            [".cursor"]],
+    ["codex",             [".codex"]],
+    ["qwen-code",         [".qwen"]],
+    ["gemini-cli",        [".gemini"]],
+    ["jetbrains-copilot", [".config", "JetBrains"]],
+    ["vscode-copilot",    [".vscode"]],
+  ];
+
+  let parityTmpBase: string;
+  let savedHome: string | undefined;
+  let savedUserprofile: string | undefined;
+  let savedPlatform: string | undefined;
+  let savedClaudeConfig: string | undefined;
+
+  beforeAll(() => {
+    parityTmpBase = join(tmpdir(), `security-parity-test-${Date.now()}`);
+    mkdirSync(parityTmpBase, { recursive: true });
+    savedHome = process.env.HOME;
+    savedUserprofile = process.env.USERPROFILE;
+    savedPlatform = process.env.CONTEXT_MODE_PLATFORM;
+    savedClaudeConfig = process.env.CLAUDE_CONFIG_DIR;
+  });
+
+  afterAll(() => {
+    if (savedHome === undefined) delete process.env.HOME;
+    else process.env.HOME = savedHome;
+    if (savedUserprofile === undefined) delete process.env.USERPROFILE;
+    else process.env.USERPROFILE = savedUserprofile;
+    if (savedPlatform === undefined) delete process.env.CONTEXT_MODE_PLATFORM;
+    else process.env.CONTEXT_MODE_PLATFORM = savedPlatform;
+    if (savedClaudeConfig === undefined) delete process.env.CLAUDE_CONFIG_DIR;
+    else process.env.CLAUDE_CONFIG_DIR = savedClaudeConfig;
+    rmSync(parityTmpBase, { recursive: true, force: true });
+  });
+
+  for (const [adapter, segments] of ADAPTER_SEGMENTS) {
+    test(`readBashPolicies: ${adapter} adapter settings.json deny is honored`, () => {
+      const fakeHome = join(parityTmpBase, `${adapter}-home`);
+      const adapterDir = join(fakeHome, ...segments);
+      mkdirSync(adapterDir, { recursive: true });
+      const denyPattern = `Bash(${adapter}-marker *)`;
+      writeFileSync(
+        join(adapterDir, "settings.json"),
+        JSON.stringify({
+          permissions: { allow: [], deny: [denyPattern] },
+        }),
+      );
+
+      // Sandbox HOME so home-rooted resolution lands in our tmp tree.
+      process.env.HOME = fakeHome;
+      process.env.USERPROFILE = fakeHome;
+      process.env.CONTEXT_MODE_PLATFORM = adapter;
+      delete process.env.CLAUDE_CONFIG_DIR;
+
+      const policies = readBashPolicies();
+      const allDeny = policies.flatMap((p) => p.deny);
+      assert.ok(
+        allDeny.includes(denyPattern),
+        `${adapter}: expected '${denyPattern}' in deny list, got ${JSON.stringify(allDeny)}`,
+      );
+    });
+
+    test(`readToolDenyPatterns: ${adapter} adapter Read deny is honored`, () => {
+      const fakeHome = join(parityTmpBase, `${adapter}-home-read`);
+      const adapterDir = join(fakeHome, ...segments);
+      mkdirSync(adapterDir, { recursive: true });
+      const fileMarker = `.env.${adapter}`;
+      writeFileSync(
+        join(adapterDir, "settings.json"),
+        JSON.stringify({
+          permissions: { allow: [], deny: [`Read(${fileMarker})`] },
+        }),
+      );
+
+      process.env.HOME = fakeHome;
+      process.env.USERPROFILE = fakeHome;
+      process.env.CONTEXT_MODE_PLATFORM = adapter;
+      delete process.env.CLAUDE_CONFIG_DIR;
+
+      const result = readToolDenyPatterns("Read");
+      const flat = result.flat();
+      assert.ok(
+        flat.includes(fileMarker),
+        `${adapter}: expected '${fileMarker}' in Read deny globs, got ${JSON.stringify(flat)}`,
+      );
+    });
+  }
+
+  test("union semantics: claude global is also read when non-claude adapter active", () => {
+    const fakeHome = join(parityTmpBase, "union-home");
+    const cursorDir = join(fakeHome, ".cursor");
+    const claudeDir = join(fakeHome, ".claude");
+    mkdirSync(cursorDir, { recursive: true });
+    mkdirSync(claudeDir, { recursive: true });
+    writeFileSync(
+      join(cursorDir, "settings.json"),
+      JSON.stringify({ permissions: { allow: [], deny: ["Bash(cursor-only *)"] } }),
+    );
+    writeFileSync(
+      join(claudeDir, "settings.json"),
+      JSON.stringify({ permissions: { allow: [], deny: ["Bash(claude-only *)"] } }),
+    );
+
+    process.env.HOME = fakeHome;
+    process.env.USERPROFILE = fakeHome;
+    process.env.CONTEXT_MODE_PLATFORM = "cursor";
+    delete process.env.CLAUDE_CONFIG_DIR;
+
+    const policies = readBashPolicies();
+    const allDeny = policies.flatMap((p) => p.deny);
+    assert.ok(
+      allDeny.includes("Bash(cursor-only *)"),
+      `expected cursor deny in union, got ${JSON.stringify(allDeny)}`,
+    );
+    assert.ok(
+      allDeny.includes("Bash(claude-only *)"),
+      `expected claude deny in union (defense in depth), got ${JSON.stringify(allDeny)}`,
+    );
+  });
+});
