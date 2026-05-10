@@ -500,7 +500,7 @@ export default function piExtension(pi: any): void {
 
   // ── 7. session_shutdown — Cleanup old sessions ─────────
 
-  pi.on("session_shutdown", () => {
+  pi.on("session_shutdown", async () => {
     try {
       if (_db) {
         _db.cleanupOldSessions(7);
@@ -509,6 +509,21 @@ export default function piExtension(pi: any): void {
       _sessionId = "";
     } catch {
       // best effort — never throw during shutdown
+    }
+    // Race fix (#472 round-3): if shutdown fires while bridge bootstrap
+    // is still in flight, _mcpBridge is null at this point and the
+    // freshly-spawned MCP child gets orphaned once bootstrap eventually
+    // resolves. Await the bootstrap up to a 2s ceiling so we see the
+    // real handle, then call shutdown() on it. The ceiling prevents a
+    // hung bootstrap (e.g. broken bundle) from blocking session exit.
+    try {
+      await Promise.race([
+        _mcpBridgeReady,
+        new Promise<void>((r) => setTimeout(r, 2000).unref()),
+      ]);
+    } catch {
+      // _mcpBridgeReady never rejects (best-effort), but defensively
+      // swallow anyway so shutdown never throws.
     }
     if (_mcpBridge) {
       try {
