@@ -847,18 +847,29 @@ Full configs: [`configs/kiro/mcp.json`](configs/kiro/mcp.json) | [`configs/kiro/
 </details>
 
 <details>
-<summary><strong>OMP (Oh My Pi)</strong> — MCP-only via <code>mcp.json</code></summary>
+<summary><strong>OMP (Oh My Pi)</strong> — plugin with full hook support</summary>
 
 **Prerequisites:** Node.js 18+, Oh My Pi installed.
 
-**Install:**
+**Install (recommended — plugin path):**
 
-1. Install context-mode globally:
+```bash
+omp plugin install context-mode
+```
 
-   ```bash
-   npm install -g context-mode
-   ```
+What this does, verified against [`oh-my-pi/packages/coding-agent/src/extensibility/plugins/manager.ts:158`](https://github.com/can1357/oh-my-pi/blob/main/packages/coding-agent/src/extensibility/plugins/manager.ts):
 
+1. OMP runs `bun install context-mode` inside `~/.omp/plugins/`
+2. OMP reads `package.json` of the installed package and looks for an `omp` (or `pi`) field — see [`extensibility/plugins/loader.ts:75`](https://github.com/can1357/oh-my-pi/blob/main/packages/coding-agent/src/extensibility/plugins/loader.ts) — `const manifest = pluginPkg.omp || pluginPkg.pi;`
+3. Our [`package.json`](package.json) declares `"omp": { "hooks": "./build/adapters/omp/plugin.js" }`
+4. OMP imports the file, calls its default export with `HookAPI`
+5. Four handlers register: `session_start`, `tool_call`, `tool_result`, `session_before_compact`
+
+The `tool_call` handler returns `{ block: true, reason }` for `curl`/`wget`/inline-fetch in `bash` per [`hooks/types.ts:566`](https://github.com/can1357/oh-my-pi/blob/main/packages/coding-agent/src/extensibility/hooks/types.ts) (`ToolCallEventResult`). No `mcp.json` edits needed.
+
+**Alternative — MCP-only path:**
+
+1. `npm install -g context-mode`
 2. Add to `~/.omp/agent/mcp.json` (user scope) or `<project>/.omp/mcp.json` (project scope):
 
    ```json
@@ -871,8 +882,6 @@ Full configs: [`configs/kiro/mcp.json`](configs/kiro/mcp.json) | [`configs/kiro/
    }
    ```
 
-   `PI_CODING_AGENT_DIR` overrides the agent directory; the file name `mcp.json` is fixed.
-
 3. Copy routing instructions:
 
    ```bash
@@ -883,11 +892,11 @@ Full configs: [`configs/kiro/mcp.json`](configs/kiro/mcp.json) | [`configs/kiro/
 
 4. Restart OMP.
 
-**Verify:** In an OMP session, type `ctx stats`. Context-mode tools should appear and respond.
+**Verify:** In an OMP session, type `ctx stats`. Context-mode tools should appear and respond. The plugin install can also be checked with `omp plugin doctor` or `omp plugin list`.
 
-**Routing:** Rule-based via `SYSTEM.md` (~60% compliance — context-mode delivers via MCP for OMP; native OMP `pre`/`post` hooks are not yet wired by this adapter). Auto-detected via `PI_CODING_AGENT_DIR` env var or presence of `~/.omp/`. Storage roots at `~/.omp/context-mode/` so OMP and Pi installs never share session DBs, content indices, or stats files.
+**Routing:** Plugin path — programmatic enforcement via `pi.on("tool_call", ...)` returning `{ block: true, reason }` (~98% compliance, like Claude Code). MCP-only path — rule-based via `SYSTEM.md` (~60%). Auto-detected via `PI_CODING_AGENT_DIR` env var or presence of `~/.omp/`. Storage roots at `~/.omp/context-mode/` so OMP and Pi installs never share session DBs, content indices, or stats files.
 
-Full configs: [`configs/omp/mcp.json`](configs/omp/mcp.json) | [`configs/omp/SYSTEM.md`](configs/omp/SYSTEM.md)
+Full configs: [`configs/omp/mcp.json`](configs/omp/mcp.json) | [`configs/omp/SYSTEM.md`](configs/omp/SYSTEM.md) | plugin source: [`src/adapters/omp/plugin.ts`](src/adapters/omp/plugin.ts)
 
 </details>
 
@@ -1014,14 +1023,14 @@ Session continuity requires 5 hooks working together:
 
 | Hook | Role | Claude Code | Gemini CLI | VS Code Copilot | JetBrains Copilot | Cursor | OpenCode | KiloCode | OpenClaw | Codex CLI | Antigravity | Kiro | Zed | Pi | OMP |
 |---|---|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
-| **PreToolUse** | Enforces sandbox routing before tool execution | Yes | -- | -- | -- | Yes | -- | -- | -- | Yes | -- | Yes | -- | ✓ (via tool_call event) | -- |
-| **PostToolUse** | Captures events after each tool call | Yes | Yes | Yes | Yes | Yes | Plugin | Plugin | Plugin | Yes | -- | Yes | -- | ✓ (via tool_result event) | -- |
+| **PreToolUse** | Enforces sandbox routing before tool execution | Yes | -- | -- | -- | Yes | -- | -- | -- | Yes | -- | Yes | -- | ✓ (via tool_call event) | ✓ (via tool_call event) |
+| **PostToolUse** | Captures events after each tool call | Yes | Yes | Yes | Yes | Yes | Plugin | Plugin | Plugin | Yes | -- | Yes | -- | ✓ (via tool_result event) | ✓ (via tool_result event) |
 | **UserPromptSubmit** | Captures user decisions and corrections | Yes | -- | -- | -- | -- | Plugin (via chat.message) | Plugin (via chat.message) | -- | Yes | -- | -- | -- | -- | -- |
-| **PreCompact** | Builds snapshot before compaction | Yes | Yes | Yes | Yes | -- | Plugin | Plugin | Plugin | Yes | -- | -- | -- | ✓ (via session_before_compact) | -- |
-| **SessionStart** | Restores state after compaction or resume | Yes | Yes | Yes | Yes | -- | ✓ (via experimental.chat.system.transform) | ✓ (via experimental.chat.system.transform) | Plugin | Yes | -- | -- | -- | ✓ (via session_start event) | -- |
-| | **Session completeness** | **Full** | **High** | **High** | **High** | **Partial** | **Full** | **Full** | **High** | **Partial** | **--** | **Partial** | **--** | **High** | **--** |
+| **PreCompact** | Builds snapshot before compaction | Yes | Yes | Yes | Yes | -- | Plugin | Plugin | Plugin | Yes | -- | -- | -- | ✓ (via session_before_compact) | ✓ (via session_before_compact) |
+| **SessionStart** | Restores state after compaction or resume | Yes | Yes | Yes | Yes | -- | ✓ (via experimental.chat.system.transform) | ✓ (via experimental.chat.system.transform) | Plugin | Yes | -- | -- | -- | ✓ (via session_start event) | ✓ (via session_start event) |
+| | **Session completeness** | **Full** | **High** | **High** | **High** | **Partial** | **Full** | **Full** | **High** | **Partial** | **--** | **Partial** | **--** | **High** | **High** |
 
-> **Note:** Full session continuity (capture + snapshot + restore) works on **Claude Code**, **Gemini CLI**, **VS Code Copilot**, **JetBrains Copilot**, **OpenCode**, and **KiloCode**. **OpenCode** and **KiloCode** use `experimental.chat.system.transform` as a SessionStart surrogate to inject the routing block and restore prior sessions, plus `chat.message` for user-prompt capture; full SessionStart hook support is not yet available ([#14808](https://github.com/sst/opencode/issues/14808), [#5409](https://github.com/sst/opencode/issues/5409)), but prior-session continuity and user-decision capture work fully. **Cursor** captures tool events via `preToolUse`/`postToolUse`, but `sessionStart` is currently rejected by Cursor's validator ([forum report](https://forum.cursor.com/t/unknown-hook-type-sessionstart/149566)), so session restore after compaction is not available yet. **OpenClaw** uses native gateway plugin hooks (`api.on()`) for full session continuity. **Pi Coding Agent** provides high session continuity via extension hooks (`tool_call`, `tool_result`, `session_start`, `session_before_compact`). **Codex CLI** provides partial hook-based session tracking through PreToolUse, PostToolUse, PreCompact, SessionStart, UserPromptSubmit, and Stop; MCP tools work. **Antigravity**, **Kiro**, and **Zed** have no hook support in the current release, so session tracking is not available. **OMP** (Oh My Pi) is also MCP-only and has no hook support — its dedicated adapter exists to keep storage isolated under `~/.omp/context-mode/` rather than leaking into another platform's directory.
+> **Note:** Full session continuity (capture + snapshot + restore) works on **Claude Code**, **Gemini CLI**, **VS Code Copilot**, **JetBrains Copilot**, **OpenCode**, and **KiloCode**. **OpenCode** and **KiloCode** use `experimental.chat.system.transform` as a SessionStart surrogate to inject the routing block and restore prior sessions, plus `chat.message` for user-prompt capture; full SessionStart hook support is not yet available ([#14808](https://github.com/sst/opencode/issues/14808), [#5409](https://github.com/sst/opencode/issues/5409)), but prior-session continuity and user-decision capture work fully. **Cursor** captures tool events via `preToolUse`/`postToolUse`, but `sessionStart` is currently rejected by Cursor's validator ([forum report](https://forum.cursor.com/t/unknown-hook-type-sessionstart/149566)), so session restore after compaction is not available yet. **OpenClaw** uses native gateway plugin hooks (`api.on()`) for full session continuity. **Pi Coding Agent** provides high session continuity via extension hooks (`tool_call`, `tool_result`, `session_start`, `session_before_compact`). **Codex CLI** provides partial hook-based session tracking through PreToolUse, PostToolUse, PreCompact, SessionStart, UserPromptSubmit, and Stop; MCP tools work. **Antigravity**, **Kiro**, and **Zed** have no hook support in the current release, so session tracking is not available. **OMP** (Oh My Pi) ships full plugin-based hook support — `omp plugin install context-mode` registers `tool_call`, `tool_result`, `session_start`, and `session_before_compact` handlers and storage roots cleanly under `~/.omp/context-mode/` so OMP and Pi installs never share state.
 
 <details>
 <summary><strong>What gets captured</strong></summary>
@@ -1130,7 +1139,7 @@ Detailed event data is also indexed into FTS5 for on-demand retrieval via `ctx_s
 
 **Pi Coding Agent** — High coverage. The extension registers all key lifecycle events: `tool_call` (PreToolUse), `tool_result` (PostToolUse), `session_start` (SessionStart), and `session_before_compact` (PreCompact). File edits, git ops, errors, and tasks are fully tracked. Session restore after compaction works via the extension's event hooks.
 
-**OMP (Oh My Pi)** — No session support today. context-mode delivers via MCP for OMP; OMP's native `pre`/`post` tool-call hook surface (`HookAPI`, `pi.on("tool_call", ...)`) is not yet wired by this adapter. The dedicated adapter exists so OMP storage roots cleanly under `~/.omp/context-mode/` instead of leaking into another platform's directory (issue [#473](https://github.com/mksglu/context-mode/issues/473)). Auto-detected via `PI_CODING_AGENT_DIR` env var or presence of `~/.omp/`.
+**OMP (Oh My Pi)** — High coverage. The plugin (installed via `omp plugin install context-mode`) registers all key lifecycle events: `tool_call` (PreToolUse), `tool_result` (PostToolUse), `session_start` (SessionStart), and `session_before_compact` (PreCompact). Storage roots cleanly under `~/.omp/context-mode/` so OMP and Pi installs never share state (issue [#473](https://github.com/mksglu/context-mode/issues/473)). Auto-detected via `PI_CODING_AGENT_DIR` env var or presence of `~/.omp/`.
 
 </details>
 
@@ -1139,12 +1148,12 @@ Detailed event data is also indexed into FTS5 for on-demand retrieval via `ctx_s
 | Feature | Claude Code | Qwen Code | Gemini CLI | VS Code Copilot | JetBrains Copilot | Cursor | OpenCode | KiloCode | OpenClaw | Codex CLI | Antigravity | Kiro | Zed | Pi | OMP |
 |---|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
 | MCP Server | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
-| PreToolUse Hook | Yes | Yes | Yes | Yes | Yes | Yes | Plugin | Plugin | Plugin | Yes | -- | Yes | -- | Yes (extension) | -- |
-| PostToolUse Hook | Yes | Yes | Yes | Yes | Yes | Yes | Plugin | Plugin | Plugin | Yes | -- | Yes | -- | Yes (extension) | -- |
-| SessionStart Hook | Yes | Yes | Yes | Yes | Yes | -- | ✓ (via experimental.chat.system.transform) | ✓ (via experimental.chat.system.transform) | Plugin | Yes | -- | -- | -- | Yes (extension) | -- |
-| PreCompact Hook | Yes | Yes | Yes | Yes | Yes | -- | Plugin | Plugin | Plugin | Yes | -- | -- | -- | Yes (extension) | -- |
+| PreToolUse Hook | Yes | Yes | Yes | Yes | Yes | Yes | Plugin | Plugin | Plugin | Yes | -- | Yes | -- | Yes (extension) | Plugin |
+| PostToolUse Hook | Yes | Yes | Yes | Yes | Yes | Yes | Plugin | Plugin | Plugin | Yes | -- | Yes | -- | Yes (extension) | Plugin |
+| SessionStart Hook | Yes | Yes | Yes | Yes | Yes | -- | ✓ (via experimental.chat.system.transform) | ✓ (via experimental.chat.system.transform) | Plugin | Yes | -- | -- | -- | Yes (extension) | Plugin |
+| PreCompact Hook | Yes | Yes | Yes | Yes | Yes | -- | Plugin | Plugin | Plugin | Yes | -- | -- | -- | Yes (extension) | Plugin |
 | Can Modify Args | Yes | Yes | Yes | Yes | Yes | Yes | Plugin | Plugin | Plugin | -- | -- | -- | -- | Yes (extension) | -- |
-| Can Block Tools | Yes | Yes | Yes | Yes | Yes | Yes | Plugin | Plugin | Plugin | Yes | -- | Yes | -- | Yes (extension) | -- |
+| Can Block Tools | Yes | Yes | Yes | Yes | Yes | Yes | Plugin | Plugin | Plugin | Yes | -- | Yes | -- | Yes (extension) | Plugin |
 | Utility Commands (ctx) | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes (/ctx-stats, /ctx-doctor) | Yes |
 | Slash Commands | Yes | -- | -- | -- | -- | -- | -- | -- | -- | -- | -- | -- | -- | -- | -- |
 | Plugin Marketplace | Yes | -- | -- | -- | -- | -- | -- | -- | -- | -- | -- | -- | -- | -- | -- |
@@ -1161,13 +1170,13 @@ Detailed event data is also indexed into FTS5 for on-demand retrieval via `ctx_s
 >
 > **Pi Coding Agent** runs context-mode as an extension with full hook support. The extension registers `tool_call`, `tool_result`, `session_start`, and `session_before_compact` events, providing high session continuity coverage. The MCP server provides all 11 MCP tools.
 >
-> **OMP (Oh My Pi)** is MCP-only — no hook integration. The dedicated adapter exists to keep storage isolated under `~/.omp/context-mode/` rather than leaking into another harness's directory. Auto-detected via `OMP_PROCESSING_AGENT_DIR` (default `~/.omp/agent`) or `~/.omp/` directory. See [issue #473](https://github.com/mksglu/context-mode/issues/473).
+> **OMP (Oh My Pi)** runs context-mode as a plugin via `omp plugin install context-mode`. The plugin registers `tool_call`, `tool_result`, `session_start`, and `session_before_compact` events for hard-block routing and full session continuity. Storage isolated under `~/.omp/context-mode/` so OMP and Pi never share state. Auto-detected via `PI_CODING_AGENT_DIR` (default agent dir `~/.omp/agent`) or `~/.omp/` directory. See [issue #473](https://github.com/mksglu/context-mode/issues/473) for the storage-isolation history.
 
 ### Routing Enforcement
 
 Hooks intercept tool calls programmatically — they can block dangerous commands and redirect them to the sandbox before execution. Instruction files guide the model via prompt instructions but cannot block anything. **Always enable hooks where supported.**
 
-> **Note:** Routing instruction files were previously auto-written to project directories on first session start. This was disabled to prevent git tree pollution ([#158](https://github.com/mksglu/context-mode/issues/158), [#164](https://github.com/mksglu/context-mode/issues/164)). Hook-capable platforms (Claude Code, Gemini CLI, VS Code Copilot, JetBrains Copilot, Cursor, OpenCode, OpenClaw, Codex CLI) inject routing via hooks and need no file. Non-hook platforms (Zed, Kiro, Antigravity, OMP) require a one-time manual copy — see each platform's install section.
+> **Note:** Routing instruction files were previously auto-written to project directories on first session start. This was disabled to prevent git tree pollution ([#158](https://github.com/mksglu/context-mode/issues/158), [#164](https://github.com/mksglu/context-mode/issues/164)). Hook-capable platforms (Claude Code, Gemini CLI, VS Code Copilot, JetBrains Copilot, Cursor, OpenCode, OpenClaw, Codex CLI, OMP via plugin) inject routing via hooks and need no file. Non-hook platforms (Zed, Kiro, Antigravity) require a one-time manual copy — see each platform's install section.
 
 | Platform | Hooks | Instruction File | With Hooks | Without Hooks |
 |---|:---:|---|:---:|:---:|
@@ -1183,6 +1192,7 @@ Hooks intercept tool calls programmatically — they can block dangerous command
 | Kiro | Yes | [`KIRO.md`](configs/kiro/KIRO.md) | **~98% saved** | ~60% saved |
 | Zed | -- | [`AGENTS.md`](configs/zed/AGENTS.md) | -- | ~60% saved |
 | Pi | ✓ | [`AGENTS.md`](configs/pi/AGENTS.md) | **~98% saved** | ~60% saved |
+| OMP | Plugin | [`SYSTEM.md`](configs/omp/SYSTEM.md) | **~98% saved** | ~60% saved |
 
 Without hooks, one unrouted `curl` or Playwright snapshot can dump 56 KB into context — wiping out an entire session's worth of savings.
 
