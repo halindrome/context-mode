@@ -343,3 +343,53 @@ describe("VS Code Copilot hooks", () => {
     });
   });
 });
+
+// ── #435 round-3 — MCP cwd != hook projectDir worktree-suffix ─────────────
+describe("VS Code Copilot hooks — MCP cwd != hook projectDir worktree-suffix (#435)", () => {
+  let mcpDir: string;
+  let worktreeDir: string;
+  let mcpDbPath: string;
+  let worktreeDbPath: string;
+
+  beforeAll(async () => {
+    mcpDir = mkdtempSync(join(tmpdir(), "vscode-mcp-A-"));
+    worktreeDir = mkdtempSync(join(tmpdir(), "vscode-wt-B-"));
+    const mcpHash = createHash("sha256").update(mcpDir).digest("hex").slice(0, 16);
+    const wtHash = createHash("sha256").update(worktreeDir).digest("hex").slice(0, 16);
+    const configDir = join(homedir(), ".vscode", "context-mode");
+    const sessionsDir = join(configDir, "sessions");
+    // Ensure DEBUG_LOG parent dir exists — posttooluse.mjs appends to
+    // ~/.vscode/context-mode/posttooluse-debug.log on entry before
+    // getSessionDBPath() (which mkdir's its sessions/ subdir) runs.
+    const { mkdirSync: mk } = await import("node:fs");
+    mk(configDir, { recursive: true });
+    mcpDbPath = join(sessionsDir, `${mcpHash}.db`);
+    worktreeDbPath = join(sessionsDir, `${wtHash}.db`);
+  });
+
+  afterAll(() => {
+    try { rmSync(mcpDir, { recursive: true, force: true }); } catch { /* best effort */ }
+    try { rmSync(worktreeDir, { recursive: true, force: true }); } catch { /* best effort */ }
+    try { if (existsSync(mcpDbPath)) unlinkSync(mcpDbPath); } catch { /* best effort */ }
+    try { if (existsSync(worktreeDbPath)) unlinkSync(worktreeDbPath); } catch { /* best effort */ }
+  });
+
+  const _sentinelDir = process.platform === "win32" ? tmpdir() : "/tmp";
+  const mcpSentinel = resolve(_sentinelDir, `context-mode-mcp-ready-${process.pid}`);
+  beforeEach(() => { writeFileSync(mcpSentinel, String(process.pid)); });
+  afterEach(() => { try { unlinkSync(mcpSentinel); } catch {} });
+
+  test("posttooluse writes DB under hook projectDir hash, not env VSCODE_CWD hash", () => {
+    const result = runHook("posttooluse.mjs", {
+      tool_name: "Read",
+      tool_input: { file_path: `${worktreeDir}/src/main.ts` },
+      tool_response: "file contents",
+      sessionId: "vscode-435-r3",
+      cwd: worktreeDir,
+    }, { VSCODE_CWD: mcpDir });
+
+    expect(result.exitCode).toBe(0);
+    expect(existsSync(worktreeDbPath)).toBe(true);
+    expect(existsSync(mcpDbPath)).toBe(false);
+  });
+});
