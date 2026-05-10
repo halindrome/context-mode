@@ -79,6 +79,7 @@
     "start.mjs",
     "scripts/postinstall.mjs",
     "scripts/heal-better-sqlite3.mjs",
+    "scripts/heal-installed-plugins.mjs",
     "README.md",
     "LICENSE"
   ],

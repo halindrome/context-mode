@@ -812,9 +812,81 @@ async function upgrade() {
 
       s.stop(color.green(`Updated in-place to v${newVersion}`));
 
+      // v1.0.114 hotfix — pre-flight: verify the in-place copy actually
+      // wrote a plugin.json carrying newVersion BEFORE we tell the
+      // registry that's the install path. If the manifest still reports
+      // the old version (rsync race, partial write, files-array drift),
+      // updating the registry would create the silent v1.0.113-class
+      // drift Mert hit. Bail out — the next /ctx-upgrade gets to retry.
+      const pluginManifest = resolve(pluginRoot, ".claude-plugin", "plugin.json");
+      let onDiskVersion: string | null = null;
+      try {
+        const pj = JSON.parse(readFileSync(pluginManifest, "utf-8"));
+        if (pj && typeof pj.version === "string") onDiskVersion = pj.version;
+      } catch { /* parse error → onDiskVersion stays null */ }
+      if (onDiskVersion !== newVersion) {
+        throw new Error(
+          `pluginRoot manifest version mismatch — disk says "${onDiskVersion ?? "<missing>"}" but newVersion is "${newVersion}". Refusing to bump registry.`,
+        );
+      }
+
       // Fix registry — adapter-aware
       adapter.updatePluginRegistry(pluginRoot, newVersion);
       p.log.info(color.dim("  Registry synced to " + pluginRoot));
+
+      // v1.0.114 hotfix — post-write assertion: re-read installed_plugins.json
+      // and verify installPath/.claude-plugin/plugin.json's version matches
+      // the registry entry. Throws on mismatch — fails loudly so a future
+      // adapter regression surfaces here, not weeks later in user reports.
+      try {
+        const ipPath = resolve(resolveClaudeConfigDir(), "plugins", "installed_plugins.json");
+        if (existsSync(ipPath)) {
+          const ip = JSON.parse(readFileSync(ipPath, "utf-8"));
+          const entries = ip?.plugins?.["context-mode@context-mode"];
+          if (Array.isArray(entries)) {
+            for (const entry of entries) {
+              const ip2 = entry?.installPath;
+              if (typeof ip2 !== "string" || !ip2) continue;
+              if (!existsSync(ip2)) {
+                throw new Error(`installPath does not exist on disk: ${ip2}`);
+              }
+              const pjPath = resolve(ip2, ".claude-plugin", "plugin.json");
+              if (!existsSync(pjPath)) {
+                throw new Error(`missing plugin.json manifest at ${pjPath}`);
+              }
+              const pj = JSON.parse(readFileSync(pjPath, "utf-8"));
+              if (pj?.version !== entry.version) {
+                throw new Error(
+                  `version mismatch — registry says "${entry.version}" but ${pjPath} says "${pj?.version}"`,
+                );
+              }
+            }
+          }
+        }
+      } catch (err: unknown) {
+        const message = err instanceof Error ? err.message : String(err);
+        throw new Error(`Registry consistency check failed: ${message}`);
+      }
+
+      // v1.0.114 hotfix — marketplace post-pull assertion: clone (if
+      // present) MUST be on newVersion. Mert's case showed marketplace
+      // stuck at v1.0.89 — the sync block above swallowed that silently.
+      // Warn (don't throw) — npm-only users have no marketplace clone.
+      try {
+        const marketplaceManifest = resolve(marketplaceDir, ".claude-plugin", "plugin.json");
+        if (existsSync(marketplaceManifest)) {
+          const mpj = JSON.parse(readFileSync(marketplaceManifest, "utf-8"));
+          if (mpj?.version !== newVersion) {
+            p.log.warn(
+              color.yellow("Marketplace clone version mismatch") +
+                ` — ${marketplaceDir} reports "${mpj?.version}" but expected "${newVersion}"`,
+            );
+            p.log.info(
+              color.dim(`  Run manually: git -C "${marketplaceDir}" fetch --tags origin && git -C "${marketplaceDir}" reset --hard origin/HEAD`),
+            );
+          }
+        }
+      } catch { /* best effort */ }
 
       // Install production deps
       s.start("Installing production dependencies");
