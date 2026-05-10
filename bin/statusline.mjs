@@ -212,7 +212,7 @@ async function main() {
   const {
     getRealBytesStats,
     getMultiAdapterLifetimeStats,
-    OPUS_INPUT_PRICE_PER_TOKEN,
+    kb,
   } = analytics;
 
   // Sessions dir doesn't exist yet — first ever launch
@@ -251,14 +251,31 @@ async function main() {
     multi = null;
   }
 
-  const PRICE = OPUS_INPUT_PRICE_PER_TOKEN ?? (15 / 1_000_000);
-  const lifetimeTokens = lifetime?.totalSavedTokens ?? 0;
-  const sessionTokens = conversation?.totalSavedTokens ?? 0;
-  const lifetimeUsd = lifetimeTokens * PRICE;
-  const sessionUsd = sessionTokens * PRICE;
+  // v1.0.118: drop the $ math — ctx_stats's narrative renderer is the source
+  // of truth and uses byte-based metrics. Statusline mirrors the same
+  // formulas so the two displays never diverge again.
+  //
+  // Lifetime bytes — multi-adapter aggregate when present, else local-DB
+  // real bytes. Mirrors src/session/analytics.ts:1684 narrative renderer.
+  const lifetimeBytes = (multi?.totalBytes && multi.totalBytes > 0)
+    ? multi.totalBytes
+    : (lifetime?.totalSavedTokens ?? 0) * 4;
 
-  // Reduction % — bytes avoided + snapshot bytes vs returned bytes.
-  // Mirrors persistStats() math in src/server.ts:565-568.
+  // This-chat bytes — real bytes accounting (data + bytes-avoided + snapshot).
+  const sessionBytes = conversation
+    ? ((conversation.eventDataBytes ?? 0)
+       + (conversation.bytesAvoided ?? 0)
+       + (conversation.snapshotBytes ?? 0))
+    : 0;
+
+  // Per-day average — same lifetime-day computation ctx_stats opener uses.
+  const sinceMs = lifetime?.firstEventMs ?? multi?.perAdapter?.[0]?.firstMs ?? 0;
+  const lifetimeDays = sinceMs > 0
+    ? Math.max(1, Math.round((Date.now() - sinceMs) / 86_400_000))
+    : 0;
+  const perDayBytes = lifetimeDays > 0 ? lifetimeBytes / lifetimeDays : 0;
+
+  // Reduction % — same as before (bytes-avoided + snapshot vs returned).
   const totalReturned = lifetime?.bytesReturned ?? 0;
   const totalKept =
     (lifetime?.bytesAvoided ?? 0)
@@ -271,36 +288,26 @@ async function main() {
 
   const dot = statusDot(pct);
 
-  // Multi-adapter aggregation. Real adapters = those passing the isReal
-  // filter (>=100 events, >=5 distinct projects, recent activity, avg
-  // bytes >= 50). When 2+ real adapters exist, surface a cross-tool $.
-  // multi.totalBytes is dataBytes + rescueBytes, NOT bytes-avoided — so
-  // it's a different (and typically smaller) lens than getRealBytesStats.
-  // Render the multi $ alongside lifetime $ rather than instead of it.
+  // Cross-tool count — used in the headline when 2+ real adapters detected.
   const realAdapters = (multi?.perAdapter ?? []).filter((a) => a?.isReal);
-  const multiTotalTokens = (multi?.totalBytes ?? 0) / 4;
-  const multiUsd = multiTotalTokens * PRICE;
-  const showMultiAdapter = realAdapters.length >= 2 && multiUsd > 0;
+  const showMultiAdapter = realAdapters.length >= 2;
 
-  // BRAND-NEW: no local SessionDB data at all → headline.
-  // Multi-adapter alone (without local data) means another tool has
-  // history but THIS Claude session is fresh — still show headline,
-  // not someone else's lifetime $, to avoid surprising users with a
-  // number they can't trace to their current adapter.
-  if (lifetimeTokens === 0 && sessionTokens === 0) {
+  // BRAND-NEW: no data at all → marketing headline.
+  if (lifetimeBytes === 0 && sessionBytes === 0) {
     process.stdout.write(
       `${brand("context-mode")}  ${green("●")}  ${dim("saves ~98% of context window")}`,
     );
     return;
   }
 
-  // FRESH session, no session $ yet — lead with persistence value.
-  if (sessionUsd === 0 && lifetimeUsd > 0) {
-    const blocks = [
-      `${bold(fmtUsd(lifetimeUsd))} ${dim("saved across sessions")}`,
-    ];
+  // FRESH session, no this-chat data yet — lead with lifetime number.
+  if (sessionBytes === 0 && lifetimeBytes > 0) {
+    const blocks = [`${bold(kb(lifetimeBytes))} ${dim("kept out")}`];
+    if (perDayBytes > 0) {
+      blocks.push(`${bold(kb(perDayBytes) + "/day")}`);
+    }
     if (showMultiAdapter) {
-      blocks.push(`${bold(fmtUsd(multiUsd))} ${dim(`across ${realAdapters.length} tools`)}`);
+      blocks.push(`${dim(`across ${realAdapters.length} tools`)}`);
     }
     blocks.push(dim("preserved across compact, restart & upgrade"));
     process.stdout.write(
@@ -309,18 +316,18 @@ async function main() {
     return;
   }
 
-  // ACTIVE: session $ · lifetime $ · [multi $] · % efficient
+  // ACTIVE: this-chat · lifetime · [N tools] · % efficient
   const valueBlocks = [
-    `${bold(fmtUsd(sessionUsd))} ${dim("saved this session")}`,
+    `${bold(kb(sessionBytes))} ${dim("this chat")}`,
   ];
-  if (lifetimeUsd > 0) {
-    valueBlocks.push(`${bold(fmtUsd(lifetimeUsd))} ${dim("saved across sessions")}`);
+  if (lifetimeBytes > 0) {
+    valueBlocks.push(`${bold(kb(lifetimeBytes))} ${dim("lifetime")}`);
   }
   if (showMultiAdapter) {
-    valueBlocks.push(`${bold(fmtUsd(multiUsd))} ${dim(`across ${realAdapters.length} tools`)}`);
+    valueBlocks.push(`${dim(`across ${realAdapters.length} tools`)}`);
   }
   if (pct > 0) {
-    valueBlocks.push(`${bold(`${pct}%`)} ${dim("efficient")}`);
+    valueBlocks.push(`${bold(`${pct}%`)} ${dim("kept out")}`);
   }
 
   const head = `${brand("context-mode")}  ${dot}  `;

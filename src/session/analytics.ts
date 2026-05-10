@@ -1473,7 +1473,7 @@ function adapterLabel(name: string): string {
  * rounded to 0.00 / 0.01 in the common range and added noise without
  * information. Scale awareness comes from the unit jump between rows.
  */
-function kb(b: number): string {
+export function kb(b: number): string {
   if (!Number.isFinite(b) || b <= 0) return "0 B";
   if (b < 1024) return `${Math.round(b)} B`;
 
