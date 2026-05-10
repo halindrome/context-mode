@@ -537,6 +537,72 @@ export class AnalyticsEngine {
 }
 
 // ─────────────────────────────────────────────────────────
+// Adapter dir enumeration (B3a multi-adapter aggregation)
+// ─────────────────────────────────────────────────────────
+
+/**
+ * Where one adapter stores its context-mode sidecars on disk. Mirrors the
+ * map in `src/adapters/detect.ts:92-111` (`getSessionDirSegments`) so we
+ * never go out of sync as a single source of truth.
+ *
+ * `sessionsDir` = `<home>/<segments>/context-mode/sessions`
+ * `contentDir`  = `<home>/<segments>/context-mode/content`
+ *
+ * Why duplicated here: `getSessionDirSegments` returns segments relative to
+ * `homedir()`; analytics needs the absolute joined paths for both `sessions`
+ * and `content` siblings. Keeping a parallel hard-coded list avoids importing
+ * detect.ts (which pulls in adapter loaders) into the stats path.
+ */
+export interface AdapterDirEntry {
+  /** Adapter id matching `src/adapters/detect.ts` PlatformId. */
+  name: string;
+  /** Absolute path to `<home>/<segments>/context-mode/sessions`. */
+  sessionsDir: string;
+  /** Absolute path to `<home>/<segments>/context-mode/content`. */
+  contentDir: string;
+}
+
+/**
+ * Enumerate every known adapter's sessions + content dirs under `home`.
+ * Used by `getMultiAdapterLifetimeStats` and `getMultiAdapterRealBytesStats`
+ * so a single call surfaces "your work everywhere on this machine across
+ * all AI tools" (the marketing line).
+ *
+ * Returns ALL 15 adapters even when the dir doesn't exist on disk — the
+ * scanner functions filter to existing dirs. That keeps the enumeration
+ * pure / testable without filesystem dependencies.
+ */
+export function enumerateAdapterDirs(opts?: { home?: string }): AdapterDirEntry[] {
+  const home = opts?.home ?? homedir();
+  // Mirrors `getSessionDirSegments` in src/adapters/detect.ts:92-111.
+  const map: ReadonlyArray<readonly [string, readonly string[]]> = [
+    ["claude-code",      [".claude"]],
+    ["gemini-cli",       [".gemini"]],
+    ["antigravity",      [".gemini"]],
+    ["openclaw",         [".openclaw"]],
+    ["codex",            [".codex"]],
+    ["cursor",           [".cursor"]],
+    ["vscode-copilot",   [".vscode"]],
+    ["kiro",             [".kiro"]],
+    ["pi",               [".pi"]],
+    ["omp",              [".omp"]],
+    ["qwen-code",        [".qwen"]],
+    ["kilo",             [".config", "kilo"]],
+    ["opencode",         [".config", "opencode"]],
+    ["zed",              [".config", "zed"]],
+    ["jetbrains-copilot", [".config", "JetBrains"]],
+  ];
+  return map.map(([name, segments]) => {
+    const base = join(home, ...segments, "context-mode");
+    return {
+      name,
+      sessionsDir: join(base, "sessions"),
+      contentDir: join(base, "content"),
+    };
+  });
+}
+
+// ─────────────────────────────────────────────────────────
 // Lifetime stats (Bug #3 + #4)
 // ─────────────────────────────────────────────────────────
 
