@@ -1054,6 +1054,277 @@ export function getRealBytesStats(opts: {
   return { eventDataBytes, bytesAvoided, bytesReturned, snapshotBytes, totalSavedTokens };
 }
 
+// ─────────────────────────────────────────────────────────
+// Multi-adapter aggregation (B3a — "your work everywhere")
+// ─────────────────────────────────────────────────────────
+
+/**
+ * Real-usage filter thresholds. Decided in the B3a /diagnose conversation
+ * to suppress fixture-noise dirs (test runs that touched ~/.X but never
+ * carried real user work).
+ *
+ * An adapter is `isReal=true` iff ALL four hold:
+ *   eventCount     >= 100
+ *   distinctProjects >= 5
+ *   lastActivity within 30 days
+ *   avgEventBytes  >= 50
+ *
+ * Tuneable via `getMultiAdapterLifetimeStats({ filter })` for testing.
+ */
+export interface RealUsageFilter {
+  minEvents?: number;
+  minProjects?: number;
+  recencyMs?: number;
+  minAvgBytes?: number;
+  /** Fixed "now" timestamp for deterministic testing. Defaults to Date.now(). */
+  nowMs?: number;
+}
+
+const DEFAULT_REAL_USAGE_FILTER: Required<Omit<RealUsageFilter, "nowMs">> = {
+  minEvents: 100,
+  minProjects: 5,
+  recencyMs: 30 * 86_400_000,
+  minAvgBytes: 50,
+};
+
+/** Per-adapter scan result returned by {@link scanOneAdapter}. */
+export interface AdapterScanResult {
+  /** Adapter id (matches `enumerateAdapterDirs().name`). */
+  name: string;
+  /** Total event rows across every `*.db` in this adapter's sessions dir. */
+  eventCount: number;
+  /** Total distinct session_meta rows across every db. */
+  sessionCount: number;
+  /** Sum of LENGTH(data) across every session_event row. */
+  dataBytes: number;
+  /** Sum of LENGTH(snapshot) across consumed compact-rescue snapshots. */
+  rescueBytes: number;
+  /** Reserved for future content/ scan (B3b). 0 today. */
+  contentBytes: number;
+  /** Distinct session_id count across all dbs (alias of sessionCount). */
+  uuidConvs: number;
+  /** Distinct project_dir values across all session_events. */
+  projectDirs: string[];
+  /** Earliest event ms epoch (Number.POSITIVE_INFINITY when no events). */
+  firstMs: number;
+  /** Latest event ms epoch (0 when no events). */
+  lastMs: number;
+  /** Real-usage flag — see {@link RealUsageFilter}. */
+  isReal: boolean;
+}
+
+/**
+ * Scan one adapter's sessions dir. Always returns a result — never throws.
+ * When the dir is missing, the result has zeroed counts and `isReal=false`.
+ *
+ * Mirrors the inner SessionDB-walk inside `getLifetimeStats`
+ * (analytics.ts:677-752) so the new multi-adapter path stays in lock-step
+ * with the per-DB queries the single-dir path already trusts.
+ */
+function scanOneAdapter(
+  entry: AdapterDirEntry,
+  loadDb: () => unknown,
+  filter: Required<Omit<RealUsageFilter, "nowMs">> & { nowMs: number },
+): AdapterScanResult {
+  const result: AdapterScanResult = {
+    name: entry.name,
+    eventCount: 0,
+    sessionCount: 0,
+    dataBytes: 0,
+    rescueBytes: 0,
+    contentBytes: 0,
+    uuidConvs: 0,
+    projectDirs: [],
+    firstMs: Number.POSITIVE_INFINITY,
+    lastMs: 0,
+    isReal: false,
+  };
+  if (!existsSync(entry.sessionsDir)) return result;
+
+  let dbFiles: string[] = [];
+  try {
+    dbFiles = readdirSync(entry.sessionsDir).filter((f) => f.endsWith(".db"));
+  } catch { return result; }
+  if (dbFiles.length === 0) return result;
+
+  let DatabaseCtor: ReturnType<typeof loadDatabaseImpl> | null = null;
+  try {
+    DatabaseCtor = loadDb() as ReturnType<typeof loadDatabaseImpl>;
+  } catch { return result; }
+  if (!DatabaseCtor) return result;
+
+  const projectsSet = new Set<string>();
+  const sessionsSet = new Set<string>();
+
+  for (const file of dbFiles) {
+    const dbPath = join(entry.sessionsDir, file);
+    try {
+      const sdb = new DatabaseCtor(dbPath, { readonly: true });
+      try {
+        const ev = sdb.prepare(
+          "SELECT COUNT(*) AS cnt, COALESCE(SUM(LENGTH(data)), 0) AS bytes FROM session_events",
+        ).get() as { cnt: number; bytes: number } | undefined;
+        if (ev) {
+          result.eventCount += Number(ev.cnt ?? 0);
+          result.dataBytes  += Number(ev.bytes ?? 0);
+        }
+        try {
+          const ss = sdb.prepare(
+            "SELECT COUNT(*) AS cnt FROM session_meta",
+          ).get() as { cnt: number } | undefined;
+          result.sessionCount += Number(ss?.cnt ?? 0);
+        } catch { /* old schema */ }
+        try {
+          const snap = sdb.prepare(
+            "SELECT COALESCE(SUM(length(snapshot)), 0) AS bytes FROM session_resume WHERE consumed = 1",
+          ).get() as { bytes: number } | undefined;
+          if (snap?.bytes) result.rescueBytes += Number(snap.bytes);
+        } catch { /* old schema */ }
+        try {
+          const range = sdb.prepare(
+            "SELECT MIN(created_at) AS mn, MAX(created_at) AS mx FROM session_events",
+          ).get() as { mn: string | null; mx: string | null } | undefined;
+          if (range?.mn) {
+            const t = Date.parse(range.mn + (range.mn.endsWith("Z") ? "" : "Z"));
+            if (Number.isFinite(t) && t < result.firstMs) result.firstMs = t;
+          }
+          if (range?.mx) {
+            const t = Date.parse(range.mx + (range.mx.endsWith("Z") ? "" : "Z"));
+            if (Number.isFinite(t) && t > result.lastMs) result.lastMs = t;
+          }
+        } catch { /* old schema */ }
+        try {
+          const projRows = sdb.prepare(
+            "SELECT DISTINCT project_dir AS p FROM session_events WHERE project_dir != ''",
+          ).all() as Array<{ p: string }>;
+          for (const row of projRows) if (row.p) projectsSet.add(row.p);
+        } catch { /* old schema */ }
+        try {
+          const sidRows = sdb.prepare(
+            "SELECT DISTINCT session_id AS s FROM session_events",
+          ).all() as Array<{ s: string }>;
+          for (const row of sidRows) if (row.s) sessionsSet.add(row.s);
+        } catch { /* old schema */ }
+      } finally {
+        sdb.close();
+      }
+    } catch { /* missing tables / corrupt — skip */ }
+  }
+
+  result.projectDirs = Array.from(projectsSet);
+  result.uuidConvs = sessionsSet.size;
+
+  // Real-usage filter — see RealUsageFilter docstring.
+  const avgBytes = result.eventCount > 0 ? result.dataBytes / result.eventCount : 0;
+  const recentEnough =
+    result.lastMs > 0 && (filter.nowMs - result.lastMs) <= filter.recencyMs;
+  result.isReal =
+    result.eventCount  >= filter.minEvents &&
+    projectsSet.size   >= filter.minProjects &&
+    recentEnough &&
+    avgBytes           >= filter.minAvgBytes;
+
+  return result;
+}
+
+/** Aggregated multi-adapter lifetime stats. */
+export interface MultiAdapterLifetimeStats {
+  /** Sum of eventCount across every adapter that exists on disk. */
+  totalEvents: number;
+  /** Sum of sessionCount across every adapter. */
+  totalSessions: number;
+  /** Sum of dataBytes + rescueBytes across every adapter. */
+  totalBytes: number;
+  /** Per-adapter rows for adapters that have >= one .db file. */
+  perAdapter: AdapterScanResult[];
+}
+
+/**
+ * Aggregate lifetime stats across every adapter dir under `home`.
+ * The marketing line — "your work everywhere on this machine across all
+ * AI tools" — depends on this. Existing `getLifetimeStats` (single dir)
+ * is untouched; this is purely additive.
+ */
+export function getMultiAdapterLifetimeStats(opts?: {
+  home?: string;
+  loadDatabase?: () => unknown;
+  filter?: RealUsageFilter;
+}): MultiAdapterLifetimeStats {
+  const dirs = enumerateAdapterDirs({ home: opts?.home });
+  const loadDb = opts?.loadDatabase ?? loadDatabaseImpl;
+  const filter = {
+    ...DEFAULT_REAL_USAGE_FILTER,
+    ...(opts?.filter ?? {}),
+    nowMs: opts?.filter?.nowMs ?? Date.now(),
+  };
+
+  const perAdapter: AdapterScanResult[] = [];
+  let totalEvents = 0;
+  let totalSessions = 0;
+  let totalBytes = 0;
+
+  for (const entry of dirs) {
+    if (!existsSync(entry.sessionsDir)) continue; // only surface adapters with a sessions dir
+    const r = scanOneAdapter(entry, loadDb, filter);
+    perAdapter.push(r);
+    totalEvents   += r.eventCount;
+    totalSessions += r.sessionCount;
+    totalBytes    += r.dataBytes + r.rescueBytes;
+  }
+
+  return { totalEvents, totalSessions, totalBytes, perAdapter };
+}
+
+/** Aggregated multi-adapter real-bytes stats. */
+export interface MultiAdapterRealBytesStats extends RealBytesStats {
+  /** Per-adapter row in the same shape as {@link RealBytesStats}, keyed by name. */
+  perAdapter: Array<RealBytesStats & { name: string }>;
+}
+
+/**
+ * Aggregate real-bytes stats across every adapter dir under `home`.
+ * Mirrors `getRealBytesStats` (single dir, analytics.ts:887-989) but
+ * iterates {@link enumerateAdapterDirs}. Optional `sessionId` /
+ * `worktreeHash` filters apply uniformly to every dir.
+ */
+export function getMultiAdapterRealBytesStats(opts?: {
+  home?: string;
+  sessionId?: string;
+  worktreeHash?: string;
+  loadDatabase?: () => unknown;
+}): MultiAdapterRealBytesStats {
+  const dirs = enumerateAdapterDirs({ home: opts?.home });
+
+  const sum: RealBytesStats = {
+    eventDataBytes: 0,
+    bytesAvoided: 0,
+    bytesReturned: 0,
+    snapshotBytes: 0,
+    totalSavedTokens: 0,
+  };
+  const perAdapter: MultiAdapterRealBytesStats["perAdapter"] = [];
+
+  for (const entry of dirs) {
+    if (!existsSync(entry.sessionsDir)) continue;
+    const one = getRealBytesStats({
+      sessionsDir: entry.sessionsDir,
+      sessionId: opts?.sessionId,
+      worktreeHash: opts?.worktreeHash,
+      loadDatabase: opts?.loadDatabase,
+    });
+    perAdapter.push({ name: entry.name, ...one });
+    sum.eventDataBytes += one.eventDataBytes;
+    sum.bytesAvoided   += one.bytesAvoided;
+    sum.bytesReturned  += one.bytesReturned;
+    sum.snapshotBytes  += one.snapshotBytes;
+  }
+  sum.totalSavedTokens = Math.floor(
+    (sum.eventDataBytes + sum.bytesAvoided + sum.snapshotBytes) / 4,
+  );
+
+  return { ...sum, perAdapter };
+}
+
 /**
  * Marketing-grade labels for auto-memory file prefixes. The renderer sees raw
  * filename prefixes (`project_codex_hooks.md` → `project`) — without this map
