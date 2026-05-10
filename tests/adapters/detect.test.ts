@@ -41,7 +41,7 @@ describe("detectPlatform", () => {
     delete process.env.VSCODE_PID;
     delete process.env.VSCODE_CWD;
     delete process.env.QWEN_PROJECT_DIR;
-    delete process.env.OMP_PROCESSING_AGENT_DIR;
+    delete process.env.PI_CODING_AGENT_DIR;
     delete process.env.IDEA_INITIAL_DIRECTORY;
     delete process.env.IDEA_HOME;
     delete process.env.JETBRAINS_CLIENT_ID;
@@ -216,19 +216,20 @@ describe("detectPlatform", () => {
   });
 
   // ── OMP (Oh My Pi) ──────────────────────────────────────
-  // OMP_PROCESSING_AGENT_DIR is the published OMP config root override
-  // (defaults to ~/.omp/agent). Listed BEFORE pi in PLATFORM_ENV_VARS so an
-  // OMP-running harness is not misclassified as Pi when both are installed.
+  // PI_CODING_AGENT_DIR is the upstream OMP agent-dir override per
+  // can1357/oh-my-pi `packages/utils/src/dirs.ts:193`. Listed BEFORE pi in
+  // PLATFORM_ENV_VARS so an OMP-running harness is not misclassified as Pi
+  // when both are installed.
 
-  it("detects omp via OMP_PROCESSING_AGENT_DIR env var", () => {
-    process.env.OMP_PROCESSING_AGENT_DIR = "/home/user/.omp/agent";
+  it("detects omp via PI_CODING_AGENT_DIR env var", () => {
+    process.env.PI_CODING_AGENT_DIR = "/home/user/.omp/agent";
     const signal = detectPlatform();
     expect(signal.platform).toBe("omp");
     expect(signal.confidence).toBe("high");
   });
 
-  it("prefers omp over pi when both OMP_PROCESSING_AGENT_DIR and PI_PROJECT_DIR are set", () => {
-    process.env.OMP_PROCESSING_AGENT_DIR = "/home/user/.omp/agent";
+  it("prefers omp over pi when both PI_CODING_AGENT_DIR and PI_PROJECT_DIR are set", () => {
+    process.env.PI_CODING_AGENT_DIR = "/home/user/.omp/agent";
     process.env.PI_PROJECT_DIR = "/some/project";
     const signal = detectPlatform();
     expect(signal.platform).toBe("omp");

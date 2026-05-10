@@ -847,9 +847,9 @@ Full configs: [`configs/kiro/mcp.json`](configs/kiro/mcp.json) | [`configs/kiro/
 </details>
 
 <details>
-<summary><strong>OMP (Oh My Pi)</strong> — MCP-only, isolated storage under <code>~/.omp/</code></summary>
+<summary><strong>OMP (Oh My Pi)</strong> — MCP-only via <code>mcp.json</code></summary>
 
-**Prerequisites:** Node.js 18+, [Oh My Pi](https://github.com/can1357/oh-my-pi) installed.
+**Prerequisites:** Node.js 18+, Oh My Pi installed.
 
 **Install:**
 
@@ -859,7 +859,7 @@ Full configs: [`configs/kiro/mcp.json`](configs/kiro/mcp.json) | [`configs/kiro/
    npm install -g context-mode
    ```
 
-2. Add to `~/.omp/agent/mcp_config.json` (or `$OMP_PROCESSING_AGENT_DIR/mcp_config.json` if the env var is set):
+2. Add to `~/.omp/agent/mcp.json` (user scope) or `<project>/.omp/mcp.json` (project scope):
 
    ```json
    {
@@ -871,17 +871,23 @@ Full configs: [`configs/kiro/mcp.json`](configs/kiro/mcp.json) | [`configs/kiro/
    }
    ```
 
-3. Copy routing instructions (OMP has no hook support):
+   `PI_CODING_AGENT_DIR` overrides the agent directory; the file name `mcp.json` is fixed.
+
+3. Copy routing instructions:
 
    ```bash
-   cp node_modules/context-mode/configs/omp/PI.md ./PI.md
+   cp node_modules/context-mode/configs/omp/SYSTEM.md ~/.omp/agent/SYSTEM.md
    ```
+
+   Project-scoped alternative: `cp ... .omp/SYSTEM.md`. OMP also auto-discovers any `AGENTS.md` in the project tree.
 
 4. Restart OMP.
 
 **Verify:** In an OMP session, type `ctx stats`. Context-mode tools should appear and respond.
 
-**Routing:** Manual. The `PI.md` file is the only enforcement method (~60% compliance). Auto-detected via `OMP_PROCESSING_AGENT_DIR` env var or presence of `~/.omp/` directory. Storage roots at `~/.omp/context-mode/` so OMP and Pi installs do not share session DBs, content indices, or stats files.
+**Routing:** Rule-based via `SYSTEM.md` (~60% compliance — context-mode delivers via MCP for OMP; native OMP `pre`/`post` hooks are not yet wired by this adapter). Auto-detected via `PI_CODING_AGENT_DIR` env var or presence of `~/.omp/`. Storage roots at `~/.omp/context-mode/` so OMP and Pi installs never share session DBs, content indices, or stats files.
+
+Full configs: [`configs/omp/mcp.json`](configs/omp/mcp.json) | [`configs/omp/SYSTEM.md`](configs/omp/SYSTEM.md)
 
 </details>
 
@@ -1124,7 +1130,7 @@ Detailed event data is also indexed into FTS5 for on-demand retrieval via `ctx_s
 
 **Pi Coding Agent** — High coverage. The extension registers all key lifecycle events: `tool_call` (PreToolUse), `tool_result` (PostToolUse), `session_start` (SessionStart), and `session_before_compact` (PreCompact). File edits, git ops, errors, and tasks are fully tracked. Session restore after compaction works via the extension's event hooks.
 
-**OMP (Oh My Pi)** — No session support. MCP-only paradigm; no hook integration. The dedicated adapter exists so OMP storage roots cleanly under `~/.omp/context-mode/` instead of leaking into another platform's directory (issue [#473](https://github.com/mksglu/context-mode/issues/473)). Auto-detected via `OMP_PROCESSING_AGENT_DIR` env var or presence of `~/.omp/`.
+**OMP (Oh My Pi)** — No session support today. context-mode delivers via MCP for OMP; OMP's native `pre`/`post` tool-call hook surface (`HookAPI`, `pi.on("tool_call", ...)`) is not yet wired by this adapter. The dedicated adapter exists so OMP storage roots cleanly under `~/.omp/context-mode/` instead of leaking into another platform's directory (issue [#473](https://github.com/mksglu/context-mode/issues/473)). Auto-detected via `PI_CODING_AGENT_DIR` env var or presence of `~/.omp/`.
 
 </details>
 
