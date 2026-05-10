@@ -1446,10 +1446,32 @@ function adapterLabel(name: string): string {
 // formatReport — renders FullReport as sales-grade savings dashboard
 // ─────────────────────────────────────────────────────────
 
-/** Format bytes as human-readable KB or MB. */
+/**
+ * Format bytes with the next unit shown in parentheses for context.
+ *
+ * Mert: "232.6 KB bu kac MB ya da GB yapar onu gostersin" — small numbers in
+ * isolation lose scale. Pair every primary unit with its next-bigger unit so
+ * the reader can mentally locate the size on a 1 KB → 1 GB axis without
+ * having to do the math themselves.
+ *
+ * Format rules:
+ *   < 1 KB         → "X B"
+ *   1 KB – < 1 MB  → "X KB (0.YY MB)"      ← new dual-unit, MB context
+ *   1 MB – < 1 GB  → "X MB (0.YY GB)"      ← new dual-unit, GB context
+ *   ≥ 1 GB         → "X GB"
+ */
 function kb(b: number): string {
-  if (b >= 1024 * 1024) return `${(b / 1024 / 1024).toFixed(1)} MB`;
-  if (b >= 1024) return `${(b / 1024).toFixed(1)} KB`;
+  if (b >= 1024 * 1024 * 1024) return `${(b / 1024 / 1024 / 1024).toFixed(2)} GB`;
+  if (b >= 1024 * 1024) {
+    const mb = b / 1024 / 1024;
+    const gb = mb / 1024;
+    return `${mb.toFixed(1)} MB (${gb.toFixed(2)} GB)`;
+  }
+  if (b >= 1024) {
+    const kbV = b / 1024;
+    const mbV = kbV / 1024;
+    return `${kbV.toFixed(1)} KB (${mbV.toFixed(2)} MB)`;
+  }
   return `${Math.round(b)} B`;
 }
 
@@ -1576,30 +1598,27 @@ export function renderCostExample(
   const geminiUsd = ((lifetimeTokens * 1.25) / 1_000_000).toFixed(2);
   const haikuUsd  = ((lifetimeTokens * 0.8)  / 1_000_000).toFixed(2);
 
+  // Mert: "daha marketing ve business value e vermeli, math hesaplamalari ile
+  // kalabalik yapma" — collapse the old 4-block render (5 prose lines + 3
+  // comparison lines + 2 team lines + scaling table + disclaimer) into ONE
+  // headline number, ONE relatable comparison, ONE team-scale callout. Drop
+  // the alternate-model scaling row (engineer-curiosity, not value framing).
   const out: string[] = [];
   out.push(
-    `  context-mode kept ${kb(lifetimeBytes)} (${fmtNum(lifetimeTokens)} tokens) out of your AI's context.`,
+    `  $${usdStr(opusUsd)} of Opus 4 tokens your team didn't burn.`,
   );
-  out.push("  If those tokens had hit Opus 4 ($15 per 1M input):");
-  out.push("");
-  out.push(`    $${usdStr(opusUsd)}  on Opus 4 input alone`);
-  out.push("");
-  out.push("  That's roughly:");
-  out.push(`    ·  ${cursorMonths} months of Cursor Pro ($20/mo)`);
-  out.push(`    ·  ${claudeMaxMonths} months of Claude Max ($200/mo)`);
-  out.push(`    ·  ${weekendCount} weekends of nonstop API coding`);
+  out.push(
+    `  context-mode kept ${kb(lifetimeBytes)} out of context — that's ${cursorMonths} months of Cursor Pro paid for itself.`,
+  );
+  if (teamUsd > 0 && teamYearUsd > 0) {
+    out.push("");
+    out.push(
+      `  Scale across a 10-dev team and that's ~$${teamYearUsd.toLocaleString("en-US")}/year saved.`,
+    );
+  }
   out.push("");
   out.push(
-    `  At a 10-dev team scale: ~$${teamUsd} over ${lifetimeDays} days, or ~$${teamYearUsd}/year.`,
-  );
-  out.push("");
-  out.push("  Different model? Math scales:");
-  out.push(
-    `    Sonnet 4  $${sonnetUsd}  ·  GPT-4o $${gpt4oUsd}  ·  Gemini 2 $${geminiUsd}  ·  Haiku 4 $${haikuUsd}`,
-  );
-  out.push("");
-  out.push(
-    "  These are EXAMPLES, not your actual bill — your model and rates may differ.",
+    `  (Opus rates shown for context. On cheaper models the dollar number drops; the savings ratio holds.)`,
   );
   return out;
 }
@@ -1762,10 +1781,12 @@ function renderNarrative5Section(args: {
   out.push("");
   out.push("");
 
-  // ── Section 3 — The receipt — getting wider.
-  out.push("  ─── 3. The receipt — getting wider ───");
+  // ── Section 3 — Scope ladder, prose form (Mert: "cok daginik" → drop columns).
+  // Two short sentences instead of a 4-column table — the same numbers framed
+  // as "this chat" → "all your work" so the reader sees the scope getting wider
+  // without being asked to scan a wide grid.
+  out.push("  ─── 3. The scope, getting wider ───");
   out.push("");
-  // Two rows: this conversation + all real work.
   const convStartedYMD = conversation.firstEventMs && conversation.firstEventMs > 0
     ? new Intl.DateTimeFormat(locale, { timeZone: tz, year: "numeric", month: "short", day: "numeric" })
         .format(new Date(conversation.firstEventMs))
@@ -1775,18 +1796,20 @@ function renderNarrative5Section(args: {
         .format(new Date(sinceMs))
     : "";
   const distinctProj = lifetime?.distinctProjects ?? 0;
-  out.push(
-    `    This conversation                     ${kb(convBytes).padStart(7)}  ${(fmtNum(conversationTokens) + " tokens").padStart(13)}    ${(conversation.events.toLocaleString(locale) + " captures").padStart(15)}   ${convStartedYMD ? `started ${convStartedYMD}` : ""}`,
-  );
   const allCaps = lifetime?.totalEvents ?? multiAdapter?.totalEvents ?? 0;
   out.push(
-    `    All your real work everywhere    ${kb(lifetimeBytes).padStart(8)}   ${(fmtNum(lifetimeTokensWithout) + " tokens").padStart(11)}   ${(allCaps.toLocaleString(locale) + " captures").padStart(15)}   ${totalConversations} chats × ${distinctProj} projects${lifeStartedYMD ? `, since ${lifeStartedYMD}` : ""}`,
+    `  This chat: ${kb(convBytes)} kept out · ${conversation.events.toLocaleString(locale)} captures${convStartedYMD ? ` · started ${convStartedYMD}` : ""}.`,
+  );
+  out.push(
+    `  All your work: ${kb(lifetimeBytes)} kept out · ${allCaps.toLocaleString(locale)} captures across ${distinctProj} project${distinctProj === 1 ? "" : "s"}${lifeStartedYMD ? ` · since ${lifeStartedYMD}` : ""}.`,
   );
   out.push("");
   out.push("");
 
-  // ── Section 4 — Cost example.
-  out.push("  ─── 4. For example: what would that cost? ───");
+  // ── Section 4 — Marketing-grade cost framing (Mert: "math hesaplamalari ile
+  // kalabalik yapma" → less math, more business value). One headline, one
+  // optional team-scale callout, no scaling table, no math footnotes.
+  out.push("  ─── 4. The bottom line ───");
   out.push("");
   out.push(...renderCostExample(lifetimeBytes, lifetimeTokensWithout, lifetimeDays));
   out.push("");
