@@ -210,7 +210,13 @@ describe("statusline.mjs — cross-OS session resolver", () => {
   // The statusline subprocess's process.ppid is the vitest worker pid
   // (which is THIS file's `process.pid`). The fake ps must start its
   // ancestry chain at THAT pid so the walk has something to follow.
-  test("darwin: walks parent chain via ps to find claude PID", () => {
+  //
+  // Skipped on win32: the fake `ps` shim is a bash script with `#!/bin/sh`,
+  // which Windows' CreateProcess cannot execute via execFileSync (no
+  // shell-script binfmt). Production statusline on Windows takes the
+  // explicit win32 branch (line 119-125 of bin/statusline.mjs) and never
+  // reaches findClaudePidDarwin anyway, so coverage is irrelevant there.
+  test.skipIf(process.platform === "win32")("darwin: walks parent chain via ps to find claude PID", () => {
     const statuslineParentPid = process.pid;
     const fakePs = join(scratch, "ps");
     writeFileSync(
