@@ -2341,23 +2341,28 @@ describe("Project dir hash consistency", () => {
     "utf-8",
   );
 
-  test("shared hashProjectDir helper exists and normalizes backslashes", () => {
-    const normalizeFn = serverSrc.match(/function normalizeProjectDirForHash[\s\S]*?^}/m);
-    expect(normalizeFn).not.toBeNull();
-    expect(normalizeFn![0]).toMatch(/replace\(.*\\\\.*\/.*\)/);
-
-    const fn = serverSrc.match(/function hashProjectDir[\s\S]*?^}/m);
-    expect(fn).not.toBeNull();
-    const body = fn![0];
-    expect(body).toContain("normalizeProjectDirForHash");
-    expect(body).toContain("createHash");
+  test("server.ts imports canonical hash + path resolvers from session/db.js", () => {
+    // After the case-fold migration + content-store migration, all DB
+    // path computation lives in src/session/db.ts. The server MUST import
+    // resolveSessionDbPath + resolveContentStorePath rather than rolling
+    // its own hash + join inline.
+    expect(serverSrc).toMatch(
+      /import\s*\{[^}]*resolveSessionDbPath[^}]*\}\s*from\s*"\.\/session\/db\.js"/,
+    );
+    expect(serverSrc).toMatch(
+      /import\s*\{[^}]*resolveContentStorePath[^}]*\}\s*from\s*"\.\/session\/db\.js"/,
+    );
+    // The deleted local helpers MUST be gone — guards against accidental
+    // re-introduction that would split the case-fold contract.
+    expect(serverSrc).not.toMatch(/^function hashProjectDir\(/m);
+    expect(serverSrc).not.toMatch(/^function normalizeProjectDirForHash\(/m);
   });
 
-  test("getStorePath uses hashProjectDir, not inline hashing", () => {
+  test("getStorePath delegates to resolveContentStorePath (auto case-fold migration)", () => {
     const fn = serverSrc.match(/function getStorePath[\s\S]*?^}/m);
     expect(fn).not.toBeNull();
-    expect(fn![0]).toContain("hashProjectDir");
-    // Must NOT have its own inline createHash call
+    expect(fn![0]).toContain("resolveContentStorePath");
+    // Must NOT have its own inline createHash call.
     expect(fn![0]).not.toContain("createHash");
   });
 

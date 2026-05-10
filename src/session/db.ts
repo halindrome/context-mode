@@ -162,6 +162,49 @@ export function hashProjectDirCanonical(projectDir: string): string {
 }
 
 /**
+ * Resolve the per-project FTS5 content store DB path, performing a one-shot
+ * migration from a legacy raw-casing filename to the canonical one when only
+ * the legacy file (with optional `-wal` / `-shm` SQLite sidecars) exists.
+ *
+ * Same dual-hash safety contract as {@link resolveSessionDbPath}:
+ *   - Linux: canonical hash equals legacy hash → no migration attempted.
+ *   - Mac/Win: rename legacy → canonical when canonical missing.
+ *   - Both exist: leave legacy alone (data-loss safety). Caller picks
+ *     canonical; reconciliation is a manual operation.
+ *
+ * Differs from `resolveSessionDbPath` in two ways:
+ *   1. No worktree suffix — the FTS5 store is per-project, not per-worktree.
+ *   2. The `-wal` / `-shm` sidecars travel with the main `.db` during
+ *      migration so an active SQLite WAL checkpoint is not stranded behind.
+ */
+export function resolveContentStorePath(opts: {
+  projectDir: string;
+  contentDir: string;
+}): string {
+  const { projectDir, contentDir } = opts;
+  const canonicalHash = hashProjectDirCanonical(projectDir);
+  const canonicalPath = join(contentDir, `${canonicalHash}.db`);
+  if (existsSync(canonicalPath)) return canonicalPath;
+
+  const legacyHash = hashProjectDirLegacy(projectDir);
+  if (legacyHash === canonicalHash) return canonicalPath; // Linux short-circuit
+
+  const legacyPath = join(contentDir, `${legacyHash}.db`);
+  if (existsSync(legacyPath)) {
+    try {
+      renameSync(legacyPath, canonicalPath);
+      // Travel the SQLite sidecars too so an active WAL is not orphaned.
+      for (const suffix of ["-wal", "-shm"]) {
+        try { renameSync(legacyPath + suffix, canonicalPath + suffix); } catch { /* sidecar may not exist */ }
+      }
+    } catch {
+      // Race or permission issue — caller will create canonicalPath fresh.
+    }
+  }
+  return canonicalPath;
+}
+
+/**
  * Resolve the SessionDB file path for a project, performing a one-shot
  * migration from legacy raw-casing filenames to canonical ones when only
  * the legacy file exists.
@@ -963,8 +1006,9 @@ export class SessionDB extends SQLiteBase {
    * Atomically claim the most recent unconsumed resume snapshot in this DB,
    * EXCLUDING any row that belongs to `currentSessionId`.
    *
-   * `SessionDB` is sharded per project (see `getSessionDBPath` — SHA-256 of
-   * project dir), so "this DB" already implies "this project". The atomic
+   * `SessionDB` is sharded per project (see `resolveSessionDbPath` — SHA-256
+   * of canonical project dir), so "this DB" already implies "this project".
+   * The atomic
    * `UPDATE … RETURNING` ensures concurrent processes for the same project
    * cannot both inject the same snapshot (Mickey / PR #376 race).
    *

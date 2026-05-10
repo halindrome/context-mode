@@ -2,7 +2,6 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { createRequire } from "node:module";
-import { createHash } from "node:crypto";
 import { existsSync, unlinkSync, readdirSync, readFileSync, writeFileSync, renameSync, rmSync, mkdirSync, cpSync, statSync, symlinkSync, lstatSync } from "node:fs";
 import { execSync, spawnSync, type ChildProcess, type SpawnSyncOptions, type SpawnSyncReturns } from "node:child_process";
 import { join, dirname, resolve, sep, isAbsolute } from "node:path";
@@ -29,7 +28,7 @@ import {
 } from "./runtime.js";
 import { classifyNonZeroExit } from "./exit-classify.js";
 import { startLifecycleGuard } from "./lifecycle.js";
-import { hashProjectDirCanonical, resolveSessionDbPath, SessionDB } from "./session/db.js";
+import { hashProjectDirCanonical, hashProjectDirLegacy, resolveContentStorePath, resolveSessionDbPath, SessionDB } from "./session/db.js";
 import { purgeSession } from "./session/purge.js";
 import {
   emitCacheHitEvent,
@@ -223,23 +222,6 @@ function resolveProjectPath(filePath: string): string {
 }
 
 /**
- * Consistent project dir hashing across all DB paths.
- * Normalizes Windows backslashes before hashing so the same project
- * always produces the same hash regardless of path separator.
- */
-function normalizeProjectDirForHash(projectDir: string): string {
-  const normalized = projectDir.replace(/\\/g, "/");
-  if (/^\/+$/.test(normalized)) return "/";
-  if (/^[A-Za-z]:\/+$/.test(normalized)) return `${normalized.slice(0, 2)}/`;
-  return normalized.replace(/\/+$/, "");
-}
-
-function hashProjectDir(projectDir = getProjectDir()): string {
-  const normalized = normalizeProjectDirForHash(projectDir);
-  return createHash("sha256").update(normalized).digest("hex").slice(0, 16);
-}
-
-/**
  * Resolve the per-project SessionDB path. Delegates to
  * {@link resolveSessionDbPath} so casing-only variants of the same
  * physical worktree on macOS / Windows hit ONE DB, not two — and any
@@ -263,12 +245,14 @@ function getSessionDbPath(): string {
  *         ~/.cursor/context-mode/content/87c28c41ddb64d38.db
  */
 function getStorePath(): string {
-  const hash = hashProjectDir();
   // Derive content dir from session dir: .../sessions/ → .../content/
-  const sessDir = getSessionDir();
-  const dir = join(dirname(sessDir), "content");
+  const dir = join(dirname(getSessionDir()), "content");
   mkdirSync(dir, { recursive: true });
-  return join(dir, `${hash}.db`);
+  // Delegate to resolveContentStorePath: same case-fold + one-shot legacy
+  // rename behavior as resolveSessionDbPath. On macOS / Windows, an
+  // existing legacy raw-casing FTS5 db (with -wal/-shm sidecars) is
+  // migrated in place on first call. On Linux it's a no-op.
+  return resolveContentStorePath({ projectDir: getProjectDir(), contentDir: dir });
 }
 
 function getStore(): ContentStore {
@@ -3150,12 +3134,23 @@ server.registerTool(
       _store = null;
     }
 
+    // FTS5 store: pass contentDir so purgeSession sweeps BOTH canonical
+    // and legacy raw-casing variants (dual-hash, mirrors session events).
+    // storePath is also passed for the rare case where the resolver picked
+    // an absolute path that differs from the dual-hash pair (e.g. caller
+    // pre-migrated). Both paths are de-duped during unlink.
+    const contentDir = storePathForPurge ? dirname(storePathForPurge) : undefined;
     const { deleted } = purgeSession({
       projectDir: getProjectDir(),
       sessionsDir: getSessionDir(),
       storePath: storePathForPurge,
+      contentDir,
       legacyContentDir: join(homedir(), ".context-mode", "content"),
-      contentHash: hashProjectDir(),
+      // hashProjectDirLegacy mirrors the deployed (≤ v1.0.111) raw-casing
+      // hash that named files under ~/.context-mode/content/. Using the
+      // legacy hash here is correct: that pre-pre-legacy directory was
+      // never migrated and still uses raw casing.
+      contentHash: hashProjectDirLegacy(getProjectDir()),
     });
 
     // Reset in-memory session stats

@@ -339,6 +339,84 @@ describe("purgeSession — slice 8: worktree separation", () => {
 // Slice 9 — deleted labels match the legacy ctx_purge contract
 // ─────────────────────────────────────────────────────────
 
+// ─────────────────────────────────────────────────────────
+// Slice 10 — FTS5 content store: dual-hash sweep via contentDir
+// ─────────────────────────────────────────────────────────
+
+describe("purgeSession — slice 10: FTS5 dual-hash sweep via contentDir", () => {
+  it.skipIf(process.platform === "linux")(
+    "wipes BOTH legacy raw-casing and canonical FTS5 store .db + sidecars",
+    () => {
+      const projectDir = makeRepo("s10");
+      const sessionsDir = makeTmpDir("sess10");
+      const contentDir = makeTmpDir("content10");
+      const canonicalHash = hashProjectDirCanonical(projectDir);
+      const legacyHash = hashProjectDirLegacy(projectDir);
+      // Cross-platform skip: if the test repo's path happens to be already
+      // lowercased (rare on macOS tmpdir but possible), the dual-sweep
+      // collapses to a single sweep — slice 5 already covers that.
+      if (canonicalHash === legacyHash) return;
+
+      const canonicalDb = join(contentDir, `${canonicalHash}.db`);
+      const legacyDb    = join(contentDir, `${legacyHash}.db`);
+      touchSqliteTriple(canonicalDb);
+      touchSqliteTriple(legacyDb);
+
+      const r = purgeSession({ projectDir, sessionsDir, contentDir });
+
+      for (const p of [canonicalDb, `${canonicalDb}-wal`, `${canonicalDb}-shm`,
+                       legacyDb, `${legacyDb}-wal`, `${legacyDb}-shm`]) {
+        expect(existsSync(p)).toBe(false);
+      }
+      expect(r.deleted).toContain("knowledge base (FTS5)");
+      // Label appears once even though both hashes were swept.
+      expect(r.deleted.filter((l) => l === "knowledge base (FTS5)")).toHaveLength(1);
+    },
+  );
+
+  it("contentDir triggers FTS5 sweep even when no FTS5 file exists (no-op safe)", () => {
+    const projectDir = makeRepo("s10b");
+    const sessionsDir = makeTmpDir("sess10b");
+    const contentDir = makeTmpDir("content10b");
+    const r = purgeSession({ projectDir, sessionsDir, contentDir });
+    expect(r.deleted).not.toContain("knowledge base (FTS5)");
+  });
+
+  it.skipIf(process.platform !== "linux")(
+    "Linux: legacyHash === canonicalHash so dual-sweep collapses to single pass",
+    () => {
+      const projectDir = makeRepo("s10c");
+      const sessionsDir = makeTmpDir("sess10c");
+      const contentDir = makeTmpDir("content10c");
+      expect(hashProjectDirCanonical(projectDir)).toBe(hashProjectDirLegacy(projectDir));
+      const dbPath = join(contentDir, `${hashProjectDirCanonical(projectDir)}.db`);
+      touchSqliteTriple(dbPath);
+      const r = purgeSession({ projectDir, sessionsDir, contentDir });
+      expect(existsSync(dbPath)).toBe(false);
+      expect(r.deleted).toContain("knowledge base (FTS5)");
+    },
+  );
+
+  it("worktree separation: sibling project's FTS5 file at different hash is untouched", () => {
+    const wt1 = makeRepo("s10wt1");
+    const wt2 = makeRepo("s10wt2");
+    const sessionsDir = makeTmpDir("sess10wt");
+    const contentDir = makeTmpDir("content10wt");
+    const wt1Hash = hashProjectDirCanonical(wt1);
+    const wt2Hash = hashProjectDirCanonical(wt2);
+    expect(wt1Hash).not.toBe(wt2Hash); // distinct projects
+    const wt1Db = join(contentDir, `${wt1Hash}.db`);
+    const wt2Db = join(contentDir, `${wt2Hash}.db`);
+    touchSqliteTriple(wt1Db);
+    touchSqliteTriple(wt2Db);
+
+    purgeSession({ projectDir: wt1, sessionsDir, contentDir });
+
+    expect(existsSync(wt1Db)).toBe(false); // wiped
+    expect(existsSync(wt2Db)).toBe(true);  // untouched
+  });
+});
+
 describe("purgeSession — slice 9: backward-compatible labels", () => {
   it("uses the exact legacy labels: 'knowledge base (FTS5)', 'session events DB', 'session events markdown'", () => {
     const projectDir = makeRepo("s9");

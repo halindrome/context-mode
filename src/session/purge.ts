@@ -63,8 +63,27 @@ export interface PurgeOpts {
    * (e.g. `~/.claude/context-mode/content/<hash>.db`). When omitted no
    * FTS5 wipe runs. Caller is responsible for closing any open handle
    * BEFORE invoking purgeSession (Windows file locks).
+   *
+   * Use `contentDir` instead for new code — it dual-sweeps the canonical
+   * AND legacy raw-casing variants, mirroring the session events pattern.
+   * `storePath` remains for callers that have already pre-resolved a single
+   * absolute path and only want to wipe that exact file.
    */
   storePath?: string;
+  /**
+   * Per-platform FTS5 content directory (e.g.
+   * `~/.claude/context-mode/content`). When provided, purgeSession sweeps
+   * BOTH the canonical and legacy raw-casing hash variants of the FTS5
+   * store inside this directory plus their `-wal` / `-shm` sidecars. This
+   * is the recommended input — covers a partial upgrade where the user
+   * had been writing to a legacy raw-casing FTS5 file before the case-fold
+   * migration landed.
+   *
+   * Mutually-additive with `storePath`: if both are passed, both are swept
+   * (de-duped on path). Closing FTS5 handles before invoking is still the
+   * caller's responsibility.
+   */
+  contentDir?: string;
   /**
    * Legacy shared content directory at `~/.context-mode/content`. When
    * omitted, the legacy content sweep is skipped.
@@ -128,19 +147,35 @@ function tryUnlinkSqliteTriple(path: string, wipedPaths: string[]): boolean {
  * without `contentHash`), which is a programmer bug not a runtime concern.
  */
 export function purgeSession(opts: PurgeOpts): PurgeResult {
-  const { projectDir, sessionsDir, storePath, legacyContentDir, contentHash } = opts;
+  const { projectDir, sessionsDir, storePath, contentDir, legacyContentDir, contentHash } = opts;
   const deleted: string[] = [];
   const wipedPaths: string[] = [];
 
   // ── 1. Knowledge base FTS5 store (per-platform). ──────────────────────
-  // Single-hash today: the FTS5 store has not undergone the case-fold
-  // migration that the SessionDB underwent in commit a32cc29, so there is
-  // no "legacy" variant to sweep. If/when that migration lands the caller
-  // can pass an array of `storePath` candidates by computing them outside.
-  if (storePath) {
-    const removed = tryUnlinkSqliteTriple(storePath, wipedPaths);
-    if (removed) deleted.push("knowledge base (FTS5)");
+  // Two input modes:
+  //   - `storePath`: single absolute path; pre-resolved by caller. Wipes
+  //     exactly that file plus -wal / -shm sidecars. Back-compat path.
+  //   - `contentDir`: directory; purgeSession derives BOTH canonical and
+  //     legacy raw-casing variants of the FTS5 store filename (matches
+  //     the case-fold migration pattern from `resolveContentStorePath`)
+  //     and sweeps each with sidecars. Recommended for new callers.
+  // Both inputs may be supplied; paths are de-duped via the unlink-or-fail
+  // semantics of `tryUnlinkSqliteTriple`. The "knowledge base (FTS5)"
+  // label appears at most once.
+  let storeFound = false;
+  if (storePath && tryUnlinkSqliteTriple(storePath, wipedPaths)) storeFound = true;
+  if (contentDir) {
+    const canonicalHash = hashProjectDirCanonical(projectDir);
+    const legacyHash    = hashProjectDirLegacy(projectDir);
+    const storeHashes = canonicalHash === legacyHash
+      ? [canonicalHash]
+      : [canonicalHash, legacyHash];
+    for (const h of storeHashes) {
+      const path = join(contentDir, `${h}.db`);
+      if (tryUnlinkSqliteTriple(path, wipedPaths)) storeFound = true;
+    }
   }
+  if (storeFound) deleted.push("knowledge base (FTS5)");
 
   // ── 2. Legacy shared content DB at ~/.context-mode/content/<hash>.db.
   // Same reasoning as (1) — single hash, legacy code-path only.
