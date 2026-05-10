@@ -1,31 +1,31 @@
 /**
- * adapters/pi — Pi Coding Agent platform adapter.
+ * adapters/pi — Pi coding agent platform adapter.
  *
- * Implements HookAdapter for Pi's MCP-only paradigm.
+ * Implements HookAdapter for Pi's MCP-only paradigm at the adapter layer.
  *
  * Pi hook specifics:
- *   - NO HookAdapter parse/format pipeline. Pi's hook lifecycle
- *     (session_start, tool_call, tool_result, session_compact, ...) is
- *     handled directly by `src/adapters/pi/extension.ts` via the native
- *     `pi.on(...)` surface. From the MCP-server perspective — which is
- *     what `getAdapter()` routes — Pi is mcp-only.
- *   - Config: ~/.pi/mcp_config.json (JSON format)
- *   - MCP: full support via mcpServers in mcp_config.json
- *   - Session dir: ~/.pi/context-mode/sessions/
- *     Mirrors `src/adapters/pi/extension.ts:121-125` so the MCP-server path
- *     and the extension's own self-managed path resolve to the SAME directory.
- *   - Routing file: PI.md
+ *   - NO JSON-stdio hooks. Pi exposes a JS-callback runtime API
+ *     (`pi.on("session_start", fn)`, `pi.on("tool_call", fn)`, …) which is
+ *     wired DIRECTLY by `src/adapters/pi/extension.ts`. The HookAdapter
+ *     contract here intentionally reports `mcp-only` and all-false
+ *     capabilities so harness paths that walk the JSON-stdio matrix do not
+ *     try to register stdio hooks for Pi.
+ *   - Config root: ~/.pi/
+ *   - Settings: ~/.pi/settings.json (kept lightweight — Pi does not
+ *     prescribe a canonical settings file, but several internal tools
+ *     write one; using settings.json keeps parity with Claude Code).
+ *   - Session dir: ~/.pi/context-mode/sessions/  (parallel to ~/.claude/,
+ *     ~/.omp/) — this is the data-isolation contract from issue #473.
+ *   - Instruction file: AGENTS.md (per configs/pi/AGENTS.md).
  *
- * Why a dedicated adapter:
- *   Without `case "pi"` in `getAdapter()`'s switch, Pi sessions silently
- *   fell through to ClaudeCodeAdapter and were written to
- *   ~/.claude/context-mode/sessions/ instead of ~/.pi/context-mode/sessions/
- *   (issue #473 / B2 fix). This adapter restores the correct storage root
- *   so `_detectedAdapter.getSessionDir()` matches the extension's writes.
- *
- * Sources:
- *   - Pi extension: src/adapters/pi/extension.ts
- *   - clientInfo mapping: src/adapters/client-map.ts:25-26 ("Pi CLI" / "Pi Coding Agent")
+ * Why a dedicated adapter is mandatory:
+ *   Before this adapter existed, `getAdapter("pi")` fell through to the
+ *   `default` arm of the switch in `src/adapters/detect.ts` and returned a
+ *   ClaudeCodeAdapter. Pi sessions therefore wrote DBs and event logs into
+ *   `~/.claude/context-mode/sessions/`, contaminating Claude Code state and
+ *   silently leaking Pi user data into the wrong storage root (issue #473
+ *   follow-up). The OMP adapter fixed the same class of bug for OMP; this
+ *   adapter closes the gap for Pi.
  */
 
 import {
@@ -63,7 +63,7 @@ export class PiAdapter extends BaseAdapter implements HookAdapter {
     super([".pi"]);
   }
 
-  readonly name = "Pi Coding Agent";
+  readonly name = "Pi";
   readonly paradigm: HookParadigm = "mcp-only";
 
   readonly capabilities: PlatformCapabilities = {
@@ -77,27 +77,28 @@ export class PiAdapter extends BaseAdapter implements HookAdapter {
   };
 
   // ── Input parsing ──────────────────────────────────────
-  // Pi's hook lifecycle is handled by extension.ts via pi.on(...).
-  // These methods exist to satisfy the HookAdapter contract; they
-  // throw if the MCP-server hook pipeline ever calls them by mistake.
+  // Pi does not feed the adapter via JSON-stdio. These methods exist to
+  // satisfy the HookAdapter contract and throw if the harness mistakenly
+  // routes a JSON-stdio event through the adapter.
 
   parsePreToolUseInput(_raw: unknown): PreToolUseEvent {
-    throw new Error("Pi extension manages its own hooks; HookAdapter parsers are not used");
+    throw new Error("Pi does not support JSON-stdio hooks (wired via extension.ts)");
   }
 
   parsePostToolUseInput(_raw: unknown): PostToolUseEvent {
-    throw new Error("Pi extension manages its own hooks; HookAdapter parsers are not used");
+    throw new Error("Pi does not support JSON-stdio hooks (wired via extension.ts)");
   }
 
   parsePreCompactInput(_raw: unknown): PreCompactEvent {
-    throw new Error("Pi extension manages its own hooks; HookAdapter parsers are not used");
+    throw new Error("Pi does not support JSON-stdio hooks (wired via extension.ts)");
   }
 
   parseSessionStartInput(_raw: unknown): SessionStartEvent {
-    throw new Error("Pi extension manages its own hooks; HookAdapter parsers are not used");
+    throw new Error("Pi does not support JSON-stdio hooks (wired via extension.ts)");
   }
 
   // ── Response formatting ────────────────────────────────
+  // No JSON-stdio path — return undefined to satisfy the contract.
 
   formatPreToolUseResponse(_response: PreToolUseResponse): unknown {
     return undefined;
@@ -118,11 +119,11 @@ export class PiAdapter extends BaseAdapter implements HookAdapter {
   // ── Configuration ──────────────────────────────────────
 
   getSettingsPath(): string {
-    return resolve(homedir(), ".pi", "mcp_config.json");
+    return resolve(homedir(), ".pi", "settings.json");
   }
 
   getInstructionFiles(): string[] {
-    return ["PI.md"];
+    return ["AGENTS.md"];
   }
 
   generateHookConfig(_pluginRoot: string): HookRegistration {
@@ -150,46 +151,58 @@ export class PiAdapter extends BaseAdapter implements HookAdapter {
     return [
       {
         check: "Hook support",
-        status: "warn",
+        status: "pass",
         message:
-          "Pi manages its own hook lifecycle via the extension API; " +
-          "no JSON-stdio hook validation is required for the MCP-server path.",
+          "Pi hooks are wired via the context-mode Pi extension " +
+          "(~/.pi/extensions/context-mode/), not via JSON-stdio.",
       },
     ];
   }
 
   checkPluginRegistration(): DiagnosticResult {
+    // Pi registers extensions by directory presence; the version-sync
+    // script writes ~/.pi/extensions/context-mode/package.json. We treat
+    // that file as the registration signal.
+    const pkgPath = resolve(
+      homedir(),
+      ".pi",
+      "extensions",
+      "context-mode",
+      "package.json",
+    );
     try {
-      const raw = readFileSync(this.getSettingsPath(), "utf-8");
-      const config = JSON.parse(raw);
-      const mcpServers = (config as { mcpServers?: Record<string, unknown> })?.mcpServers ?? {};
-
-      if ("context-mode" in mcpServers) {
+      const pkg = JSON.parse(readFileSync(pkgPath, "utf-8"));
+      if (pkg?.name === "context-mode") {
         return {
-          check: "MCP registration",
+          check: "Pi extension registration",
           status: "pass",
-          message: "context-mode found in mcpServers config",
+          message: `context-mode extension installed at ${pkgPath}`,
         };
       }
-
       return {
-        check: "MCP registration",
-        status: "fail",
-        message: "context-mode not found in mcpServers",
-        fix: `Add context-mode to mcpServers in ${this.getSettingsPath()}`,
+        check: "Pi extension registration",
+        status: "warn",
+        message: `Unexpected package at ${pkgPath}`,
       };
     } catch {
       return {
-        check: "MCP registration",
-        status: "warn",
-        message: `Could not read ${this.getSettingsPath()}`,
+        check: "Pi extension registration",
+        status: "fail",
+        message: `context-mode not found at ${pkgPath}`,
+        fix: "Run: context-mode upgrade",
       };
     }
   }
 
   getInstalledVersion(): string {
     try {
-      const pkgPath = resolve(homedir(), ".pi", "extensions", "context-mode", "package.json");
+      const pkgPath = resolve(
+        homedir(),
+        ".pi",
+        "extensions",
+        "context-mode",
+        "package.json",
+      );
       const pkg = JSON.parse(readFileSync(pkgPath, "utf-8"));
       return pkg.version ?? "unknown";
     } catch {
@@ -198,6 +211,9 @@ export class PiAdapter extends BaseAdapter implements HookAdapter {
   }
 
   // ── Upgrade ────────────────────────────────────────────
+  // Pi does NOT use settings.json hook entries. The extension is the
+  // integration point — there is nothing for the harness to register
+  // beyond copying the extension into ~/.pi/extensions/context-mode/.
 
   configureAllHooks(_pluginRoot: string): string[] {
     return [];
@@ -208,10 +224,11 @@ export class PiAdapter extends BaseAdapter implements HookAdapter {
   }
 
   updatePluginRegistry(_pluginRoot: string, _version: string): void {
-    // Pi plugin registry is managed via mcp_config.json
+    // Pi extension version is managed by scripts/version-sync.mjs writing
+    // to ~/.pi/extensions/context-mode/package.json. No-op here.
   }
 
   getRoutingInstructions(): string {
-    return "# context-mode\n\nUse context-mode MCP tools (execute, execute_file, batch_execute, fetch_and_index, search) instead of bash/cat/curl for data-heavy operations.";
+    return "# context-mode\n\nUse context-mode MCP tools (ctx_execute, ctx_execute_file, ctx_batch_execute, ctx_fetch_and_index, ctx_search) instead of inline shell/HTTP calls for data-heavy operations.";
   }
 }

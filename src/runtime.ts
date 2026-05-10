@@ -90,12 +90,14 @@ function runnableExists(cmd: string): boolean {
   } else if (!commandExists(cmd)) {
     return false;
   }
-  // Probe with --version (5s timeout). Exit 0 means it really runs.
+  // Probe with --version. On Windows, allow 5s for cold-start (MS Store stub
+  // fallthrough can be slow). On POSIX, 1500ms is plenty for a real binary
+  // and keeps cold detection of python3 → python → py under ~5s total (#454).
   try {
     execFileSync(cmd, ["--version"], {
       shell: isWindows,
       stdio: "pipe",
-      timeout: 5000,
+      timeout: isWindows ? 5000 : 1500,
     });
     return true;
   } catch {

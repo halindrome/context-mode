@@ -36,4 +36,11 @@ for (const file of targets) {
   }
 }
 
+// Note: package.json's `omp` block intentionally has no `version` field.
+// The OMP loader stamps `manifest.version = pluginPkg.version` from the
+// top-level package.json:version at load time (see
+// refs/platforms/oh-my-pi/packages/coding-agent/src/extensibility/plugins/
+// loader.ts:87), so a duplicate would just drift on every release without
+// adding any signal. The `pi` block follows the same upstream rule.
+
 console.log(`✓ all manifests at v${version}`);

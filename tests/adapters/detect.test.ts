@@ -42,7 +42,7 @@ describe("detectPlatform", () => {
     delete process.env.VSCODE_PID;
     delete process.env.VSCODE_CWD;
     delete process.env.QWEN_PROJECT_DIR;
-    delete process.env.OMP_PROCESSING_AGENT_DIR;
+    delete process.env.PI_CODING_AGENT_DIR;
     delete process.env.IDEA_INITIAL_DIRECTORY;
     delete process.env.IDEA_HOME;
     delete process.env.JETBRAINS_CLIENT_ID;
@@ -103,8 +103,13 @@ describe("detectPlatform", () => {
   });
 
   // ── Kilo ────────────────────────────────────────────────
-  
-  it("returns opencode when KILO=1 is set", () => {
+  // Kilo is an OpenCode fork. PLATFORM_ENV_VARS in src/adapters/detect.ts:36
+  // explicitly orders forks BEFORE parents — kilo (line 48) is checked before
+  // opencode (line 51) so a Kilo runtime that sets BOTH `KILO=1` and
+  // `OPENCODE=1` (Kilo-Org/kilocode packages/opencode/src/index.ts:138-139)
+  // resolves to "kilo", not "opencode". Regression coverage below.
+
+  it("returns kilo when KILO=1 is set", () => {
     process.env.KILO = "1";
     const signal = detectPlatform();
     expect(signal.platform).toBe("kilo");
@@ -116,6 +121,53 @@ describe("detectPlatform", () => {
     process.env.KILO_PID = "12345";
     const signal = detectPlatform();
     expect(signal.platform).toBe("kilo");
+    expect(signal.confidence).toBe("high");
+  });
+
+  // Regression for #424: Kilo runtime sets KILO + OPENCODE simultaneously.
+  // Fork-precedence ordering in PLATFORM_ENV_VARS (detect.ts:36 — "forks
+  // listed BEFORE the fork's parent") MUST hold regardless of which env var
+  // was assigned first by the harness.
+  it("returns kilo when KILO and OPENCODE both set (Kilo is OpenCode fork — fork listed before parent)", () => {
+    process.env.KILO = "1";
+    process.env.OPENCODE = "1";
+    const signal = detectPlatform();
+    expect(signal.platform).toBe("kilo");
+    expect(signal.confidence).toBe("high");
+  });
+
+  it("returns kilo when OPENCODE set first then KILO (assignment order must not matter)", () => {
+    process.env.OPENCODE = "1";
+    process.env.KILO = "1";
+    const signal = detectPlatform();
+    expect(signal.platform).toBe("kilo");
+    expect(signal.confidence).toBe("high");
+  });
+
+  it("returns kilo when KILO_PID and OPENCODE_PID both set (PID-variant fork precedence)", () => {
+    process.env.OPENCODE_PID = "12345";
+    process.env.KILO_PID = "67890";
+    const signal = detectPlatform();
+    expect(signal.platform).toBe("kilo");
+    expect(signal.confidence).toBe("high");
+  });
+
+  // Negative coverage: empty/zero KILO must NOT trigger kilo. detect.ts:159
+  // uses `process.env[v]` (truthy check) — the empty string "" is falsy and
+  // the assignment "0" is truthy (non-empty string), so we only assert the
+  // empty-string negative path.
+  it("does NOT return kilo when KILO is empty string (falls through to opencode)", () => {
+    process.env.KILO = "";
+    process.env.OPENCODE = "1";
+    const signal = detectPlatform();
+    expect(signal.platform).toBe("opencode");
+    expect(signal.confidence).toBe("high");
+  });
+
+  it("does NOT return kilo when KILO is unset and only OPENCODE is set", () => {
+    process.env.OPENCODE = "1";
+    const signal = detectPlatform();
+    expect(signal.platform).toBe("opencode");
     expect(signal.confidence).toBe("high");
   });
 
@@ -165,19 +217,20 @@ describe("detectPlatform", () => {
   });
 
   // ── OMP (Oh My Pi) ──────────────────────────────────────
-  // OMP_PROCESSING_AGENT_DIR is the published OMP config root override
-  // (defaults to ~/.omp/agent). Listed BEFORE pi in PLATFORM_ENV_VARS so an
-  // OMP-running harness is not misclassified as Pi when both are installed.
+  // PI_CODING_AGENT_DIR is the upstream OMP agent-dir override per
+  // can1357/oh-my-pi `packages/utils/src/dirs.ts:193`. Listed BEFORE pi in
+  // PLATFORM_ENV_VARS so an OMP-running harness is not misclassified as Pi
+  // when both are installed.
 
-  it("detects omp via OMP_PROCESSING_AGENT_DIR env var", () => {
-    process.env.OMP_PROCESSING_AGENT_DIR = "/home/user/.omp/agent";
+  it("detects omp via PI_CODING_AGENT_DIR env var", () => {
+    process.env.PI_CODING_AGENT_DIR = "/home/user/.omp/agent";
     const signal = detectPlatform();
     expect(signal.platform).toBe("omp");
     expect(signal.confidence).toBe("high");
   });
 
-  it("prefers omp over pi when both OMP_PROCESSING_AGENT_DIR and PI_PROJECT_DIR are set", () => {
-    process.env.OMP_PROCESSING_AGENT_DIR = "/home/user/.omp/agent";
+  it("prefers omp over pi when both PI_CODING_AGENT_DIR and PI_PROJECT_DIR are set", () => {
+    process.env.PI_CODING_AGENT_DIR = "/home/user/.omp/agent";
     process.env.PI_PROJECT_DIR = "/some/project";
     const signal = detectPlatform();
     expect(signal.platform).toBe("omp");

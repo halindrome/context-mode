@@ -2,7 +2,7 @@ import "../setup-home";
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { createHash } from "node:crypto";
 import { homedir, tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { join, resolve, sep } from "node:path";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { ClaudeCodeAdapter } from "../../src/adapters/claude-code/index.js";
 import { fakeHome, realHome } from "../setup-home";
@@ -280,7 +280,7 @@ describe("ClaudeCodeAdapter", () => {
       );
       // Regression pin: session DB must NOT land under ~/.claude when
       // CLAUDE_CONFIG_DIR is set.
-      expect(dbPath.startsWith(join(homedir(), ".claude") + "/")).toBe(false);
+      expect(dbPath.startsWith(join(homedir(), ".claude") + sep)).toBe(false);
     });
 
     it("validateHooks failure message references the resolved settings path", () => {

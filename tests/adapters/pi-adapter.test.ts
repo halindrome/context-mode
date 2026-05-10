@@ -3,8 +3,10 @@ import { describe, it, expect, beforeEach } from "vitest";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { PiAdapter } from "../../src/adapters/pi/index.js";
+import { ClaudeCodeAdapter } from "../../src/adapters/claude-code/index.js";
+import { getAdapter, getSessionDirSegments } from "../../src/adapters/detect.js";
 
-describe("PiAdapter", () => {
+describe("PiAdapter — Pi platform adapter", () => {
   let adapter: PiAdapter;
 
   beforeEach(() => {
@@ -15,25 +17,21 @@ describe("PiAdapter", () => {
 
   describe("identity", () => {
     it("name is Pi", () => {
-      expect(adapter.name).toMatch(/Pi/i);
+      expect(adapter.name).toBe("Pi");
     });
 
-    it("paradigm is mcp-only (Pi extension manages its own hook lifecycle)", () => {
-      // Pi extension uses native pi.on(...) lifecycle handlers, not our
-      // HookAdapter parse/format pipeline. From the MCP-server perspective
-      // (which is what getAdapter() routes), Pi is mcp-only.
+    it("paradigm is mcp-only (Pi hooks wire via extension.ts, not json-stdio)", () => {
       expect(adapter.paradigm).toBe("mcp-only");
     });
   });
 
-  // ── Capabilities ──────────────────────────────────────
+  // ── Capabilities ───────────────────────────────────────
+  // Pi adapter at the HookAdapter layer is MCP-only. Hook capabilities
+  // are exercised through extension.ts's pi.on() bindings, not the
+  // adapter's JSON-stdio parse/format methods.
 
   describe("capabilities", () => {
-    it("all hook capabilities are false (Pi extension is self-managed)", () => {
-      // The MCP-only adapter never invokes parsePreToolUseInput/etc.
-      // Pi's extension.ts handles the lifecycle directly via the pi.on(...)
-      // surface; this adapter exists purely so storage paths resolve under
-      // ~/.pi instead of ~/.claude.
+    it("all HookAdapter capabilities are false (extension wires hooks directly)", () => {
       expect(adapter.capabilities.preToolUse).toBe(false);
       expect(adapter.capabilities.postToolUse).toBe(false);
       expect(adapter.capabilities.preCompact).toBe(false);
@@ -44,9 +42,28 @@ describe("PiAdapter", () => {
     });
   });
 
-  // ── Config paths — the BUG fix ────────────────────────
-  // These paths MUST live under ~/.pi/, NEVER under ~/.claude/.
-  // Mirrors omp.test.ts:127-146 — same family of issues (#473).
+  // ── getAdapter("pi") routing — the bug being fixed ─────
+  // Issue #473 follow-up: getAdapter("pi") was returning ClaudeCodeAdapter
+  // via the default branch, causing Pi user data to leak into ~/.claude/.
+
+  describe("getAdapter('pi') routing", () => {
+    it("returns a PiAdapter instance, not ClaudeCodeAdapter", async () => {
+      const a = await getAdapter("pi");
+      expect(a).toBeInstanceOf(PiAdapter);
+      expect(a).not.toBeInstanceOf(ClaudeCodeAdapter);
+    });
+
+    it("returned adapter writes session dir under ~/.pi/, not ~/.claude/", async () => {
+      const a = await getAdapter("pi");
+      const dir = a.getSessionDir();
+      expect(dir).toContain(".pi");
+      expect(dir).not.toContain(".claude");
+    });
+  });
+
+  // ── Config paths — data isolation under ~/.pi/ ─────────
+  // The OMP fix mirror for issue #473 — verify Pi data NEVER bleeds
+  // into ~/.claude/ regardless of which harness installed context-mode.
 
   describe("config paths", () => {
     it("session dir is under ~/.pi/context-mode/sessions/", () => {
@@ -69,26 +86,31 @@ describe("PiAdapter", () => {
       expect(eventsPath).not.toContain(".claude");
     });
 
-    it("settings path is ~/.pi/mcp_config.json", () => {
+    it("settings path is ~/.pi/settings.json", () => {
       expect(adapter.getSettingsPath()).toBe(
-        resolve(homedir(), ".pi", "mcp_config.json"),
+        resolve(homedir(), ".pi", "settings.json"),
       );
     });
 
     it("config dir is ~/.pi", () => {
       expect(adapter.getConfigDir()).toBe(resolve(homedir(), ".pi"));
     });
-  });
 
-  // ── Instruction file ──────────────────────────────────
-
-  describe("instruction files", () => {
-    it("uses PI.md", () => {
-      expect(adapter.getInstructionFiles()).toEqual(["PI.md"]);
+    it("getSessionDirSegments('pi') matches adapter sessionDirSegments", () => {
+      expect(getSessionDirSegments("pi")).toEqual([".pi"]);
     });
   });
 
-  // ── Hook config (all empty — MCP-only) ────────────────
+  // ── Instruction file ──────────────────────────────────
+  // Pi convention: AGENTS.md (per configs/pi/AGENTS.md).
+
+  describe("instruction files", () => {
+    it("uses AGENTS.md (Pi convention)", () => {
+      expect(adapter.getInstructionFiles()).toEqual(["AGENTS.md"]);
+    });
+  });
+
+  // ── Hook config (no JSON-stdio hooks for Pi) ──────────
 
   describe("hook config", () => {
     it("generateHookConfig returns empty object", () => {
@@ -104,15 +126,17 @@ describe("PiAdapter", () => {
     });
   });
 
-  // ── Parse methods (all throw — MCP-only) ──────────────
+  // ── readSettings / writeSettings — graceful when missing ─
 
-  describe("parse methods", () => {
-    it("parsePreToolUseInput throws", () => {
-      expect(() => adapter.parsePreToolUseInput({})).toThrow(/Pi/);
+  describe("settings I/O", () => {
+    it("readSettings returns null when file missing (graceful)", () => {
+      // Fresh fake HOME — no ~/.pi/settings.json yet
+      expect(adapter.readSettings()).toBeNull();
     });
 
-    it("parsePostToolUseInput throws", () => {
-      expect(() => adapter.parsePostToolUseInput({})).toThrow(/Pi/);
+    it("writeSettings then readSettings round-trips", () => {
+      adapter.writeSettings({ foo: "bar" });
+      expect(adapter.readSettings()).toEqual({ foo: "bar" });
     });
   });
 });

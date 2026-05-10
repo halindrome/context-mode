@@ -1,12 +1,12 @@
 /**
  * OpenCode / KiloCode TypeScript plugin entry point for context-mode.
  *
- * Provides five hooks (v1.0.107 — Mickey OC-1..OC-3 follow-up):
+ * Provides five hooks (v1.0.107 — Mickey OC-1..OC-4 follow-up):
  *   - tool.execute.before  — Routing enforcement (deny/modify/passthrough)
- *   - tool.execute.after   — Session event capture
+ *   - tool.execute.after   — Session event capture + first-fire AGENTS.md scan (OC-4)
  *   - experimental.session.compacting — Compaction snapshot + budget-capped auto-injection (OC-3)
  *   - experimental.chat.system.transform — ROUTING_BLOCK + resume snapshot injection (OC-1)
- *   - chat.message         — User-prompt capture w/ CCv2 inline filter (OC-2)
+ *   - chat.message         — User-prompt capture w/ CCv2 inline filter (OC-2) + AGENTS.md scan (OC-4)
  *
  * KiloCode loads this via: import("context-mode") → expects default export
  * with shape { server: (input) => Promise<Hooks> } (PluginModule).
@@ -21,7 +21,7 @@
  *   - Session cleanup happens at plugin init (no SessionStart)
  */
 
-import { dirname, resolve } from "node:path";
+import { dirname, resolve, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { existsSync, readFileSync } from "node:fs";
 
@@ -187,11 +187,27 @@ function isSyntheticMessage(text: string): boolean {
 
 // ── Helpers ───────────────────────────────────────────────
 
-const ROUTING_MARKERS = ["ctx_execute", "ctx_batch_execute", "ctx_fetch_and_index"];
+// Quorum markers — must NOT be substrings of each other (#487).
+// Each token uniquely identifies the routing block / context-mode rules
+// without overlapping any other marker. The XML tag is the primary signal;
+// the two distinctive bare tool names are the secondary signals. Together
+// any 2 of 3 confirm the system prompt already carries routing instructions.
+const ROUTING_MARKERS = [
+  "<context_window_protection>",
+  "ctx_search",
+  "ctx_index",
+];
 
 function systemHasRoutingInstructions(system: string[]): boolean {
   const text = system.join("\n");
-  return ROUTING_MARKERS.filter((m) => text.includes(m)).length >= 2;
+  // Word-boundary check guards against unrelated identifiers that happen to
+  // share a prefix/suffix (e.g. a hypothetical `ctx_search_v2`).
+  const wordBoundary = (m: string) => {
+    if (m.startsWith("<")) return text.includes(m);
+    const re = new RegExp(`(?:^|\\W)${m.replace(/[.*+?^${}()|[\\]\\\\]/g, "\\$&")}(?:\\W|$)`);
+    return re.test(text);
+  };
+  return ROUTING_MARKERS.filter(wordBoundary).length >= 2;
 }
 
 /**
@@ -270,6 +286,50 @@ async function createContextModePlugin(ctx: PluginContext) {
   // Clean up old sessions on startup (no SessionStart hook to do this).
   db.cleanupOldSessions(7);
 
+  // OC-4 (#487 follow-up): per-session capture gate. PR #487 trusted the host
+  // to deliver AGENTS.md events, but OpenCode only fires `rule_content` events
+  // when the user explicitly reads the file. snapshot.ts:172 + analytics.ts:152
+  // CONSUME `rule_content` to render rules into the resume snapshot — without
+  // this capture path, AGENTS.md is silently absent from continuity output.
+  // Keyed by sessionId (NOT projectDir) so multi-session reuse within a long-
+  // lived plugin process still gets per-session capture exactly once.
+  const agentsMdCaptured = new Set<string>();
+
+  /**
+   * OC-4: Read AGENTS.md (with CLAUDE.md / CONTEXT.md fallbacks) from the
+   * project directory and persist as `rule` + `rule_content` events. Mirrors
+   * the CC SessionStart pattern at hooks/sessionstart.mjs:121-132 and the
+   * OpenCode instruction.ts FILES order. Idempotent via `agentsMdCaptured`
+   * Set keyed by sessionId. Fail-soft: missing/unreadable files do not throw.
+   */
+  function captureAgentsMd(sessionId: string): void {
+    if (agentsMdCaptured.has(sessionId)) return;
+    agentsMdCaptured.add(sessionId);
+    const candidates = ["AGENTS.md", "CLAUDE.md", "CONTEXT.md"];
+    for (const name of candidates) {
+      try {
+        const p = join(projectDir, name);
+        if (!existsSync(p)) continue;
+        const content = readFileSync(p, "utf-8");
+        if (!content.trim()) continue;
+        db.insertEvent(sessionId, {
+          type: "rule",
+          category: "rule",
+          data: p,
+          priority: 1,
+        } as SessionEvent, "PluginInit");
+        db.insertEvent(sessionId, {
+          type: "rule_content",
+          category: "rule",
+          data: content,
+          priority: 1,
+        } as SessionEvent, "PluginInit");
+      } catch {
+        // file missing or unreadable — skip silently
+      }
+    }
+  }
+
   function logger(
     message = "context-mode debug log",
     extra?: PluginClientAppLogBodyExtra,
@@ -282,6 +342,26 @@ async function createContextModePlugin(ctx: PluginContext) {
         extra,
       },
     });
+  }
+
+  /**
+   * Drop-in wrapper for `logger` that NEVER rejects (#448).
+   *
+   * The OPENCODE_DEBUG branch awaits `logger(...)` from inside the chat-turn
+   * hot path (chat.system.transform). If `ctx.client.app.log` rejects —
+   * transport error, closed stream, oversized payload — the promise rejection
+   * propagates back to OpenCode core and can break the turn. Debug logging
+   * is best-effort; swallow errors silently and let the turn proceed.
+   */
+  async function safeLog(
+    message?: string,
+    extra?: PluginClientAppLogBodyExtra,
+  ): Promise<void> {
+    try {
+      await logger(message, extra);
+    } catch {
+      // Never break the turn on debug-log failure.
+    }
   }
 
   return {
@@ -323,6 +403,9 @@ async function createContextModePlugin(ctx: PluginContext) {
       if (!sessionId) return;
       try {
         db.ensureSession(sessionId, projectDir);
+        // OC-4 (#487 follow-up): AGENTS.md → rule_content capture for snapshot
+        // and auto-memory parity. Idempotent per-session via Set guard.
+        captureAgentsMd(sessionId);
 
         const hookInput: HookInput = {
           tool_name: input.tool ?? "",
@@ -358,7 +441,10 @@ async function createContextModePlugin(ctx: PluginContext) {
         if (isSyntheticMessage(message)) return;
 
         db.ensureSession(sessionId, projectDir);
-        
+        // OC-4 (#487 follow-up): also capture on chat.message so sessions that
+        // never invoke a tool still seed rule_content events for continuity.
+        captureAgentsMd(sessionId);
+
         // 1. Always save the raw prompt
         db.insertEvent(sessionId, {
           type: "user_prompt",
@@ -399,7 +485,7 @@ async function createContextModePlugin(ctx: PluginContext) {
         output.context.push(snapshot);
 
         if (process.env.OPENCODE_DEBUG) {
-          await logger(snapshot, {
+          await safeLog(snapshot, {
             sessionId,
             source: "on compaction - snapshot",
           });
@@ -416,7 +502,7 @@ async function createContextModePlugin(ctx: PluginContext) {
           }
 
           if (process.env.OPENCODE_DEBUG) {
-            await logger(autoBlock, {
+            await safeLog(autoBlock, {
               sessionId,
               source: "on compaction - autoBlock",
             });
@@ -460,17 +546,16 @@ async function createContextModePlugin(ctx: PluginContext) {
       if (Array.isArray(output?.system)) {
         if (!systemHasRoutingInstructions(output.system)) {
           try {
-            const marker = `<!-- context-mode v${VERSION}: routing block injected (sessionID=${sessionId.slice(0, 8)}) -->\n`;
-            output.system.splice(1, 0, marker + routingBlock);
+            output.system.splice(1, 0, routingBlock);
           } catch {
             // Never break the chat turn on routing-block injection failure.
           }
 
           if (process.env.OPENCODE_DEBUG) {
-            await logger(output.system[1], {sessionId, source: 'on routing block injection'});
+            await safeLog(output.system[1], {sessionId, source: 'on routing block injection'});
           }
         } else if (process.env.OPENCODE_DEBUG) {
-          await logger(`routing block skipped — system prompt already contains context-mode instructions`, {sessionId, source: 'on routing block injection'});
+          await safeLog(`routing block skipped — system prompt already contains context-mode instructions`, {sessionId, source: 'on routing block injection'});
         }
       }
 
@@ -482,22 +567,13 @@ async function createContextModePlugin(ctx: PluginContext) {
         if (!row || !row.snapshot) return;        // no row → retry on next turn
 
         if (process.env.OPENCODE_DEBUG) {
-          await logger(row.snapshot, {
+          await safeLog(row.snapshot, {
             sessionId,
             source: "on resume - snapshot",
           });
         }
 
         if (Array.isArray(output?.system)) {
-          // Visible signal — without this, the injection is silent and users
-          // cannot tell the feature is active (Mickey: "I can't find use case
-          // for it"). The XML comment is harmless to the model and shows up in
-          // OPENCODE_DEBUG logs as proof the snapshot landed.
-          const eventCount = row.snapshot.match(/events="(\d+)"/)?.[1] ?? "?";
-          const marker =
-            `<!-- context-mode v${VERSION}: resumed prior session ${row.sessionId.slice(0, 8)} ` +
-            `(${eventCount} events, ${row.snapshot.length} chars) -->\n`;
-
           // Insert at index 1 (after the header) — NOT unshift.
           // OpenCode's llm.ts:117-128 saves `header = system[0]` BEFORE this
           // hook runs and then folds the rest into a 2-part structure
@@ -508,10 +584,10 @@ async function createContextModePlugin(ctx: PluginContext) {
           // provider prompt cache is invalidated on every resume injection.
           // Inserting at index 1 keeps the header invariant and lets the
           // snapshot ride along inside the cached body block.
-          output.system.splice(1, 0, marker + row.snapshot);
+          output.system.splice(1, 0, row.snapshot);
           // Mark consumed only AFTER successful splice so failed paths can retry
           if (process.env.OPENCODE_DEBUG) {
-            await logger(output.system[1], { sessionId, source: "on resume" });
+            await safeLog(output.system[1], { sessionId, source: "on resume" });
           }
         }
       } catch {
@@ -526,3 +602,5 @@ async function createContextModePlugin(ctx: PluginContext) {
 // OpenCode compat: named export for direct import("context-mode/plugin")
 export default { id:"context-mode", server: createContextModePlugin };
 export { createContextModePlugin as ContextModePlugin };
+// Test surface — exported for unit testing the quorum substring fix (#487).
+export { systemHasRoutingInstructions, ROUTING_MARKERS };

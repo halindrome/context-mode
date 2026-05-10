@@ -74,10 +74,26 @@ export class MCPStdioClient {
     if (this.child) return;
     this.exited = false;
     this.child = spawn(process.execPath, [this.serverScript], {
-      stdio: ["pipe", "pipe", "ignore"],
+      // Pipe stderr (#472 round-3): swallowing it via "ignore" hides
+      // server crash diagnostics — the user only saw "ctx_* tools will
+      // not be callable" with no clue WHY. Forwarding to process.stderr
+      // with a [mcp-bridge] prefix lets ops grep across session noise.
+      stdio: ["pipe", "pipe", "pipe"],
       env: this.env,
     });
     this.child.stdout?.on("data", (chunk) => this.onData(chunk));
+    this.child.stderr?.on("data", (chunk: Buffer) => {
+      const text = chunk.toString("utf-8");
+      // Preserve original line breaks; prefix every non-empty line so
+      // multi-line traces stay grep-friendly.
+      const prefixed = text
+        .split(/\r?\n/)
+        .map((line, i, arr) =>
+          i === arr.length - 1 && line === "" ? "" : `[mcp-bridge] ${line}`,
+        )
+        .join("\n");
+      process.stderr.write(prefixed);
+    });
     this.child.on("exit", () => this.onExit());
     this.child.on("error", () => this.onExit());
   }
@@ -175,11 +191,27 @@ export class MCPStdioClient {
 
   shutdown(): void {
     if (!this.child) return;
+    const child = this.child;
     try {
-      this.child.kill("SIGTERM");
+      child.kill("SIGTERM");
     } catch {
       // best effort
     }
+    // SIGKILL fallback (#472 round-3): a child that ignores SIGTERM
+    // (e.g. installed handler that swallows the signal, or stuck in
+    // an uninterruptible syscall) becomes a zombie because we null
+    // the handle immediately. Schedule a hard kill bounded at 5s; the
+    // .unref() prevents this timer from keeping the parent alive after
+    // legitimate work is done.
+    setTimeout(() => {
+      try {
+        if (child.exitCode === null && child.signalCode === null) {
+          child.kill("SIGKILL");
+        }
+      } catch {
+        // best effort
+      }
+    }, 5000).unref();
     this.child = null;
     this.initialized = false;
     this.exited = true;

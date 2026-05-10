@@ -12,6 +12,7 @@ import type { SessionEvent } from "../types.js";
 import type { ProjectAttribution } from "./project-attribution.js";
 import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
+import { realpathSync } from "node:fs";
 
 // ─────────────────────────────────────────────────────────
 // Worktree isolation
@@ -31,11 +32,31 @@ import { execFileSync } from "node:child_process";
 // MCP server has chdir'd into the installed package directory.
 let _wtCache: { projectDir: string; envSuffix: string | undefined; suffix: string } | undefined;
 
-function normalizeWorktreePath(path: string): string {
+export function normalizeWorktreePath(path: string): string {
   const normalized = path.replace(/\\/g, "/");
   if (/^\/+$/.test(normalized)) return "/";
   if (/^[A-Za-z]:\/+$/.test(normalized)) return `${normalized.slice(0, 2)}/`;
   return normalized.replace(/\/+$/, "");
+}
+
+// Case-insensitive filesystems (macOS HFS+/APFS default, Windows NTFS default)
+// can report `currentRoot` and `mainRoot` with different casing for the same
+// physical directory — git itself sometimes preserves the on-disk casing while
+// user-supplied paths use a different casing. Compare canonically by resolving
+// symlinks via realpath and case-folding on these platforms. POSIX/Linux is
+// strictly case-sensitive so this is a no-op there.
+function canonicalizeForCompare(root: string): string {
+  let resolved = root;
+  try {
+    resolved = realpathSync.native(root);
+  } catch {
+    // Path may not exist (test fixtures, deleted dirs); fall back to as-given.
+  }
+  const normalized = normalizeWorktreePath(resolved);
+  if (process.platform === "win32" || process.platform === "darwin") {
+    return normalized.toLowerCase();
+  }
+  return normalized;
 }
 
 function gitOutput(projectDir: string, args: string[]): string {
@@ -77,7 +98,11 @@ export function getWorktreeSuffix(projectDir = process.cwd()): string {
     try {
       const currentRoot = getCurrentWorktreeRoot(projectDir);
       const mainRoot = getMainWorktreeRoot(projectDir);
-      if (currentRoot && mainRoot && currentRoot !== mainRoot) {
+      if (
+        currentRoot &&
+        mainRoot &&
+        canonicalizeForCompare(currentRoot) !== canonicalizeForCompare(mainRoot)
+      ) {
         suffix = `__${createHash("sha256").update(currentRoot).digest("hex").slice(0, 8)}`;
       }
     } catch {

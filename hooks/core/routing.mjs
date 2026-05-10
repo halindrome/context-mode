@@ -149,43 +149,48 @@ function stripQuotedContent(cmd) {
  */
 const SAFE_COMMAND_PATTERNS = [
   // System probes (no stdout, or one short line)
+  // Defense-in-depth (#470): trailing wildcards use `[^\r\n]+` instead of
+  // `.+`. The primary gate is SHELL_CONTROL_OPERATORS, which already rejects
+  // `\n` / `\r`, but in JS regex `\s` matches LF/CR too — so a pattern like
+  // `\s+.+$` would silently span a newline if the operator gate ever
+  // regressed. Anchoring `.+` to a single line removes that latent footgun.
   /^pwd$/,
   /^whoami$/,
   /^hostname(?:\s+-[a-zA-Z]+)?$/,
-  /^date(?:\s+.+)?$/,
+  /^date(?:\s+[^\r\n]+)?$/,
   /^echo\s/,
   /^printf\s/,
   /^which\s+\S+(?:\s+\S+)*$/,
   /^type\s+\S+(?:\s+\S+)*$/,
   /^command\s+-v\s+\S+(?:\s+\S+)*$/,
-  /^readlink(?:\s+.+)?$/,
-  /^basename(?:\s+.+)?$/,
-  /^dirname(?:\s+.+)?$/,
+  /^readlink(?:\s+[^\r\n]+)?$/,
+  /^basename(?:\s+[^\r\n]+)?$/,
+  /^dirname(?:\s+[^\r\n]+)?$/,
   // Filesystem ops (silent on success, errors on stderr only).
   // For cp / mv / rm we explicitly refuse `-v` / `--verbose`: verbose
   // mode prints one line per file and can flood on big trees
   // (recursive copy of /etc, mass rename, etc.). The "silent on
   // success" invariant only holds without -v.
-  /^cd(?:\s+.+)?$/,
-  /^mkdir(?:\s+.+)?$/,
-  /^touch\s+.+$/,
-  /^mv(?!\s+-[a-zA-Z]*v\b)(?!\s+--verbose\b)\s+.+$/,
-  /^cp(?!\s+-[a-zA-Z]*v\b)(?!\s+--verbose\b)\s+.+$/,
-  /^rm(?!\s+-[a-zA-Z]*v\b)(?!\s+--verbose\b)\s+.+$/,
+  /^cd(?:\s+[^\r\n]+)?$/,
+  /^mkdir(?:\s+[^\r\n]+)?$/,
+  /^touch\s+[^\r\n]+$/,
+  /^mv(?!\s+-[a-zA-Z]*v\b)(?!\s+--verbose\b)\s+[^\r\n]+$/,
+  /^cp(?!\s+-[a-zA-Z]*v\b)(?!\s+--verbose\b)\s+[^\r\n]+$/,
+  /^rm(?!\s+-[a-zA-Z]*v\b)(?!\s+--verbose\b)\s+[^\r\n]+$/,
   // ls — refuse recursive (-R / --recursive) to keep output bounded.
-  /^ls(?!\s+-[a-zA-Z]*R)(?!\s+--recursive)(?:\s+.+)?$/,
+  /^ls(?!\s+-[a-zA-Z]*R)(?!\s+--recursive)(?:\s+[^\r\n]+)?$/,
   // git read-only / status subcommands
-  /^git\s+status(?:\s+.+)?$/,
-  /^git\s+rev-parse(?:\s+.+)?$/,
+  /^git\s+status(?:\s+[^\r\n]+)?$/,
+  /^git\s+rev-parse(?:\s+[^\r\n]+)?$/,
   /^git\s+remote(?:\s+-v|\s+show\s+\S+)?$/,
-  /^git\s+branch(?:\s+.+)?$/,
-  /^git\s+config\s+--get(?:\s+.+)?$/,
-  /^git\s+diff\s+--stat(?:\s+.+)?$/,
-  /^git\s+diff\s+--name-only(?:\s+.+)?$/,
+  /^git\s+branch(?:\s+[^\r\n]+)?$/,
+  /^git\s+config\s+--get(?:\s+[^\r\n]+)?$/,
+  /^git\s+diff\s+--stat(?:\s+[^\r\n]+)?$/,
+  /^git\s+diff\s+--name-only(?:\s+[^\r\n]+)?$/,
   /^git\s+stash\s+list$/,
-  /^git\s+tag(?:\s+-l(?:\s+.+)?)?$/,
+  /^git\s+tag(?:\s+-l(?:\s+[^\r\n]+)?)?$/,
   // git log only when explicitly bounded by -<N> with N up to two digits
-  /^git\s+log\s+-\d{1,2}(?:\s+.+)?$/,
+  /^git\s+log\s+-\d{1,2}(?:\s+[^\r\n]+)?$/,
   // Version probes (--version anywhere, or `cmd -V`)
   /(?:^|\s)--version(?:\s|$)/,
   /^\S+\s+-V(?:\s|$)/,
@@ -198,7 +203,13 @@ const SAFE_COMMAND_PATTERNS = [
 // alternation so the regex engine doesn't accidentally short-match `&&`
 // when `&` is itself a separator (`date & cat huge.log`). Without this,
 // `^date(?:\s+.+)?$` would match the whole string and bypass the gate.
-const SHELL_CONTROL_OPERATORS = /[|`]|\$\(|>>|>|<(?!<)|&(?!&)|&&|\|\||;/;
+//
+// `\n` / `\r` (newline injection — #470): bash treats LF as a statement
+// separator equivalent to `;`. CRLF (Windows clipboard paste) and bare CR
+// fall in the same defect class. Without these, `git status\nfind /`
+// would short-match the single-line `^git\s+status` pattern and bypass
+// the gate entirely.
+const SHELL_CONTROL_OPERATORS = /[|`\n\r]|\$\(|>>|>|<(?!<)|&(?!&)|&&|\|\||;/;
 
 /**
  * @param {string} command Raw Bash command string from the hook payload.
@@ -319,6 +330,21 @@ const TOOL_ALIASES = {
   "execute_bash": "Bash",
 };
 
+function toolLeafName(toolName) {
+  const raw = String(toolName ?? "");
+  const withoutMcpPrefix = raw.startsWith("MCP:") ? raw.slice(4) : raw;
+  const parts = withoutMcpPrefix.split(/__|\//).filter(Boolean);
+  return parts.at(-1) ?? withoutMcpPrefix;
+}
+
+function matchesContextModeTool(toolName, ctxName, legacyName) {
+  const raw = String(toolName ?? "");
+  const leaf = toolLeafName(raw);
+  if (leaf === ctxName) return true;
+  if (raw.startsWith("MCP:") && leaf === legacyName) return true;
+  return raw.includes("context-mode") && leaf === legacyName;
+}
+
 /**
  * Route a PreToolUse event. Returns normalized decision object or null for passthrough.
  *
@@ -331,6 +357,23 @@ const TOOL_ALIASES = {
  *   invocations even when process.ppid shifts (Windows/Git Bash — see #298).
  */
 export function routePreToolUse(toolName, toolInput, projectDir, platform, sessionId) {
+  // ─── Opt-in fail-closed gate (#468 follow-up) ───
+  // Default behavior on security-module load failure is fail-OPEN (a stderr
+  // warning is emitted but routing continues). Security-conscious users can
+  // opt in to fail-CLOSED via CONTEXT_MODE_REQUIRE_SECURITY=1 — every PreToolUse
+  // event is denied with a clear reason until the security module loads cleanly.
+  // Universal gate (applies to all tools, not just Bash) since user `permissions.deny`
+  // patterns may target Read/Write paths that would otherwise leak before security loads.
+  if (process.env.CONTEXT_MODE_REQUIRE_SECURITY === "1" && securityInitFailed) {
+    return {
+      action: "deny",
+      reason:
+        "context-mode: security module unavailable and CONTEXT_MODE_REQUIRE_SECURITY=1 — fail-closed engaged. " +
+        "Run `npm run build` (or reinstall context-mode) to restore security enforcement. " +
+        "To bypass, unset or set CONTEXT_MODE_REQUIRE_SECURITY=0.",
+    };
+  }
+
   // Build platform-specific tool namer (defaults to claude-code for backward compat)
   const t = createToolNamer(platform || "claude-code");
 
@@ -540,12 +583,8 @@ export function routePreToolUse(toolName, toolInput, projectDir, platform, sessi
   }
 
   // ─── MCP execute: security check for shell commands ───
-  // Match both __execute and __ctx_execute (prefixed tool names)
-  // Cursor can also surface the tool as MCP:ctx_execute_file.
-  if (
-    (toolName.includes("context-mode") && /(?:__|\/)(ctx_)?execute$/.test(toolName)) ||
-    /^MCP:(ctx_)?execute$/.test(toolName)
-  ) {
+  // Match bare, generic MCP, and legacy context-mode execute tool names.
+  if (matchesContextModeTool(toolName, "ctx_execute", "execute")) {
     if (security && toolInput.language === "shell") {
       const code = toolInput.code ?? "";
       const policies = security.readBashPolicies(projectDir);
@@ -563,11 +602,7 @@ export function routePreToolUse(toolName, toolInput, projectDir, platform, sessi
   }
 
   // ─── MCP execute_file: check file path + code against deny patterns ───
-  // Cursor can also surface the tool as MCP:ctx_execute_file.
-  if (
-    (toolName.includes("context-mode") && /(?:__|\/)(ctx_)?execute_file$/.test(toolName)) ||
-    /^MCP:(ctx_)?execute_file$/.test(toolName)
-  ) {
+  if (matchesContextModeTool(toolName, "ctx_execute_file", "execute_file")) {
     if (security) {
       // Check file path against Read deny patterns
       const filePath = toolInput.path ?? "";
@@ -597,7 +632,7 @@ export function routePreToolUse(toolName, toolInput, projectDir, platform, sessi
   }
 
   // ─── MCP batch_execute: check each command individually ───
-  if (toolName.includes("context-mode") && /(?:__|\/)(ctx_)?batch_execute$/.test(toolName)) {
+  if (matchesContextModeTool(toolName, "ctx_batch_execute", "batch_execute")) {
     if (security) {
       const commands = toolInput.commands ?? [];
       const policies = security.readBashPolicies(projectDir);

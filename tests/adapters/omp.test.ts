@@ -9,16 +9,16 @@ describe("OMPAdapter", () => {
   let savedAgentDir: string | undefined;
 
   beforeEach(() => {
-    savedAgentDir = process.env.OMP_PROCESSING_AGENT_DIR;
-    delete process.env.OMP_PROCESSING_AGENT_DIR;
+    savedAgentDir = process.env.PI_CODING_AGENT_DIR;
+    delete process.env.PI_CODING_AGENT_DIR;
     adapter = new OMPAdapter();
   });
 
   afterEach(() => {
     if (savedAgentDir === undefined) {
-      delete process.env.OMP_PROCESSING_AGENT_DIR;
+      delete process.env.PI_CODING_AGENT_DIR;
     } else {
-      process.env.OMP_PROCESSING_AGENT_DIR = savedAgentDir;
+      process.env.PI_CODING_AGENT_DIR = savedAgentDir;
     }
   });
 
@@ -53,25 +53,25 @@ describe("OMPAdapter", () => {
   describe("parse methods", () => {
     it("parsePreToolUseInput throws", () => {
       expect(() => adapter.parsePreToolUseInput({})).toThrow(
-        /OMP does not support hooks/,
+        /OMP hooks not wired by this adapter/,
       );
     });
 
     it("parsePostToolUseInput throws", () => {
       expect(() => adapter.parsePostToolUseInput({})).toThrow(
-        /OMP does not support hooks/,
+        /OMP hooks not wired by this adapter/,
       );
     });
 
     it("parsePreCompactInput throws", () => {
       expect(() => adapter.parsePreCompactInput({})).toThrow(
-        /OMP does not support hooks/,
+        /OMP hooks not wired by this adapter/,
       );
     });
 
     it("parseSessionStartInput throws", () => {
       expect(() => adapter.parseSessionStartInput({})).toThrow(
-        /OMP does not support hooks/,
+        /OMP hooks not wired by this adapter/,
       );
     });
   });
@@ -145,9 +145,9 @@ describe("OMPAdapter", () => {
       expect(eventsPath).not.toContain(".claude");
     });
 
-    it("default settings path is ~/.omp/agent/mcp_config.json", () => {
+    it("default settings path is ~/.omp/agent/mcp.json", () => {
       expect(adapter.getSettingsPath()).toBe(
-        resolve(homedir(), ".omp", "agent", "mcp_config.json"),
+        resolve(homedir(), ".omp", "agent", "mcp.json"),
       );
     });
 
@@ -157,15 +157,15 @@ describe("OMPAdapter", () => {
       );
     });
 
-    it("OMP_PROCESSING_AGENT_DIR overrides settings path", () => {
-      process.env.OMP_PROCESSING_AGENT_DIR = "/custom/omp/agent";
+    it("PI_CODING_AGENT_DIR overrides settings path", () => {
+      process.env.PI_CODING_AGENT_DIR = "/custom/omp/agent";
       expect(adapter.getSettingsPath()).toBe(
-        resolve("/custom/omp/agent", "mcp_config.json"),
+        resolve("/custom/omp/agent", "mcp.json"),
       );
     });
 
-    it("OMP_PROCESSING_AGENT_DIR overrides config dir", () => {
-      process.env.OMP_PROCESSING_AGENT_DIR = "/custom/omp/agent";
+    it("PI_CODING_AGENT_DIR overrides config dir", () => {
+      process.env.PI_CODING_AGENT_DIR = "/custom/omp/agent";
       expect(adapter.getConfigDir()).toBe("/custom/omp/agent");
     });
   });
@@ -173,8 +173,11 @@ describe("OMPAdapter", () => {
   // ── Instruction file ──────────────────────────────────
 
   describe("instruction files", () => {
-    it("uses PI.md (Pi-compatible)", () => {
-      expect(adapter.getInstructionFiles()).toEqual(["PI.md"]);
+    it("uses SYSTEM.md (OMP-native) plus AGENTS.md (universally discovered)", () => {
+      // Verified upstream:
+      //   - SYSTEM.md: packages/coding-agent/src/main.ts:394-402
+      //   - AGENTS.md: packages/coding-agent/src/discovery/agents-md.ts:25-29
+      expect(adapter.getInstructionFiles()).toEqual(["SYSTEM.md", "AGENTS.md"]);
     });
   });
 });

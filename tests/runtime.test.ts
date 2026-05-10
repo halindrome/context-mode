@@ -153,6 +153,229 @@ describe("SHELL env var override", () => {
   });
 });
 
+describe("runnableExists — Windows MS Store stub filter (#454)", () => {
+  // Tested through the public `detectRuntimes()` interface (runnableExists is
+  // an internal helper). All cases stub process.platform = "win32" and mock
+  // `child_process` to simulate `where <cmd>` + `<cmd> --version` probes.
+
+  afterEach(() => {
+    vi.resetModules();
+    vi.doUnmock("node:child_process");
+    Object.defineProperty(process, "platform", {
+      value: process.env.__ORIG_PLATFORM__ ?? "darwin",
+      configurable: true,
+    });
+  });
+
+  beforeEach(() => {
+    process.env.__ORIG_PLATFORM__ ??= process.platform;
+    Object.defineProperty(process, "platform", { value: "win32", configurable: true });
+  });
+
+  /** Build a child_process mock for runnableExists() probes. */
+  function mockChildProcess(opts: {
+    whereResults: Record<string, string[] | "throw">;
+    versionExits: Record<string, "ok" | "throw" | { code: number }>;
+  }) {
+    const execSync = vi.fn((cmd: string) => {
+      // commandExists path (non-Windows) shouldn't be hit when platform=win32,
+      // but be defensive: handle both `where X` and `command -v X`.
+      const m = cmd.match(/^(?:where|command -v)\s+(.+)$/);
+      if (!m) throw new Error(`unmocked execSync: ${cmd}`);
+      const tool = m[1].trim();
+      const result = opts.whereResults[tool];
+      if (result === undefined) throw new Error(`no mock for ${tool}`);
+      if (result === "throw") throw new Error(`not found: ${tool}`);
+      return result.join("\r\n") + "\r\n";
+    });
+    const execFileSync = vi.fn((cmd: string, args: string[]) => {
+      // --version probe.
+      if (args[0] !== "--version") throw new Error(`unexpected args: ${args.join(" ")}`);
+      const exit = opts.versionExits[cmd];
+      if (exit === undefined || exit === "throw") {
+        throw new Error(`probe failed: ${cmd}`);
+      }
+      if (typeof exit === "object") {
+        const err: NodeJS.ErrnoException & { status?: number } = new Error(
+          `exit ${exit.code}`,
+        );
+        err.status = exit.code;
+        throw err;
+      }
+      return Buffer.from(`${cmd} 3.11.0\n`);
+    });
+    return { execSync, execFileSync };
+  }
+
+  test("filters Microsoft\\WindowsApps stub when a real python3 also exists", async () => {
+    const { execSync, execFileSync } = mockChildProcess({
+      whereResults: {
+        python3: [
+          "C:\\Users\\X\\AppData\\Local\\Microsoft\\WindowsApps\\python3.exe",
+          "C:\\Python311\\python3.exe",
+        ],
+        bun: "throw",
+        bash: "throw",
+        sh: "throw",
+        powershell: "throw",
+        tsx: "throw",
+        "ts-node": "throw",
+        ruby: "throw",
+        go: "throw",
+        rustc: "throw",
+        php: "throw",
+        perl: "throw",
+        Rscript: "throw",
+        r: "throw",
+        elixir: "throw",
+      },
+      versionExits: { python3: "ok" },
+    });
+    vi.doMock("node:child_process", () => ({ execSync, execFileSync }));
+
+    const { detectRuntimes } = await import("../src/runtime.js");
+    const r = detectRuntimes();
+
+    // python3 was found in PATH AND --version succeeded → runtime is "python3"
+    // (the runnableExists path returned true after filtering the WindowsApps stub).
+    expect(r.python).toBe("python3");
+    // Probe was executed once for python3; should NOT cascade to "python" or "py".
+    expect(execFileSync).toHaveBeenCalledWith(
+      "python3",
+      ["--version"],
+      expect.objectContaining({ shell: true }),
+    );
+  });
+
+  test("rejects when every `where` hit is a WindowsApps stub", async () => {
+    const { execSync, execFileSync } = mockChildProcess({
+      whereResults: {
+        python3: ["C:\\Users\\X\\AppData\\Local\\Microsoft\\WindowsApps\\python3.exe"],
+        python: ["C:\\Users\\X\\AppData\\Local\\Microsoft\\WindowsApps\\python.exe"],
+        py: "throw",
+        bun: "throw",
+        bash: "throw",
+        sh: "throw",
+        powershell: "throw",
+        tsx: "throw",
+        "ts-node": "throw",
+        ruby: "throw",
+        go: "throw",
+        rustc: "throw",
+        php: "throw",
+        perl: "throw",
+        Rscript: "throw",
+        r: "throw",
+        elixir: "throw",
+      },
+      // Probes must NOT be reached because all hits are stubs and `where` short-circuits.
+      versionExits: {},
+    });
+    vi.doMock("node:child_process", () => ({ execSync, execFileSync }));
+
+    const { detectRuntimes } = await import("../src/runtime.js");
+    const r = detectRuntimes();
+
+    expect(r.python).toBeNull();
+    // No --version probe should have been executed for python3/python (stubs filtered out
+    // before the probe). py threw at `where`, so it's also rejected without a probe.
+    expect(execFileSync).not.toHaveBeenCalledWith("python3", ["--version"], expect.anything());
+    expect(execFileSync).not.toHaveBeenCalledWith("python", ["--version"], expect.anything());
+  });
+
+  test("rejects runtime when --version exits 9009 (MS Store stub fallthrough)", async () => {
+    // Defensive: even if a stub somehow slips past the path filter (e.g. user
+    // installed a custom python3.exe under WindowsApps), exit code 9009 from
+    // `<cmd> --version` must reject the runtime.
+    const { execSync, execFileSync } = mockChildProcess({
+      whereResults: {
+        python3: ["C:\\Custom\\python3.exe"], // not under WindowsApps
+        python: "throw",
+        py: "throw",
+        bun: "throw",
+        bash: "throw",
+        sh: "throw",
+        powershell: "throw",
+        tsx: "throw",
+        "ts-node": "throw",
+        ruby: "throw",
+        go: "throw",
+        rustc: "throw",
+        php: "throw",
+        perl: "throw",
+        Rscript: "throw",
+        r: "throw",
+        elixir: "throw",
+      },
+      versionExits: { python3: { code: 9009 } },
+    });
+    vi.doMock("node:child_process", () => ({ execSync, execFileSync }));
+
+    const { detectRuntimes } = await import("../src/runtime.js");
+    const r = detectRuntimes();
+
+    expect(r.python).toBeNull();
+    expect(execFileSync).toHaveBeenCalledWith("python3", ["--version"], expect.anything());
+  });
+
+  test("falls back to `py` when python3 and python both fail", async () => {
+    const { execSync, execFileSync } = mockChildProcess({
+      whereResults: {
+        python3: "throw",
+        python: "throw",
+        py: ["C:\\Windows\\py.exe"],
+        bun: "throw",
+        bash: "throw",
+        sh: "throw",
+        powershell: "throw",
+        tsx: "throw",
+        "ts-node": "throw",
+        ruby: "throw",
+        go: "throw",
+        rustc: "throw",
+        php: "throw",
+        perl: "throw",
+        Rscript: "throw",
+        r: "throw",
+        elixir: "throw",
+      },
+      versionExits: { py: "ok" },
+    });
+    vi.doMock("node:child_process", () => ({ execSync, execFileSync }));
+
+    const { detectRuntimes } = await import("../src/runtime.js");
+    const r = detectRuntimes();
+
+    expect(r.python).toBe("py");
+    expect(execFileSync).toHaveBeenCalledWith("py", ["--version"], expect.anything());
+  });
+
+  test("non-Windows uses 1500ms probe timeout (faster cold detect)", async () => {
+    // Restore non-Windows platform for this case.
+    Object.defineProperty(process, "platform", { value: "linux", configurable: true });
+
+    const execSync = vi.fn((cmd: string) => {
+      if (/^command -v\s/.test(cmd)) return ""; // commandExists → true
+      throw new Error(`unmocked: ${cmd}`);
+    });
+    const execFileSync = vi.fn(() => Buffer.from("ok\n"));
+    vi.doMock("node:child_process", () => ({ execSync, execFileSync }));
+
+    const { detectRuntimes } = await import("../src/runtime.js");
+    detectRuntimes();
+
+    // Verify --version probes used the tightened 1500ms timeout on non-Windows.
+    const probeCalls = execFileSync.mock.calls.filter(
+      (c) => Array.isArray(c[1]) && c[1][0] === "--version",
+    );
+    expect(probeCalls.length).toBeGreaterThan(0);
+    for (const call of probeCalls) {
+      const opts = call[2] as { timeout?: number };
+      expect(opts.timeout).toBe(1500);
+    }
+  });
+});
+
 describe("buildCommand shell variants", () => {
   function makeRuntimes(shell: string): RuntimeMap {
     return {

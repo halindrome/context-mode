@@ -260,3 +260,60 @@ describe("Bash structurally-bounded allowlist (#463)", () => {
     expect(isStructurallyBounded(undefined as unknown as string)).toBe(false);
   });
 });
+
+describe("Bash structurally-bounded allowlist: newline injection (#470)", () => {
+  // Bash treats newline as a statement separator (equivalent to `;`). A safe
+  // first line followed by an unbounded sink on line 2 must NOT be allowlisted —
+  // otherwise the nudge is suppressed and the flood hits context.
+  //
+  // Same defect class for `\r\n` (Windows clipboard pastes — see #470).
+  const SID = "issue-470-tests";
+  beforeEach(() => resetGuidanceThrottle(SID));
+
+  it("LF newline injection — allowlisted line 1 + unbounded line 2 must nudge", () => {
+    const cases = [
+      "git status\nfind /",
+      "echo ok\nfind /",
+      "echo ok\nrm -rf /",
+      "pwd\ncat /var/log/syslog",
+      "whoami\ngrep -r foo /etc",
+    ];
+    for (const command of cases) {
+      resetGuidanceThrottle(SID);
+      const decision = routePreToolUse("Bash", { command }, "/test", "claude-code", SID);
+      expect(decision?.action, `expected nudge for ${JSON.stringify(command)}`).toBe("context");
+    }
+  });
+
+  it("CRLF newline injection (Windows clipboard) must nudge", () => {
+    const cases = [
+      "git status\r\nfind /",
+      "echo ok\r\nrm -rf /",
+      "pwd\r\ncat /var/log/syslog",
+    ];
+    for (const command of cases) {
+      resetGuidanceThrottle(SID);
+      const decision = routePreToolUse("Bash", { command }, "/test", "claude-code", SID);
+      expect(decision?.action, `expected nudge for ${JSON.stringify(command)}`).toBe("context");
+    }
+  });
+
+  it("control: single-line allowlisted command still bounded (no regression)", () => {
+    // Sanity: the newline guard must not regress the single-line case.
+    expect(routePreToolUse("Bash", { command: "git status" }, "/test", "claude-code", SID)).toBeNull();
+    resetGuidanceThrottle(SID);
+    expect(routePreToolUse("Bash", { command: "pwd" }, "/test", "claude-code", SID)).toBeNull();
+    resetGuidanceThrottle(SID);
+    expect(routePreToolUse("Bash", { command: "echo ok" }, "/test", "claude-code", SID)).toBeNull();
+  });
+
+  it("isStructurallyBounded — newline-injected payloads are NOT bounded", () => {
+    expect(isStructurallyBounded("git status\nfind /")).toBe(false);
+    expect(isStructurallyBounded("git status\r\nfind /")).toBe(false);
+    expect(isStructurallyBounded("echo ok\nrm -rf /")).toBe(false);
+    expect(isStructurallyBounded("pwd\ncat huge.log")).toBe(false);
+    // Sanity: bare CR alone (very rare but bash treats it as part of the line)
+    // still must not bypass — a CR followed by a sink is a separator-like exploit.
+    expect(isStructurallyBounded("git status\rfind /")).toBe(false);
+  });
+});

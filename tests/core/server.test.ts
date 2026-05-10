@@ -1842,7 +1842,16 @@ describe("Hook Injection", () => {
     const parsed = JSON.parse(output);
     const prompt = parsed.hookSpecificOutput.updatedInput.prompt;
     assert.ok(prompt.includes("<output_constraints>"), "Should inject output_constraints");
-    assert.ok(prompt.includes("Terse like caveman"), "Should mention concise communication style");
+    // Pillar 4 (caveman/Output Compression) retired in #482. Routing block
+    // must NOT push a prose-style directive — assert the negative.
+    assert.ok(
+      !prompt.toLowerCase().includes("terse like caveman"),
+      "Routing block must not contain caveman/terse style directive",
+    );
+    assert.ok(
+      !prompt.includes("<communication_style>"),
+      "Routing block must not contain communication_style block",
+    );
     assert.ok(
       prompt.includes("<tool_selection_hierarchy>"),
       "Should inject tool_selection_hierarchy",
@@ -2133,6 +2142,51 @@ describe("ctx_upgrade tool: inline fallback for missing CLI", () => {
   test("fallback only triggers when neither CLI file exists", () => {
     // There should be an else/fallback branch after checking both paths
     expect(serverSrc).toMatch(/existsSync\(fallbackPath\)/);
+  });
+
+  // ── #469 follow-up: insight-cache cleanup must route through the shared
+  //    locale-independent helper, not the original inline `for /f`/`findstr`
+  //    block (which was the exact bug PR #469 fixed for ctx_insight). The
+  //    orphan call site at the top of the ctx_upgrade handler still carried
+  //    the broken pattern. Lock that down here.
+  describe("ctx_upgrade insight-cache cleanup uses killProcessOnPort (#469 follow-up)", () => {
+    // Scope assertions to the ctx_upgrade tool registration body so we don't
+    // accidentally match the shared killProcessOnPort helper definition or
+    // its tests below in the same file.
+    const upgradeMatch = serverSrc.match(
+      /server\.registerTool\(\s*"ctx_upgrade"[\s\S]*?^\);/m,
+    );
+    const upgradeBody = upgradeMatch ? upgradeMatch[0] : "";
+
+    test("ctx_upgrade tool block was located in source", () => {
+      expect(upgradeMatch).not.toBeNull();
+    });
+
+    test("ctx_upgrade does NOT contain the broken inline 'for /f' netstat parser", () => {
+      // The locale-broken Windows pattern PR #469 already removed from
+      // killProcessOnPort. Reintroducing it anywhere in ctx_upgrade is a
+      // regression on non-English Windows.
+      expect(upgradeBody).not.toMatch(/for\s+\/f\s+"tokens=5"/);
+      expect(upgradeBody).not.toMatch(/findstr\s+:4747/);
+    });
+
+    test("ctx_upgrade does NOT shell out to taskkill / lsof directly", () => {
+      // All port-cleanup must go through the shared helper. The handler
+      // itself must not hand-roll either Windows or POSIX kill commands.
+      expect(upgradeBody).not.toMatch(/taskkill/);
+      expect(upgradeBody).not.toMatch(/lsof\s+-ti:4747/);
+    });
+
+    test("ctx_upgrade routes insight-cache cleanup through killProcessOnPort(4747)", () => {
+      // Positive assertion: the handler must call the shared helper.
+      expect(upgradeBody).toMatch(/killProcessOnPort\(\s*4747\s*\)/);
+    });
+
+    test("ctx_upgrade preserves best-effort semantics (cleanup wrapped in try/catch)", () => {
+      // Cleanup failure must not block the upgrade — the try/catch at the
+      // top of the handler with the "best effort" comment must remain.
+      expect(upgradeBody).toMatch(/best effort/i);
+    });
   });
 });
 
@@ -3121,7 +3175,7 @@ describe("ctx_fetch_and_index batch refactor", () => {
 
   test("capped-concurrency note appears only when capped", () => {
     expect(fetchHandlerSrc).toMatch(/cappedNote\s*=\s*capped\s*\?/);
-    // Caveman style — `cap=N/Mcpu` instead of "capped from N to M; M cores available".
+    // Compact form `cap=N/Mcpu` (replaces verbose "capped from N to M; M cores available").
     expect(fetchHandlerSrc).toContain("cap=${effectiveConcurrency}/${cpus().length}cpu");
   });
 
@@ -3142,13 +3196,13 @@ describe("ctx_fetch_and_index batch refactor", () => {
   });
 
   test("batch header uses singular form for count=1 (review F5 plural fix)", () => {
-    // Per CLAUDE.md "Terse like caveman" + grammar correctness:
-    // "1 errors" → "1 error" via the fmt() helper.
+    // Grammar correctness in the compact status line: "1 errors" → "1 error"
+    // via the fmt() helper, so the line stays grammatical at any count.
     expect(fetchHandlerSrc).toContain('const fmt = (n: number, sing: string, plur: string)');
     expect(fetchHandlerSrc).toContain('n === 1 ? sing : plur');
   });
 
-  test("batch header uses caveman style (review F5 terse format)", () => {
+  test("batch header uses compact format (review F5)", () => {
     // Old: "Batch fetched N URLs at concurrency=X (capped from Y to X; Z cores available): a fetched, b cached, c errors. d new sections (eKB total)."
     // New: "fetched N c=X cap=X/Zcpu. ok=a cache=b err=c. d sections eKB."
     expect(fetchHandlerSrc).toContain("`fetched ${batch.length} c=${effectiveConcurrency}");
@@ -3281,6 +3335,164 @@ describe("SSRF guard — ssrfGuard policy in src/server.ts", () => {
     expect(guardIdx).toBeGreaterThan(-1);
     expect(cacheIdx).toBeGreaterThan(-1);
     expect(guardIdx).toBeLessThan(cacheIdx);
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// buildFetchCode — embedded SSRF guard contract (#476 review follow-ups)
+// ═══════════════════════════════════════════════════════════════════════════
+
+import { buildFetchCode } from "../../src/server.js";
+
+describe("buildFetchCode — embedded SSRF guard contract", () => {
+  const generated = buildFetchCode("https://example.com/x", "/tmp/x");
+
+  test("strips proxy env vars (HTTP_PROXY / HTTPS_PROXY / ALL_PROXY)", () => {
+    // A configured outbound proxy would route fetch through an arbitrary
+    // target; DNS resolution would happen at the proxy and the in-subprocess
+    // DNS guard would never see the rebound IP. The generated subprocess
+    // source must delete every proxy env var before any fetch can run.
+    expect(generated).toMatch(/delete process\.env\.HTTP_PROXY/);
+    expect(generated).toMatch(/delete process\.env\.HTTPS_PROXY/);
+    expect(generated).toMatch(/delete process\.env\.ALL_PROXY/);
+    expect(generated).toMatch(/delete process\.env\.http_proxy/);
+    expect(generated).toMatch(/delete process\.env\.https_proxy/);
+    expect(generated).toMatch(/delete process\.env\.all_proxy/);
+  });
+
+  test("patches dns/promises lookup (separate function reference from dns.lookup)", () => {
+    // Patching dns.lookup does NOT affect dnsPromises.lookup. Today undici
+    // uses callback-form dns.lookup so default fetch is covered, but the
+    // invariant is fragile — a future undici switch or any caller using
+    // dnsPromises.lookup directly would bypass the guard.
+    expect(generated).toMatch(/require\(['"]node:dns\/promises['"]\)/);
+    expect(generated).toMatch(/dnsPromises\.lookup\s*=\s*async\s+function/);
+    expect(generated).toMatch(/SSRF blocked/);
+  });
+
+  test("patches dns.resolve4 and dns.resolve6 (libuv bypass path)", () => {
+    // dns.resolve* uses a different code path (no getaddrinfo, no /etc/hosts)
+    // than dns.lookup — they must be patched separately or the guard is
+    // trivially bypassed by any caller using dns.resolve* directly.
+    expect(generated).toMatch(/['"]resolve4['"]\s*,\s*['"]resolve6['"]/);
+    expect(generated).toMatch(/dns\[name\]\s*=\s*function/);
+  });
+
+  describe("buildFetchCode — redirect chain rebinding", () => {
+    // SSRF rebinding via HTTP redirect chain bypasses the parent's pre-flight
+    // ssrfGuard: a 302 to http://attacker/ (or an IPv4-mapped IMDS literal)
+    // sends the subprocess fetch to an alternate host the parent never
+    // classified. The connect-time DNS guard catches some cases, but a
+    // direct-IP redirect target may not trigger getaddrinfo at all. Mitigate
+    // at the HTTP layer: emit `redirect: 'manual'` in the generated source,
+    // re-validate every Location header against ssrfGuard's classifier, and
+    // cap the redirect chain so an attacker cannot exhaust the loop.
+    const generated = buildFetchCode("https://example.com/x", "/tmp/x");
+
+    test("generated source uses redirect: 'manual' (no follow default)", () => {
+      // The default `redirect: 'follow'` lets undici chase a 3xx Location
+      // BEFORE the in-subprocess DNS guard sees the target hostname (and even
+      // when it does, a direct IPv4-literal redirect skips getaddrinfo). The
+      // generated subprocess source MUST opt out of automatic following so
+      // every hop is re-validated by classifyIp before another fetch fires.
+      expect(generated).toMatch(/redirect:\s*['"]manual['"]/);
+    });
+
+    test("manual redirect handler validates Location host via classifyIp", () => {
+      // After receiving a 3xx, the subprocess must parse the Location header,
+      // resolve its host, and run the same classifyIp policy as ssrfGuard
+      // before issuing the next fetch. Without this re-check, an attacker can
+      // redirect to http://169.254.169.254/ or any rebinding-friendly host.
+      expect(generated).toMatch(/Location/);
+      expect(generated).toMatch(/classifyIp\s*\(/);
+      // The redirect handler specifically must invoke classifyIp on the
+      // redirect target — not just the parent's pre-flight call site.
+      expect(generated).toMatch(/redirect[\s\S]{0,400}classifyIp/);
+    });
+
+    test("redirect chain is capped (no unbounded follow)", () => {
+      // An attacker controlling redirect responses could otherwise loop the
+      // subprocess forever or chain enough hops to amortize a slow rebinding
+      // attack. Cap at 5 — the standard browser limit — and abort cleanly.
+      expect(generated).toMatch(/(maxRedirects|MAX_REDIRECTS|redirectCount\s*[<>]=?\s*5|<\s*5|<=\s*5)/);
+    });
+
+    test("non-3xx response path still emits content (preserves 200 semantics)", () => {
+      // Manual redirect handling must not break the happy path: a 200 OK
+      // still flows through emit() with the right content-type branch. Pin
+      // the existing emit() call sites so a refactor that drops them fails.
+      expect(generated).toMatch(/emit\(['"]json['"]/);
+      expect(generated).toMatch(/emit\(['"]html['"]/);
+      expect(generated).toMatch(/emit\(['"]text['"]/);
+    });
+  });
+
+  test("classifyIp embeds without references to module scope", () => {
+    // classifyIp is embedded into the subprocess via Function.prototype.toString().
+    // If a future change ever has classifyIp close over a module-scope helper
+    // (e.g. a regex constant declared above it), the embedded source will
+    // ReferenceError at parse or call time — silently breaking the guard. Pin
+    // the contract: classifyIp source must contain no identifiers that can
+    // only resolve in module scope.
+    const src = classifyIp.toString();
+    const forbidden = [
+      "require(",
+      "process.",
+      "globalThis.",
+      "global.",
+      "__dirname",
+      "__filename",
+    ];
+    for (const ident of forbidden) {
+      expect(src).not.toContain(ident);
+    }
+    // Roundtrip: eval the source in an empty vm context with no globals,
+    // then invoke it. This is exactly what the subprocess does.
+    const { runInNewContext } = require("node:vm");
+    const ctx: Record<string, unknown> = {};
+    runInNewContext(`${src}\n;globalThis.fn = classifyIp;`, ctx);
+    const fn = ctx.fn as (ip: string) => "block" | "private" | "public";
+    expect(fn("169.254.169.254")).toBe("block");
+    expect(fn("8.8.8.8")).toBe("public");
+    expect(fn("10.0.0.1")).toBe("private");
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// buildFetchCode — IPv6 zone-id + generic dns.resolve (#476 round-3)
+// ═══════════════════════════════════════════════════════════════════════════
+
+describe("buildFetchCode — IPv6 zone-id + generic dns.resolve", () => {
+  test("classifyIp strips IPv6 zone-id before classification (link-local)", () => {
+    // fe80::/10 link-local with %eth0 zone suffix must still be blocked.
+    // Today the lowercase prefix check `fe8`/`fe9`/`fea`/`feb` accidentally
+    // catches link-local even with a zone suffix — but only because the
+    // suffix is appended *after* the prefix. Pin the behavior explicitly so
+    // a future refactor cannot regress.
+    expect(classifyIp("fe80::1%eth0")).toBe("block");
+    expect(classifyIp("fe80::1%25eth0")).toBe("block"); // URL-encoded zone
+  });
+
+  test("classifyIp strips IPv6 zone-id before classification (non-link-local)", () => {
+    // RFC 6874 permits zone identifiers on any IPv6 address (not just
+    // link-local). Without zone stripping, a loopback `::1%eth0` would NOT
+    // match the strict equality `lower === "::1"` and would leak through as
+    // "public". Pin every class so the strip happens before classification.
+    expect(classifyIp("::1%eth0")).toBe("private");        // loopback w/ zone
+    expect(classifyIp("fc00::1%eth0")).toBe("private");    // ULA w/ zone
+    expect(classifyIp("ff00::1%eth0")).toBe("block");      // multicast w/ zone
+    expect(classifyIp("2001:db8::1%eth0")).toBe("public"); // doc range w/ zone
+  });
+
+  test("buildFetchCode patches generic dns.resolve (not just resolve4/resolve6)", () => {
+    // dns.resolve is the polymorphic entrypoint that dispatches on rrtype.
+    // Today only resolve4/resolve6 are patched; a caller using
+    // `dns.resolve(host, 'A', cb)` or default rrtype goes through an
+    // un-guarded code path. Patch the generic wrapper so every A/AAAA
+    // record runs through classifyIp.
+    const generated = buildFetchCode("https://example.com/x", "/tmp/x");
+    expect(generated).toMatch(/dns\.resolve\s*=\s*function/);
+    expect(generated).toMatch(/classifyIp/);
   });
 });
 
@@ -3451,6 +3663,20 @@ describe("ctx_doctor — renderer-safe output (Z.ai compat)", () => {
 // env-var-based) and feeds the result into the map. Falls back to `.claude`
 // only if the map returns null (defensive — covers "unknown" PlatformId).
 
+describe("ctx_doctor hook script checks", () => {
+  const serverSrc = readFileSync(
+    resolve(__dirname, "../../src/server.ts"),
+    "utf-8",
+  );
+
+  test("resolves relative hook script paths against pluginRoot", () => {
+    const doctorSection = serverSrc.slice(serverSrc.indexOf("ctx_doctor"), serverSrc.indexOf("ctx_upgrade"));
+    expect(doctorSection).toContain("for (const scriptPath of hookScriptPaths)");
+    expect(doctorSection).toContain("const hookPath = resolve(pluginRoot, scriptPath)");
+    expect(doctorSection).not.toContain("for (const hookPath of hookScriptPaths)");
+  });
+});
+
 describe("getSessionDirSegments — sync platform → segments map", () => {
   test("returns correct segments for every supported platform", async () => {
     const { getSessionDirSegments } = await import("../../src/adapters/detect.js");
@@ -3504,6 +3730,15 @@ describe("getSessionDir uses pre-detection when adapter not yet detected", () =>
     expect(detectIdx).toBeGreaterThan(-1);
     expect(claudeIdx).toBeGreaterThan(-1);
     expect(detectIdx).toBeLessThan(claudeIdx);
+  });
+
+  test("getSessionDir honors CODEX_HOME in the Codex pre-detection branch", () => {
+    const fn = serverSrc.match(/function getSessionDir\(\)[\s\S]*?^}/m);
+    expect(fn).not.toBeNull();
+    const body = fn![0];
+    expect(serverSrc).toContain('import { resolveCodexConfigDir } from "./adapters/codex/paths.js";');
+    expect(body).toContain('segments[0] === ".codex"');
+    expect(body).toContain("resolveCodexConfigDir()");
   });
 });
 
@@ -4044,5 +4279,44 @@ describe("killProcessOnPort — Windows non-English locale (#441 follow-up)", ()
 
     expect(r.attemptedPids).toEqual([]);
     expect(calls).toHaveLength(1); // netstat only — no taskkill issued
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Prose-style policy (issue #482)
+// ═══════════════════════════════════════════════════════════════════════════
+// Decision: context-mode keeps raw data out of context but does not dictate
+// how the model writes its final answer. Aggressive brevity prompts have been
+// shown to degrade coding/reasoning benchmarks (Moonshot AI on kimi-k2.5).
+// Any caveman/terse-style language in shipped artifacts is a regression.
+
+describe("prose-style policy (#482)", () => {
+  const serverSrc = readFileSync(
+    resolve(__dirname, "../../src/server.ts"),
+    "utf-8",
+  );
+  const routingBlock = readFileSync(
+    resolve(__dirname, "../../hooks/routing-block.mjs"),
+    "utf-8",
+  );
+
+  test("no caveman/terse directive lands in any MCP tool description", () => {
+    expect(serverSrc).not.toMatch(/terse like caveman/i);
+    expect(serverSrc).not.toMatch(/only fluff die/i);
+  });
+
+  test("routing-block has no <communication_style> or <response_format> blocks", () => {
+    expect(routingBlock).not.toMatch(/<communication_style>/);
+    expect(routingBlock).not.toMatch(/<response_format>/);
+    expect(routingBlock).not.toMatch(/terse like caveman/i);
+  });
+
+  test("README does not advertise an Output Compression pillar", () => {
+    const readme = readFileSync(
+      resolve(__dirname, "../../README.md"),
+      "utf-8",
+    );
+    expect(readme).not.toMatch(/\*\*Output Compression\*\*/);
+    expect(readme).not.toMatch(/terse like caveman/i);
   });
 });

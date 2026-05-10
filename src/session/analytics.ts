@@ -11,8 +11,8 @@
 
 import { existsSync, readdirSync, statSync } from "node:fs";
 import { join } from "node:path";
-import { homedir } from "node:os";
 import { loadDatabase as loadDatabaseImpl } from "../db-base.js";
+import { resolveClaudeConfigDir } from "../util/claude-config.js";
 
 function semverNewer(a: string, b: string): boolean {
   const pa = a.split(".").map(Number);
@@ -683,10 +683,15 @@ export function getLifetimeStats(opts?: {
   /** Override for tests — defaults to db-base loadDatabase(). */
   loadDatabase?: () => unknown;
 }): LifetimeStats {
+  // Issue #460 round-3: route through resolveClaudeConfigDir so lifetime
+  // stats aggregation tracks $CLAUDE_CONFIG_DIR instead of the literal
+  // ~/.claude tree. Otherwise users who relocate config see "no sessions"
+  // even though the SessionDB sidecars exist under the override.
+  const claudeRoot = resolveClaudeConfigDir();
   const sessionsDir = opts?.sessionsDir
-    ?? join(homedir(), ".claude", "context-mode", "sessions");
+    ?? join(claudeRoot, "context-mode", "sessions");
   const memoryRoot = opts?.memoryRoot
-    ?? join(homedir(), ".claude", "projects");
+    ?? join(claudeRoot, "projects");
 
   let totalEvents = 0;
   let totalSessions = 0;

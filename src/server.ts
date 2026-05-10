@@ -39,6 +39,9 @@ import { persistToolCallCounter, restoreSessionStats } from "./session/persist-t
 import { searchAllSources } from "./search/unified.js";
 import { buildNodeCommand, type HookAdapter } from "./adapters/types.js";
 import { detectPlatform, getSessionDirSegments } from "./adapters/detect.js";
+import { resolveCodexConfigDir } from "./adapters/codex/paths.js";
+import { getHookScriptPaths } from "./util/hook-config.js";
+import { resolveClaudeConfigDir } from "./util/claude-config.js";
 import { loadDatabase } from "./db-base.js";
 import { AnalyticsEngine, formatReport, getConversationStats, getLifetimeStats, getMultiAdapterLifetimeStats, getRealBytesStats, OPUS_INPUT_PRICE_PER_TOKEN } from "./session/analytics.js";
 const __pkg_dir = dirname(fileURLToPath(import.meta.url));
@@ -136,20 +139,28 @@ let _insightChild: ChildProcess | null = null;
  * `hooks/session-helpers.mjs::resolveConfigDir` and
  * `ClaudeCodeAdapter.getConfigDir` so the pre-detection path agrees with
  * hooks/adapter on where Claude Code session data lives. See issue #453.
+ *
+ * Issue #460 round-3: delegates to the canonical util so empty/whitespace
+ * env values fall back instead of poisoning downstream `join()` calls.
  */
 function resolveClaudeConfigRoot(): string {
-  const envVal = process.env.CLAUDE_CONFIG_DIR;
-  if (envVal) {
-    if (envVal.startsWith("~")) return join(homedir(), envVal.replace(/^~[/\\]?/, ""));
-    return envVal;
+  return resolveClaudeConfigDir();
+}
+
+async function getDiagnosticAdapter(): Promise<HookAdapter | null> {
+  if (_detectedAdapter) return _detectedAdapter;
+  try {
+    const { getAdapter } = await import("./adapters/detect.js");
+    const signal = detectPlatform();
+    return await getAdapter(signal.platform);
+  } catch {
+    return null;
   }
-  return join(homedir(), ".claude");
 }
 
 /**
  * Get the platform-specific sessions directory from the detected adapter.
- * Falls back to <CLAUDE_CONFIG_DIR>/context-mode/sessions/ (or
- * ~/.claude/context-mode/sessions/) before adapter detection.
+ * Falls back to the detected platform config root before adapter detection.
  */
 function getSessionDir(): string {
   if (_detectedAdapter) return _detectedAdapter.getSessionDir();
@@ -157,15 +168,18 @@ function getSessionDir(): string {
   // call detectPlatform() (sync, env-var-based) and look up segments via
   // getSessionDirSegments() (sync map, no adapter instantiation). This keeps
   // non-Claude platforms from spilling sessions into ~/.claude/. For Claude
-  // Code (segments=[".claude"]), reroute through the CLAUDE_CONFIG_DIR
-  // contract so the pre-detection window does not split-state with hooks.
+  // Code/Codex (single-segment roots), reroute through their config-dir
+  // contracts so the pre-detection window does not split-state with hooks.
   try {
     const signal = detectPlatform();
     const segments = getSessionDirSegments(signal.platform);
     if (segments) {
-      const root = segments.length === 1 && segments[0] === ".claude"
-        ? resolveClaudeConfigRoot()
-        : join(homedir(), ...segments);
+      let root = join(homedir(), ...segments);
+      if (segments.length === 1 && segments[0] === ".claude") {
+        root = resolveClaudeConfigRoot();
+      } else if (segments.length === 1 && segments[0] === ".codex") {
+        root = resolveCodexConfigDir();
+      }
       const dir = join(root, "context-mode", "sessions");
       mkdirSync(dir, { recursive: true });
       return dir;
@@ -262,6 +276,26 @@ function getStore(): ContentStore {
     // Server just opens whatever DB exists (or creates new if hook deleted it).
     const dbPath = getStorePath();
     _store = new ContentStore(dbPath);
+
+    // Wire deny-policy hook: store re-checks the Read deny list before
+    // re-reading any file_path during auto-refresh. Catches policy edits
+    // made after a file was originally indexed. See #442 round-3.
+    _store.setDenyChecker((filePath: string) => {
+      try {
+        const projectDir = getProjectDir();
+        const denyGlobs = readToolDenyPatterns("Read", projectDir);
+        const r = evaluateFilePath(
+          filePath,
+          denyGlobs,
+          process.platform === "win32",
+          projectDir,
+        );
+        return r.denied;
+      } catch {
+        // Fail-closed for refresh: skip on error rather than re-read.
+        return true;
+      }
+    });
 
     // One-time startup cleanup: remove stale content DBs (>14 days)
     try {
@@ -376,10 +410,14 @@ function healCacheMidSession(): void {
   if (_cacheHealDone) return;
   _cacheHealDone = true;
   try {
-    const ipPath = resolve(homedir(), ".claude", "plugins", "installed_plugins.json");
+    // Issue #460 round-3: honor $CLAUDE_CONFIG_DIR so users who relocate
+    // their CC config root don't have plugin cache healing operate against
+    // the wrong tree (and silently miss dangling-symlink cleanup).
+    const claudeRoot = resolveClaudeConfigDir();
+    const ipPath = resolve(claudeRoot, "plugins", "installed_plugins.json");
     if (!existsSync(ipPath)) return;
     const ip = JSON.parse(readFileSync(ipPath, "utf-8"));
-    const cacheRoot = resolve(homedir(), ".claude", "plugins", "cache");
+    const cacheRoot = resolve(claudeRoot, "plugins", "cache");
     // Plugin root: build/ for tsc, plugin root for bundle
     const pluginRoot = existsSync(resolve(__pkg_dir, "package.json")) ? __pkg_dir : dirname(__pkg_dir);
     for (const [key, entries] of Object.entries((ip.plugins ?? {}) as Record<string, Array<{ installPath?: string }>>)) {
@@ -1005,7 +1043,7 @@ server.registerTool(
   "ctx_execute",
   {
     title: "Execute Code",
-    description: `MANDATORY: Use for any command where output exceeds 20 lines. Execute code in a sandboxed subprocess. Only stdout enters context — raw data stays in the subprocess.${bunNote} Available: ${langList}.\n\nPREFER THIS OVER BASH for: API calls (gh, curl, aws), test runners (npm test, pytest), git queries (git log, git diff), data processing, and ANY CLI command that may produce large output. Bash should only be used for file mutations, git writes, and navigation.\n\nTHINK IN CODE: When you need to analyze, count, filter, compare, or process data — write code that does the work and console.log() only the answer. Do NOT read raw data into context to process mentally. Program the analysis, don't compute it in your reasoning. Write robust, pure JavaScript (no npm dependencies). Use only Node.js built-ins (fs, path, child_process). Always wrap in try/catch. Handle null/undefined. Works on both Node.js and Bun.\n\nWhen reporting results — terse like caveman. Technical substance exact. Only fluff die. Pattern: [thing] [action] [reason]. [next step].`,
+    description: `MANDATORY: Use for any command where output exceeds 20 lines. Execute code in a sandboxed subprocess. Only stdout enters context — raw data stays in the subprocess.${bunNote} Available: ${langList}.\n\nPREFER THIS OVER BASH for: API calls (gh, curl, aws), test runners (npm test, pytest), git queries (git log, git diff), data processing, and ANY CLI command that may produce large output. Bash should only be used for file mutations, git writes, and navigation.\n\nTHINK IN CODE: When you need to analyze, count, filter, compare, or process data — write code that does the work and console.log() only the answer. Do NOT read raw data into context to process mentally. Program the analysis, don't compute it in your reasoning. Write robust, pure JavaScript (no npm dependencies). Use only Node.js built-ins (fs, path, child_process). Always wrap in try/catch. Handle null/undefined. Works on both Node.js and Bun.`,
     inputSchema: z.object({
       language: z
         .enum([
@@ -1335,7 +1373,7 @@ server.registerTool(
   {
     title: "Execute File Processing",
     description:
-      "Read a file and process it without loading contents into context. The file is read into a FILE_CONTENT variable inside the sandbox. Only your printed summary enters context.\n\nPREFER THIS OVER Read/cat for: log files, data files (CSV, JSON, XML), large source files for analysis, and any file where you need to extract specific information rather than read the entire content.\n\nTHINK IN CODE: Write code that processes FILE_CONTENT and console.log() only the answer. Don't read files into context to analyze mentally. Write robust, pure JavaScript — no npm deps, try/catch, null-safe. Node.js + Bun compatible.\n\nWhen reporting results — terse like caveman. Technical substance exact. Only fluff die. Pattern: [thing] [action] [reason]. [next step].",
+      "Read a file and process it without loading contents into context. The file is read into a FILE_CONTENT variable inside the sandbox. Only your printed summary enters context.\n\nPREFER THIS OVER Read/cat for: log files, data files (CSV, JSON, XML), large source files for analysis, and any file where you need to extract specific information rather than read the entire content.\n\nTHINK IN CODE: Write code that processes FILE_CONTENT and console.log() only the answer. Don't read files into context to analyze mentally. Write robust, pure JavaScript — no npm deps, try/catch, null-safe. Node.js + Bun compatible.",
     inputSchema: z.object({
       path: z
         .string()
@@ -1619,8 +1657,7 @@ server.registerTool(
       "Pass ALL search questions as queries array in ONE call. " +
       "File-backed sources are auto-refreshed when the source file changes.\n\n" +
       "TIPS: 2-4 specific terms per query. Use 'source' to scope results.\n\n" +
-      "SESSION STATE: If skills, roles, or decisions were set earlier in this conversation, they are still active. Do not discard or contradict them.\n\n" +
-      "When reporting results — terse like caveman. Technical substance exact. Only fluff die. Pattern: [thing] [action] [reason]. [next step].",
+      "SESSION STATE: If skills, roles, or decisions were set earlier in this conversation, they are still active. Do not discard or contradict them.",
     inputSchema: z.object({
       queries: z.preprocess(coerceJsonArray, z
         .array(z.string())
@@ -1851,16 +1888,150 @@ function resolveGfmPluginPath(): string {
 // Subprocess code that fetches a URL, detects Content-Type, and outputs a
 // __CM_CT__:<type> marker on the first line so the handler can route to the
 // appropriate indexing strategy.  HTML is converted to markdown via Turndown.
-function buildFetchCode(url: string, outputPath: string): string {
+export function buildFetchCode(url: string, outputPath: string): string {
   const turndownPath = JSON.stringify(resolveTurndownPath());
   const gfmPath = JSON.stringify(resolveGfmPluginPath());
   const escapedOutputPath = JSON.stringify(outputPath);
+  // Embed classifyIp into the subprocess so the connect-time DNS lookup is
+  // re-validated with the same policy as ssrfGuard. Without this, an attacker
+  // can serve a public IP for the parent's pre-flight ssrfGuard lookup and
+  // then a blocked IP (e.g. 169.254.169.254 IMDS) for the subprocess fetch's
+  // own lookup — classic DNS rebinding across the parent/child boundary.
+  const classifyIpSrc = classifyIp.toString();
+  const strictMode = process.env.CTX_FETCH_STRICT === "1";
   return `
 const TurndownService = require(${turndownPath});
 const { gfm } = require(${gfmPath});
 const fs = require('fs');
+const dns = require('node:dns');
+const dnsPromises = require('node:dns/promises');
 const url = ${JSON.stringify(url)};
 const outputPath = ${escapedOutputPath};
+
+// Strip proxy env vars from this subprocess only. A configured outbound
+// proxy (HTTP_PROXY / HTTPS_PROXY / ALL_PROXY) would route fetch through
+// an arbitrary target — DNS resolution happens at the proxy and the
+// in-subprocess DNS rebinding guard never sees the rebound IP. The
+// sandbox fetch path has no legitimate need for an upstream proxy.
+delete process.env.HTTP_PROXY;
+delete process.env.HTTPS_PROXY;
+delete process.env.ALL_PROXY;
+delete process.env.http_proxy;
+delete process.env.https_proxy;
+delete process.env.all_proxy;
+delete process.env.npm_config_proxy;
+delete process.env.npm_config_https_proxy;
+
+${classifyIpSrc}
+
+const STRICT = ${JSON.stringify(strictMode)};
+
+// SSRF rebinding defense: every dns.lookup call inside this subprocess
+// (including the one undici performs to connect the fetch socket) is
+// re-validated against the same policy ssrfGuard runs in the parent.
+// Even if a hostname rebinds between the parent's pre-flight check and
+// the subprocess's actual connect, the connect-time lookup re-classifies
+// every returned record and aborts before TCP if any verdict is "block".
+const _origLookup = dns.lookup;
+dns.lookup = function patchedLookup(hostname, options, callback) {
+  if (typeof options === 'function') { callback = options; options = {}; }
+  if (typeof options === 'number') { options = { family: options }; }
+  const wantAll = options && options.all;
+  const opts = Object.assign({}, options || {}, { all: true, verbatim: true });
+  _origLookup(hostname, opts, function(err, records) {
+    if (err) return callback(err);
+    if (!Array.isArray(records)) {
+      records = [{ address: records, family: (options && options.family) || 4 }];
+    }
+    for (var i = 0; i < records.length; i++) {
+      var verdict = classifyIp(records[i].address);
+      if (verdict === 'block' || (STRICT && verdict === 'private')) {
+        return callback(new Error(
+          'SSRF blocked at connect-time: ' + hostname +
+          ' resolves to ' + records[i].address +
+          ' (' + verdict + ')'
+        ));
+      }
+    }
+    if (wantAll) callback(null, records);
+    else callback(null, records[0].address, records[0].family);
+  });
+};
+
+// dns/promises is a separate function reference. Patching dns.lookup does
+// NOT affect dnsPromises.lookup. Today undici's connect path uses callback
+// dns.lookup so default fetch is covered, but the invariant is fragile —
+// any future undici switch (or user code calling dnsPromises.lookup
+// directly) would bypass the guard. Patch both to keep the contract.
+const _origPromisesLookup = dnsPromises.lookup;
+dnsPromises.lookup = async function patchedPromisesLookup(hostname, options) {
+  const opts = Object.assign({}, options || {}, { all: true, verbatim: true });
+  const records = await _origPromisesLookup(hostname, opts);
+  const list = Array.isArray(records) ? records : [records];
+  for (var i = 0; i < list.length; i++) {
+    var verdict = classifyIp(list[i].address);
+    if (verdict === 'block' || (STRICT && verdict === 'private')) {
+      throw new Error(
+        'SSRF blocked at connect-time: ' + hostname +
+        ' resolves to ' + list[i].address + ' (' + verdict + ')'
+      );
+    }
+  }
+  return options && options.all
+    ? list
+    : { address: list[0].address, family: list[0].family };
+};
+
+// dns.resolve4 / dns.resolve6 use a different code path (no getaddrinfo,
+// no /etc/hosts) than dns.lookup — they must be patched separately or the
+// guard is trivially bypassed by any caller using dns.resolve* directly.
+['resolve4', 'resolve6'].forEach(function patchResolve(name) {
+  const _origResolve = dns[name];
+  dns[name] = function patchedResolve(hostname, options, cb) {
+    if (typeof options === 'function') { cb = options; options = undefined; }
+    _origResolve.call(dns, hostname, options || {}, function(err, addrs) {
+      if (err) return cb(err);
+      var withTtl = options && options.ttl;
+      for (var i = 0; i < addrs.length; i++) {
+        var ip = withTtl ? addrs[i].address : addrs[i];
+        var v = classifyIp(ip);
+        if (v === 'block' || (STRICT && v === 'private')) {
+          return cb(new Error(
+            'SSRF blocked at connect-time: ' + hostname +
+            ' resolves to ' + ip + ' (' + v + ')'
+          ));
+        }
+      }
+      cb(null, addrs);
+    });
+  };
+});
+
+// Generic dns.resolve is a polymorphic dispatcher (rrtype-driven). Internally
+// Node delegates to dns.resolve4/dns.resolve6 for A/AAAA, but the patches
+// above hook the *exported* references — Node's internal dispatcher holds
+// captured originals and bypasses our patch. Patch the wrapper explicitly:
+// classify A/AAAA records the same way; pass through CNAME/MX/TXT/SRV/etc.
+const _origResolveGeneric = dns.resolve;
+dns.resolve = function patchedResolveGeneric(hostname, rrtype, cb) {
+  if (typeof rrtype === 'function') { cb = rrtype; rrtype = 'A'; }
+  _origResolveGeneric.call(dns, hostname, rrtype, function(err, records) {
+    if (err) return cb(err);
+    if ((rrtype === 'A' || rrtype === 'AAAA') && Array.isArray(records)) {
+      for (var i = 0; i < records.length; i++) {
+        var ip = records[i];
+        var v = classifyIp(ip);
+        if (v === 'block' || (STRICT && v === 'private')) {
+          return cb(new Error(
+            'SSRF blocked at connect-time: ' + hostname +
+            ' resolves to ' + ip + ' (' + v + ')'
+          ));
+        }
+      }
+    }
+    cb(null, records);
+  });
+};
 
 function emit(ct, content) {
   // Write content to file to bypass executor stdout truncation (100KB limit).
@@ -1869,8 +2040,60 @@ function emit(ct, content) {
   console.log('__CM_CT__:' + ct);
 }
 
+// Manual redirect handling: a 3xx Location header can rebind the subprocess
+// fetch to an alternate host the parent's pre-flight ssrfGuard never saw.
+// Even with the connect-time DNS patch, a redirect target that is a literal
+// IP (e.g. http://169.254.169.254/) skips getaddrinfo entirely. Walk the
+// chain manually so every hop runs through classifyIp before the next fetch.
+const MAX_REDIRECTS = 5;
+async function fetchWithManualRedirect(initialUrl) {
+  let currentUrl = initialUrl;
+  for (let redirectCount = 0; redirectCount <= MAX_REDIRECTS; redirectCount++) {
+    const resp = await fetch(currentUrl, { redirect: 'manual' });
+    if (resp.status < 300 || resp.status >= 400) return resp;
+    const location = resp.headers.get('location') || resp.headers.get('Location');
+    if (!location) return resp;
+    if (redirectCount === MAX_REDIRECTS) {
+      throw new Error('SSRF blocked: redirect chain exceeded ' + MAX_REDIRECTS + ' hops');
+    }
+    let nextParsed;
+    try { nextParsed = new URL(location, currentUrl); } catch (e) {
+      throw new Error('SSRF blocked: invalid redirect Location: ' + location);
+    }
+    if (nextParsed.protocol !== 'http:' && nextParsed.protocol !== 'https:') {
+      throw new Error('SSRF blocked: redirect to non-http(s) scheme ' + nextParsed.protocol);
+    }
+    // If the redirect target is a literal IP, classify it directly — no DNS
+    // lookup will fire and the connect-time guard would never see it.
+    const hostname = nextParsed.hostname.replace(/^\[|\]$/g, '');
+    const isIpLiteral = /^[0-9.]+$/.test(hostname) || hostname.includes(':');
+    if (isIpLiteral) {
+      const verdict = classifyIp(hostname);
+      if (verdict === 'block' || (STRICT && verdict === 'private')) {
+        throw new Error('SSRF blocked: redirect to ' + hostname + ' (' + verdict + ')');
+      }
+    } else {
+      // Hostname target: resolve and classify every record. The patched
+      // dns.lookup also fires on the next fetch's connect, but checking
+      // here gives a clearer error and short-circuits before TCP setup.
+      const records = await dnsPromises.lookup(hostname, { all: true, verbatim: true });
+      for (const rec of records) {
+        const verdict = classifyIp(rec.address);
+        if (verdict === 'block' || (STRICT && verdict === 'private')) {
+          throw new Error(
+            'SSRF blocked: redirect target ' + hostname +
+            ' resolves to ' + rec.address + ' (' + verdict + ')'
+          );
+        }
+      }
+    }
+    currentUrl = nextParsed.toString();
+  }
+  throw new Error('SSRF blocked: redirect chain exceeded ' + MAX_REDIRECTS + ' hops');
+}
+
 async function main() {
-  const resp = await fetch(url);
+  const resp = await fetchWithManualRedirect(url);
   if (!resp.ok) { console.error("HTTP " + resp.status); process.exit(1); }
   const contentType = resp.headers.get('content-type') || '';
 
@@ -2010,7 +2233,14 @@ async function ssrfGuard(rawUrl: string): Promise<FetchOneResult | null> {
  *
  * Exported (via the function name) so SSRF tests can exercise the matcher directly.
  */
-export function classifyIp(ip: string): "block" | "private" | "public" {
+export function classifyIp(rawIp: string): "block" | "private" | "public" {
+  // RFC 6874 zone identifiers (`fe80::1%eth0`, URL-encoded `%25eth0`) must
+  // be stripped BEFORE any prefix/equality classification. Without the strip,
+  // a loopback `::1%eth0` no longer matches `lower === "::1"` and falls
+  // through to "public" — silently bypassing the SSRF guard. Strip first,
+  // classify second.
+  const pctIdx = rawIp.indexOf("%");
+  const ip = pctIdx === -1 ? rawIp : rawIp.slice(0, pctIdx);
   const lower = ip.toLowerCase();
 
   // IPv6 takes priority — check for `:` first so IPv4-mapped addresses
@@ -2161,8 +2391,7 @@ server.registerTool(
       "  ✅ Use concurrency: 4-8 for: library docs sweep, multi-changelog scan, competitive pricing pages, multi-region docs, GitHub raw file pulls.\n" +
       "  ❌ Single URL → use the legacy {url, source} shape (concurrency irrelevant).\n" +
       "  Example: requests: [{url: 'https://react.dev/...', source: 'react'}, {url: 'https://vuejs.org/...', source: 'vue'}], concurrency: 5.\n" +
-      "  Indexing is serial regardless of concurrency — fetches race, FTS5 writes don't (avoids SQLite WAL contention).\n\n" +
-      "When reporting results — terse like caveman. Technical substance exact. Only fluff die. Pattern: [thing] [action] [reason]. [next step].",
+      "  Fetches parallelize up to your concurrency setting; FTS5 indexing serializes the writes after (SQLite single-writer rule).",
     inputSchema: z.object({
       url: z.string().optional().describe("Single URL to fetch and index (legacy single-shape)"),
       source: z
@@ -2354,8 +2583,8 @@ server.registerTool(
     const cappedNote = capped
       ? ` cap=${effectiveConcurrency}/${cpus().length}cpu`
       : "";
-    // Caveman style — terse status line: counts + sections + size.
-    // Singular forms used at count=1 to avoid grammar drift ("1 errors" → "1 error").
+    // Status line: counts + sections + size, with singular/plural agreement
+    // (count=1 → "1 error" not "1 errors") so the line stays grammatical.
     const fmt = (n: number, sing: string, plur: string) => `${n} ${n === 1 ? sing : plur}`;
     const headerLine =
       `fetched ${batch.length} c=${effectiveConcurrency}${cappedNote}. ` +
@@ -2397,8 +2626,7 @@ server.registerTool(
       "  ❌ Keep concurrency: 1 for: npm test, build, lint, image processing (CPU-bound), or commands sharing state (ports, lock files, same-repo writes).\n" +
       "  Example: [gh issue view 1, gh issue view 2, gh issue view 3] → concurrency: 3.\n" +
       "  Speedup depends on workload — applies to I/O wait, not CPU work.\n\n" +
-      "THINK IN CODE — NON-NEGOTIABLE: When commands produce data you need to analyze, count, filter, compare, or transform — add a processing command that runs JavaScript and console.log() ONLY the answer. NEVER pull raw output into context to reason over. Concurrency parallelizes the FETCH; THINK IN CODE owns the PROCESSING. One programmed analysis replaces ten read-and-reason rounds. Pure JavaScript, Node.js built-ins (fs, path, child_process), try/catch, null-safe.\n\n" +
-      "When reporting results — terse like caveman. Technical substance exact. Only fluff die. Pattern: [thing] [action] [reason]. [next step].",
+      "THINK IN CODE — NON-NEGOTIABLE: When commands produce data you need to analyze, count, filter, compare, or transform — add a processing command that runs JavaScript and console.log() ONLY the answer. NEVER pull raw output into context to reason over. Concurrency parallelizes the FETCH; THINK IN CODE owns the PROCESSING. One programmed analysis replaces ten read-and-reason rounds. Pure JavaScript, Node.js built-ins (fs, path, child_process), try/catch, null-safe.",
     inputSchema: z.object({
       commands: z.preprocess(coerceCommandsArray, z
         .array(
@@ -2738,12 +2966,29 @@ server.registerTool(
       }
     }
 
-    // Hook script
-    const hookPath = resolve(pluginRoot, "hooks", "pretooluse.mjs");
-    if (existsSync(hookPath)) {
-      lines.push(`[OK] Hook script: PASS — ${hookPath}`);
+    // Hooks
+    const diagnosticAdapter = await getDiagnosticAdapter();
+    if (diagnosticAdapter) {
+      for (const result of diagnosticAdapter.validateHooks(pluginRoot)) {
+        const prefix = result.status === "pass" ? "[OK]" : result.status === "warn" ? "[WARN]" : "[FAIL]";
+        const fix = result.fix ? ` — fix: ${result.fix}` : "";
+        lines.push(`${prefix} ${result.check}: ${result.message}${fix}`);
+      }
+
+      const hookScriptPaths = getHookScriptPaths(diagnosticAdapter, pluginRoot);
+      if (hookScriptPaths.length === 0) {
+        lines.push("[OK] Hook scripts: no direct .mjs script paths to verify");
+      }
+      for (const scriptPath of hookScriptPaths) {
+        const hookPath = resolve(pluginRoot, scriptPath);
+        if (existsSync(hookPath)) {
+          lines.push(`[OK] Hook script: PASS — ${hookPath}`);
+        } else {
+          lines.push(`[FAIL] Hook script: FAIL — not found at ${hookPath}`);
+        }
+      }
     } else {
-      lines.push(`[FAIL] Hook script: FAIL — not found at ${hookPath}`);
+      lines.push("[WARN] Hooks: adapter detection unavailable");
     }
 
     // Version
@@ -2778,14 +3023,11 @@ server.registerTool(
       const sessDir = getSessionDir();
       const insightCacheDir = join(dirname(sessDir), "insight-cache");
       if (existsSync(insightCacheDir)) {
-        // Kill any running insight server first
-        try {
-          if (process.platform === "win32") {
-            execSync('for /f "tokens=5" %a in (\'netstat -ano ^| findstr :4747\') do taskkill /F /PID %a', { stdio: "pipe" });
-          } else {
-            execSync("lsof -ti:4747 | xargs kill 2>/dev/null", { stdio: "pipe" });
-          }
-        } catch { /* no process to kill */ }
+        // Kill any running insight server first via the shared helper —
+        // this is locale-independent on Windows (PR #469) and isolates per-pid
+        // failures. We ignore the structured result: cache cleanup is
+        // best-effort and must never block ctx_upgrade.
+        killProcessOnPort(4747);
         rmSync(insightCacheDir, { recursive: true, force: true });
       }
     } catch { /* best effort — don't block upgrade */ }
