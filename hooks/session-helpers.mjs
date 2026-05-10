@@ -5,94 +5,71 @@
  *
  * All functions accept an optional `opts` parameter for platform-specific
  * configuration. Defaults to Claude Code settings for backward compatibility.
+ *
+ * ─── PATH / HASH HELPERS ARE BOUND, NOT REIMPLEMENTED ──────────────────
+ * Hash + worktree-suffix + legacy migration logic lives in TypeScript at
+ * `src/session/db.ts` and is bundled to `hooks/session-db.bundle.mjs` by
+ * the existing esbuild step in `npm run bundle`. This file imports those
+ * exports via the bundle so the JS hooks and the TS server cannot drift
+ * again — the same drift that produced rounds 5 and 6 of case-fold fixes.
+ *
+ * Bundle-first / build-fallback resolution mirrors the pattern in
+ * `session-loaders.mjs` for marketplace installs that ship `build/`
+ * artifacts instead of pre-built bundles.
  */
 
-import { execFileSync } from "node:child_process";
-import { createHash } from "node:crypto";
-import { join } from "node:path";
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { join, dirname } from "node:path";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
-// Case-fold the project dir before hashing so the same physical worktree
-// always maps to one DB regardless of casing on macOS HFS+/APFS or Windows
-// NTFS. Mirrors src/session/db.ts hashProjectDirCanonical/Legacy. Linux is
-// strictly case-sensitive so this is a no-op there.
-export function hashCanonical(projectDir) {
-  const normalized = projectDir.replace(/\\/g, "/").replace(/\/+$/, "") || "/";
-  const folded = (process.platform === "darwin" || process.platform === "win32")
-    ? normalized.toLowerCase()
-    : normalized;
-  return createHash("sha256").update(folded).digest("hex").slice(0, 16);
-}
-export function hashLegacy(projectDir) {
-  const normalized = projectDir.replace(/\\/g, "/").replace(/\/+$/, "") || "/";
-  return createHash("sha256").update(normalized).digest("hex").slice(0, 16);
-}
+// ─────────────────────────────────────────────────────────
+// Bundle binding — single source of truth for path/hash logic.
+// ─────────────────────────────────────────────────────────
 
-// Build a path under the per-project sessions dir, performing one-shot
-// migration from a legacy raw-casing filename to the canonical one when
-// both points to different files (Mac/Win only). Same rules as
-// resolveSessionDbPath in src/session/db.ts: never overwrite, never throw.
-function migrateAndJoin(dir, canonicalHash, legacyHash, suffix, ext) {
-  const canonical = join(dir, `${canonicalHash}${suffix}${ext}`);
-  if (existsSync(canonical) || canonicalHash === legacyHash) return canonical;
-  const legacy = join(dir, `${legacyHash}${suffix}${ext}`);
-  if (existsSync(legacy)) {
-    try { renameSync(legacy, canonical); } catch { /* best effort */ }
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
+
+async function loadSessionDbModule() {
+  // Bundle is co-located with this file in published installs.
+  const bundlePath = join(__dirname, "session-db.bundle.mjs");
+  if (existsSync(bundlePath)) {
+    return await import(pathToFileURL(bundlePath).href);
   }
-  return canonical;
+  // Marketplace fallback: build/session/db.js when bundles are absent.
+  const buildPath = join(__dirname, "..", "build", "session", "db.js");
+  return await import(pathToFileURL(buildPath).href);
 }
 
-/**
- * Returns the worktree suffix for session path isolation.
- * Mirrors the logic in src/server.ts — kept in sync manually since
- * hooks run as plain .mjs (no TypeScript build step).
- *
- * Two-level cache:
- *   1. In-process module cache — same hook fire calls this 3× (db,
- *      events, cleanup paths) so cache hits 2 of 3 cold within process.
- *   2. Cross-process marker file in tmpdir keyed by sha256(cwd) — every
- *      Pre/PostToolUse hook is a fresh node fork; without this each fire
- *      pays 12-50ms for `git worktree list` on Linux/macOS, 50-150ms on
- *      Windows where fork+exec is heavier.
- *
- * Marker filename uses sha256(projectDir) so it is alphanumeric — safe across
- * Windows path/filename rules. tmpdir() resolves correctly on all 3 OS.
- */
+const _sessionDb = await loadSessionDbModule();
+const {
+  hashProjectDirCanonical,
+  hashProjectDirLegacy,
+  normalizeWorktreePath,
+  resolveSessionPath: _resolveSessionPath,
+  getWorktreeSuffix: _getWorktreeSuffixBundle,
+} = _sessionDb;
+
+// ─────────────────────────────────────────────────────────
+// Cross-process worktree-suffix cache — hook-fork-only optimisation.
+// ─────────────────────────────────────────────────────────
+//
+// The TS bundle's getWorktreeSuffix has an in-process cache, but every
+// Pre/PostToolUse hook is a fresh `node` fork — that cache is dead on
+// arrival. The marker file in tmpdir keyed by sha256(projectDir) lets
+// subsequent forks short-circuit the 12-50ms `git worktree list` cost.
+// The marker filename uses the canonical hash (case-folded on Mac/Win)
+// so two terminals with different casing of the same physical worktree
+// share one marker (and one cached suffix) — same correctness guarantee
+// as the canonical DB filename.
+
 let _wtCacheInProcess;
-function normalizeWorktreePath(path) {
-  const normalized = path.replace(/\\/g, "/");
-  if (/^\/+$/.test(normalized)) return "/";
-  if (/^[A-Za-z]:\/+$/.test(normalized)) return `${normalized.slice(0, 2)}/`;
-  return normalized.replace(/\/+$/, "");
-}
-
-function gitOutput(projectDir, args) {
-  return execFileSync(
-    "git",
-    ["-C", projectDir, ...args],
-    { encoding: "utf-8", timeout: 2000, stdio: ["ignore", "pipe", "ignore"] },
-  ).trim();
-}
-
-function getCurrentWorktreeRoot(projectDir) {
-  const root = gitOutput(projectDir, ["rev-parse", "--show-toplevel"]);
-  return root.length > 0 ? normalizeWorktreePath(root) : null;
-}
-
-function getMainWorktreeRoot(projectDir) {
-  const root = gitOutput(projectDir, ["worktree", "list", "--porcelain"])
-    .split(/\r?\n/)
-    .find((line) => line.startsWith("worktree "))
-    ?.replace("worktree ", "")
-    ?.trim();
-  return root ? normalizeWorktreePath(root) : null;
-}
 
 function workTreeMarkerPath(projectDir) {
-  // Canonical hash so two terminals with different casing of the same
-  // worktree share one marker (and one cached suffix). Mirrors hashCanonical.
-  return join(tmpdir(), `cm-wt-${hashCanonical(normalizeWorktreePath(projectDir))}.txt`);
+  return join(
+    tmpdir(),
+    `cm-wt-${hashProjectDirCanonical(normalizeWorktreePath(projectDir))}.txt`,
+  );
 }
 
 function getWorktreeSuffix(projectDir = process.cwd()) {
@@ -118,28 +95,17 @@ function getWorktreeSuffix(projectDir = process.cwd()) {
       _wtCacheInProcess = { projectDir: normalizedProjectDir, envSuffix, suffix };
       return suffix;
     } catch {
-      // marker missing → compute below
+      // marker missing → delegate to bundle for the canonical computation.
     }
 
-    suffix = "";
+    // Single source of truth: the bundle's getWorktreeSuffix runs the
+    // git subprocess, the case-fold comparison, and the suffix hashing.
+    // We just persist the result so other forks can skip the git call.
     try {
-      const currentRoot = getCurrentWorktreeRoot(projectDir);
-      const mainRoot = getMainWorktreeRoot(projectDir);
-      if (currentRoot && mainRoot) {
-        // Mirror src/session/db.ts round-5 fix: case-fold the comparison
-        // AND the hash so casing-only path differences on Mac/Win produce
-        // the same suffix (and so the SAME .db file as the server reads).
-        const fold = (s) => (process.platform === "darwin" || process.platform === "win32")
-          ? s.toLowerCase()
-          : s;
-        const canonicalCurrent = fold(currentRoot);
-        const canonicalMain = fold(mainRoot);
-        if (canonicalCurrent !== canonicalMain) {
-          suffix = `__${createHash("sha256").update(canonicalCurrent).digest("hex").slice(0, 8)}`;
-        }
-      }
+      suffix = _getWorktreeSuffixBundle(projectDir);
     } catch {
       // git not available or not a git repo — no suffix
+      suffix = "";
     }
 
     // Best-effort write so subsequent hook forks short-circuit.
@@ -153,6 +119,10 @@ function getWorktreeSuffix(projectDir = process.cwd()) {
   _wtCacheInProcess = { projectDir: normalizedProjectDir, envSuffix, suffix };
   return suffix;
 }
+
+// ─────────────────────────────────────────────────────────
+// Platform options (hook-only — the server doesn't fork hooks).
+// ─────────────────────────────────────────────────────────
 
 /** Claude Code platform options (default). */
 const CLAUDE_OPTS = {
@@ -291,38 +261,46 @@ export function getSessionId(input, opts = CLAUDE_OPTS) {
   return `pid-${process.ppid}`;
 }
 
+// ─────────────────────────────────────────────────────────
+// Per-project file paths — thin wrappers around resolveSessionPath.
+// ─────────────────────────────────────────────────────────
+
+function _resolveProjectFile(opts, projectDirOverride, ext) {
+  const projectDir = normalizeWorktreePath(projectDirOverride ?? getProjectDir(opts));
+  const sessionsDir = join(resolveConfigDir(opts), "context-mode", "sessions");
+  mkdirSync(sessionsDir, { recursive: true });
+  return _resolveSessionPath({
+    projectDir,
+    sessionsDir,
+    suffix: getWorktreeSuffix(projectDir),
+    ext,
+  });
+}
+
 /**
  * Return the per-project session DB path.
  * Creates the directory if it doesn't exist.
- * Path: ~/<configDir>/context-mode/sessions/<SHA256(projectDir)[:16]>.db
+ * Path: ~/<configDir>/context-mode/sessions/<canonicalHash><suffix>.db
  */
 export function getSessionDBPath(opts = CLAUDE_OPTS, projectDirOverride) {
-  const projectDir = normalizeWorktreePath(projectDirOverride ?? getProjectDir(opts));
-  const dir = join(resolveConfigDir(opts), "context-mode", "sessions");
-  mkdirSync(dir, { recursive: true });
-  return migrateAndJoin(dir, hashCanonical(projectDir), hashLegacy(projectDir), getWorktreeSuffix(projectDir), ".db");
+  return _resolveProjectFile(opts, projectDirOverride, ".db");
 }
 
 /**
  * Return the per-project session events file path.
  * Used by sessionstart hook (write) and MCP server (read + auto-index).
- * Path: ~/<configDir>/context-mode/sessions/<SHA256(projectDir)[:16]>-events.md
+ * Path: ~/<configDir>/context-mode/sessions/<canonicalHash><suffix>-events.md
  */
 export function getSessionEventsPath(opts = CLAUDE_OPTS, projectDirOverride) {
-  const projectDir = normalizeWorktreePath(projectDirOverride ?? getProjectDir(opts));
-  const dir = join(resolveConfigDir(opts), "context-mode", "sessions");
-  mkdirSync(dir, { recursive: true });
-  return migrateAndJoin(dir, hashCanonical(projectDir), hashLegacy(projectDir), getWorktreeSuffix(projectDir), "-events.md");
+  return _resolveProjectFile(opts, projectDirOverride, "-events.md");
 }
 
 /**
  * Return the per-project cleanup flag path.
  * Used to detect true fresh starts vs --continue (which fires startup+resume).
- * Path: ~/<configDir>/context-mode/sessions/<SHA256(projectDir)[:16]>.cleanup
+ * Path: ~/<configDir>/context-mode/sessions/<canonicalHash><suffix>.cleanup
  */
 export function getCleanupFlagPath(opts = CLAUDE_OPTS, projectDirOverride) {
-  const projectDir = normalizeWorktreePath(projectDirOverride ?? getProjectDir(opts));
-  const dir = join(resolveConfigDir(opts), "context-mode", "sessions");
-  mkdirSync(dir, { recursive: true });
-  return migrateAndJoin(dir, hashCanonical(projectDir), hashLegacy(projectDir), getWorktreeSuffix(projectDir), ".cleanup");
+  return _resolveProjectFile(opts, projectDirOverride, ".cleanup");
 }
+

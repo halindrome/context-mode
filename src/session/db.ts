@@ -186,17 +186,41 @@ export function resolveSessionDbPath(opts: {
   projectDir: string;
   sessionsDir: string;
 }): string {
-  const { projectDir, sessionsDir } = opts;
-  const suffix = getWorktreeSuffix(projectDir);
+  return resolveSessionPath({ ...opts, ext: ".db" });
+}
+
+/**
+ * Generalized resolver: same case-fold + one-shot legacy-rename semantics
+ * as {@link resolveSessionDbPath}, parameterised on the file extension so
+ * the SAME logic powers `.db`, `-events.md`, and `.cleanup` paths.
+ *
+ * Source of truth for hooks: `hooks/session-helpers.mjs` imports this
+ * function from the bundled output (`hooks/session-db.bundle.mjs`) so the
+ * JS hooks and the TS server can never drift again on hash, suffix, or
+ * migration policy.
+ *
+ * Optional `suffix` lets the hook layer inject its cross-process cached
+ * worktree suffix (the marker-file optimisation that amortises the
+ * `git worktree list` cost across hook forks). When omitted, falls back
+ * to {@link getWorktreeSuffix} which uses an in-process cache only.
+ */
+export function resolveSessionPath(opts: {
+  projectDir: string;
+  sessionsDir: string;
+  ext: string;
+  suffix?: string;
+}): string {
+  const { projectDir, sessionsDir, ext } = opts;
+  const suffix = opts.suffix ?? getWorktreeSuffix(projectDir);
   const canonicalHash = hashProjectDirCanonical(projectDir);
-  const canonicalPath = join(sessionsDir, `${canonicalHash}${suffix}.db`);
+  const canonicalPath = join(sessionsDir, `${canonicalHash}${suffix}${ext}`);
 
   if (existsSync(canonicalPath)) return canonicalPath;
 
   const legacyHash = hashProjectDirLegacy(projectDir);
   if (legacyHash === canonicalHash) return canonicalPath; // Linux or already canonical
 
-  const legacyPath = join(sessionsDir, `${legacyHash}${suffix}.db`);
+  const legacyPath = join(sessionsDir, `${legacyHash}${suffix}${ext}`);
   if (existsSync(legacyPath)) {
     try {
       renameSync(legacyPath, canonicalPath);
