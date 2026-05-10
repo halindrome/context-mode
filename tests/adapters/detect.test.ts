@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+import { sep } from "node:path";
 import { detectPlatform, getAdapter } from "../../src/adapters/detect.js";
 import { ClaudeCodeAdapter } from "../../src/adapters/claude-code/index.js";
 import { GeminiCLIAdapter } from "../../src/adapters/gemini-cli/index.js";
@@ -506,7 +507,7 @@ describe("getAdapter", () => {
     const sessionsDir = adapter.getSessionDir();
     expect(sessionsDir).toContain(".pi");
     expect(sessionsDir).not.toContain(".claude");
-    expect(sessionsDir.endsWith(`/.pi/context-mode/sessions`)).toBe(true);
+    expect(sessionsDir.endsWith(`${sep}.pi${sep}context-mode${sep}sessions`)).toBe(true);
   });
 
   it("clientInfo 'Pi Coding Agent' resolves sessionsDir to ~/.pi/", async () => {

@@ -72,7 +72,10 @@ describe("precompact.mjs — snapshot-built event (D2 PRD Phase 6.1)", () => {
     // Pre-seed the SessionDB at the path precompact.mjs would resolve.
     // Use the same hash scheme as session-helpers.mjs:getSessionDBPath.
     const { createHash } = require("node:crypto") as typeof import("node:crypto");
-    const projectHash = createHash("sha256").update(fakeProject).digest("hex").slice(0, 16);
+    // Hooks hash the path AFTER normalizeWorktreePath() (\ → /), so the test
+    // must apply the same normalization before SHA — otherwise on Windows the
+    // expected hash uses backslashes while the hook uses slashes (#435 pattern).
+    const projectHash = createHash("sha256").update(fakeProject.replace(/\\/g, "/")).digest("hex").slice(0, 16);
     const dbDir = join(fakeHome, ".claude", "context-mode", "sessions");
     require("node:fs").mkdirSync(dbDir, { recursive: true });
     const dbPath = join(dbDir, `${projectHash}.db`);

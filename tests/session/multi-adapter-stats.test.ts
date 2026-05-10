@@ -24,7 +24,7 @@
 
 import { existsSync, mkdtempSync, mkdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, sep } from "node:path";
 import { randomUUID } from "node:crypto";
 import { afterAll, describe, expect, test } from "vitest";
 import { SessionDB } from "../../src/session/db.js";
@@ -122,29 +122,40 @@ describe("Slice 2.1 — enumerateAdapterDirs()", () => {
   });
 
   test("each entry exposes sessionsDir and contentDir under <home>/<segments>/context-mode/", () => {
-    const dirs = enumerateAdapterDirs({ home: "/HOME" });
+    const home = "/HOME";
+    const dirs = enumerateAdapterDirs({ home });
+    // Use path.join() so the expected prefix/suffix match the platform's
+    // separator. enumerateAdapterDirs uses node:path.join under the hood,
+    // which emits backslashes on Windows; hardcoded "/" assertions are
+    // vacuously false there.
+    const expectedHomePrefix = home + sep;
+    const expectedSessionsSuffix = sep + join("context-mode", "sessions");
+    const expectedContentSuffix = sep + join("context-mode", "content");
     for (const d of dirs) {
-      expect(d.sessionsDir.startsWith("/HOME/")).toBe(true);
-      expect(d.contentDir.startsWith("/HOME/")).toBe(true);
-      expect(d.sessionsDir.endsWith("/context-mode/sessions")).toBe(true);
-      expect(d.contentDir.endsWith("/context-mode/content")).toBe(true);
+      expect(d.sessionsDir.startsWith(expectedHomePrefix)).toBe(true);
+      expect(d.contentDir.startsWith(expectedHomePrefix)).toBe(true);
+      expect(d.sessionsDir.endsWith(expectedSessionsSuffix)).toBe(true);
+      expect(d.contentDir.endsWith(expectedContentSuffix)).toBe(true);
     }
   });
 
   test("uses the same segment map as src/adapters/detect.ts:92-111 (claude-code under .claude, kilo under .config/kilo, pi under .pi)", () => {
-    const dirs = enumerateAdapterDirs({ home: "/HOME" });
+    const home = "/HOME";
+    const dirs = enumerateAdapterDirs({ home });
     const byName = Object.fromEntries(dirs.map((d) => [d.name, d]));
-    expect(byName["claude-code"].sessionsDir).toBe("/HOME/.claude/context-mode/sessions");
-    expect(byName["kilo"].sessionsDir).toBe("/HOME/.config/kilo/context-mode/sessions");
-    expect(byName["pi"].sessionsDir).toBe("/HOME/.pi/context-mode/sessions");
-    expect(byName["antigravity"].sessionsDir).toBe("/HOME/.gemini/context-mode/sessions");
-    expect(byName["jetbrains-copilot"].sessionsDir).toBe("/HOME/.config/JetBrains/context-mode/sessions");
+    // Build expectations through path.join so backslashes on Windows match.
+    expect(byName["claude-code"].sessionsDir).toBe(join(home, ".claude", "context-mode", "sessions"));
+    expect(byName["kilo"].sessionsDir).toBe(join(home, ".config", "kilo", "context-mode", "sessions"));
+    expect(byName["pi"].sessionsDir).toBe(join(home, ".pi", "context-mode", "sessions"));
+    expect(byName["antigravity"].sessionsDir).toBe(join(home, ".gemini", "context-mode", "sessions"));
+    expect(byName["jetbrains-copilot"].sessionsDir).toBe(join(home, ".config", "JetBrains", "context-mode", "sessions"));
   });
 
   test("defaults to os.homedir() when no override passed", () => {
     const dirs = enumerateAdapterDirs();
     expect(dirs.length).toBe(15);
-    expect(dirs.every((d) => d.sessionsDir.includes("/context-mode/sessions"))).toBe(true);
+    const expectedSuffix = sep + join("context-mode", "sessions");
+    expect(dirs.every((d) => d.sessionsDir.includes(expectedSuffix))).toBe(true);
   });
 });
 

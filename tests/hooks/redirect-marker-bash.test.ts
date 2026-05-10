@@ -73,7 +73,10 @@ describe("D2 Phase 3 — bash-redirected marker pattern", () => {
       CLAUDE_SESSION_ID: sessionId,
       CONTEXT_MODE_SESSION_SUFFIX: "",
     };
-    const projectHash = createHash("sha256").update(fakeProject).digest("hex").slice(0, 16);
+    // Hooks hash the path AFTER normalizeWorktreePath() (\ → /), so the test
+    // must apply the same normalization before SHA — otherwise on Windows the
+    // expected hash uses backslashes while the hook uses slashes (#435 pattern).
+    const projectHash = createHash("sha256").update(fakeProject.replace(/\\/g, "/")).digest("hex").slice(0, 16);
     const dbDir = join(fakeHome, ".claude", "context-mode", "sessions");
     mkdirSync(dbDir, { recursive: true });
     dbPath = join(dbDir, `${projectHash}.db`);
