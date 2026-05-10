@@ -122,16 +122,19 @@ if (cacheMatch) {
 // truth) so users who fix themselves via `npm install -g context-mode`
 // follow the exact same code path. Best-effort, never blocks MCP boot.
 try {
-  const { healInstalledPlugins } = await import("./scripts/heal-installed-plugins.mjs");
+  const { healInstalledPlugins, healSettingsEnabledPlugins } =
+    await import("./scripts/heal-installed-plugins.mjs");
+  const pluginKey = "context-mode@context-mode";
   const registryPath = resolve(homedir(), ".claude", "plugins", "installed_plugins.json");
   const pluginCacheRoot = resolve(homedir(), ".claude", "plugins", "cache");
-  try {
-    healInstalledPlugins({
-      registryPath,
-      pluginCacheRoot,
-      pluginKey: "context-mode@context-mode",
-    });
-  } catch { /* best effort — never block MCP boot */ }
+  const settingsPath = resolve(homedir(), ".claude", "settings.json");
+  try { healInstalledPlugins({ registryPath, pluginCacheRoot, pluginKey }); }
+  catch { /* best effort */ }
+  // v1.0.116: Claude Code's plugin loader reads settings.json.enabledPlugins
+  // (NOT installed_plugins.json) — heal that one too so /ctx-upgrade-induced
+  // disable state is repaired before next /reload-plugins.
+  try { healSettingsEnabledPlugins({ settingsPath, pluginKey }); }
+  catch { /* best effort */ }
 } catch { /* best effort — never block MCP boot */ }
 
 // ── Self-heal Layer 4: Deploy global SessionStart hook + register in settings.json ──
