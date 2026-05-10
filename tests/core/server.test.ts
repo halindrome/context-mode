@@ -4319,4 +4319,50 @@ describe("prose-style policy (#482)", () => {
     expect(readme).not.toMatch(/\*\*Output Compression\*\*/);
     expect(readme).not.toMatch(/terse like caveman/i);
   });
+
+  test("committed bundles (cli/server/hooks) carry no caveman strings", () => {
+    // Defense-in-depth: src/* is stripped, but the npm-shipped bundles are
+    // built artifacts that could lag if a future release rebuilds from a
+    // dirty tree. Lock the deletion to the actually-published files too
+    // (round-5 finding).
+    const bundlePaths = [
+      "../../server.bundle.mjs",
+      "../../cli.bundle.mjs",
+      "../../hooks/session-extract.bundle.mjs",
+      "../../hooks/session-snapshot.bundle.mjs",
+      "../../hooks/session-db.bundle.mjs",
+    ];
+    for (const rel of bundlePaths) {
+      const p = resolve(__dirname, rel);
+      try {
+        const content = readFileSync(p, "utf-8");
+        expect(content).not.toMatch(/terse like caveman/i);
+        expect(content).not.toMatch(/only fluff die/i);
+      } catch (err) {
+        // Bundle missing on this checkout (e.g., fresh clone before
+        // `npm run bundle`). That is fine — CI's Build step generates
+        // them; this test only asserts negative when the file exists.
+        if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+      }
+    }
+  });
+});
+
+// ─────────────────────────────────────────────────────────
+// homedir() import smoke test (round-5 finding from cluster C+E+G).
+// The merge at 43c63cb dropped this import; b8ca35e restored it. A future
+// merge could lose it again silently. Pin the contract: enumerateAdapterDirs
+// must work with a stubbed home and resolve to a path under that home.
+// ─────────────────────────────────────────────────────────
+describe("analytics homedir() import is alive (#43c63cb regression guard)", () => {
+  test("enumerateAdapterDirs() resolves a sessionsDir under the host home", async () => {
+    const { enumerateAdapterDirs } = await import("../../src/session/analytics.js");
+    const { homedir } = await import("node:os");
+    const dirs = enumerateAdapterDirs();
+    expect(dirs.length).toBeGreaterThan(0);
+    // At least one entry must mention the actual home directory — proves
+    // homedir() resolution is wired all the way through.
+    const home = homedir();
+    expect(dirs.every((d) => d.sessionsDir.startsWith(home))).toBe(true);
+  });
 });

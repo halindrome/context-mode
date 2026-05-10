@@ -12,7 +12,7 @@
 import { execFileSync } from "node:child_process";
 import { existsSync, readdirSync, statSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { join, sep } from "node:path";
 import { loadDatabase as loadDatabaseImpl } from "../db-base.js";
 import { resolveClaudeConfigDir } from "../util/claude-config.js";
 
@@ -1548,8 +1548,12 @@ export function detectLocaleAndTz(): { locale: string; tz: string } {
  */
 function shortPath(abs: string): string {
   const home = homedir();
-  if (home && abs === home)            return "~";
-  if (home && abs.startsWith(home + "/")) return "~" + abs.slice(home.length);
+  if (!home) return abs;
+  if (abs === home) return "~";
+  // Use platform separator so `C:\Users\Mert\projects\x` collapses to `~\projects\x`
+  // on Windows; previous `home + "/"` check was vacuously false on Windows and
+  // left full absolute paths in the Section 1 narrative opener (round-5 finding).
+  if (abs.startsWith(home + sep)) return "~" + abs.slice(home.length);
   return abs;
 }
 

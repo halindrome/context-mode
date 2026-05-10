@@ -163,10 +163,11 @@ export interface MinimalHookAPI {
  * lifecycle events to our SessionDB-backed handlers below.
  */
 export default function ompPlugin(pi: MinimalHookAPI): void {
-  const projectDir =
-    process.env.OMP_PROJECT_DIR ||
-    process.env.PI_PROJECT_DIR ||
-    process.cwd();
+  // OMP upstream uses PI_-prefixed env vars only (verified against
+  // can1357/oh-my-pi v3.20.1 — see `packages/utils/src/dirs.ts`). The
+  // earlier `OMP_PROJECT_DIR` read was an EM mistake — no upstream code
+  // ever sets it. Drop it; fall through PI_PROJECT_DIR → cwd().
+  const projectDir = process.env.PI_PROJECT_DIR || process.cwd();
   const db = getOrCreateDB();
 
   // ── 1. session_start — initialize session row ─────────

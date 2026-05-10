@@ -175,6 +175,13 @@ await runHook(async () => {
       // (4 dashes per RFC 4122 8-4-4-4-12), unless it's already older than
       // the 7-day cleanup horizon. Detection-probe orphans like 'pid-12345'
       // (no UUID shape) are still wiped aggressively — they're noise.
+      // Loose 4-dash shape `*-*-*-*-*`. Claude Code session_ids are UUIDs
+      // (5 dash-separated segments) and match. `pid-XXXXX` probes have one
+      // dash and don't match → wiped aggressively. We deliberately keep
+      // this loose so adapters that may eventually share this DB (or reuse
+      // this hook with hybrid `claude-code-...`-style IDs across 15
+      // platforms) aren't accidentally classified as orphans. The 7-day
+      // fallback still wipes truly abandoned UUIDs.
       db.db.exec(`
         DELETE FROM session_events
          WHERE session_id NOT IN (SELECT session_id FROM session_meta)

@@ -98,12 +98,18 @@ export function getWorktreeSuffix(projectDir = process.cwd()): string {
     try {
       const currentRoot = getCurrentWorktreeRoot(projectDir);
       const mainRoot = getMainWorktreeRoot(projectDir);
-      if (
-        currentRoot &&
-        mainRoot &&
-        canonicalizeForCompare(currentRoot) !== canonicalizeForCompare(mainRoot)
-      ) {
-        suffix = `__${createHash("sha256").update(currentRoot).digest("hex").slice(0, 8)}`;
+      if (currentRoot && mainRoot) {
+        // Use the canonicalized currentRoot for BOTH the comparison and the
+        // hash so the suffix DB filename stays stable across casing-variant
+        // calls on the same machine (round-5 finding). Previously the hash
+        // ate raw casing, so the same linked worktree could land at two
+        // different `__<8-hex>` files depending on which casing the caller
+        // passed in.
+        const canonicalCurrent = canonicalizeForCompare(currentRoot);
+        const canonicalMain = canonicalizeForCompare(mainRoot);
+        if (canonicalCurrent !== canonicalMain) {
+          suffix = `__${createHash("sha256").update(canonicalCurrent).digest("hex").slice(0, 8)}`;
+        }
       }
     } catch {
       // git not available or not a git repo — no suffix
