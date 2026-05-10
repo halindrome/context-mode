@@ -27,6 +27,7 @@ import {
   getAvailableLanguages,
 } from "./runtime.js";
 import { getHookScriptPaths } from "./util/hook-config.js";
+import { resolveClaudeConfigDir } from "./util/claude-config.js";
 // Private 16-LOC copy of browserOpenArgv. Canonical version lives in src/server.ts;
 // duplicated here so the cli bundle does not pull server.ts top-level boot side effects.
 // Keep in sync — pure data, no I/O.
@@ -694,7 +695,9 @@ async function upgrade() {
   // commit and CC keeps reporting the old version even after our cache dir is
   // updated — users then see "ctx-upgrade succeeded" but nothing actually
   // changed at the plugin-system level.
-  const marketplaceDir = resolve(homedir(), ".claude", "plugins", "marketplaces", "context-mode");
+  // Issue #460 round-3: route through resolveClaudeConfigDir so users who
+  // relocate their CC config root keep the marketplace clone in the same tree.
+  const marketplaceDir = resolve(resolveClaudeConfigDir(), "plugins", "marketplaces", "context-mode");
   if (existsSync(join(marketplaceDir, ".git"))) {
     s.start("Syncing marketplace clone");
     try {
@@ -880,8 +883,10 @@ async function upgrade() {
 
       // Sync skills to the active install path from installed_plugins.json (#228).
       // Only targets the ACTUAL directory Claude Code reads from — not spraying everywhere.
+      // Issue #460 round-3: honor $CLAUDE_CONFIG_DIR so the registry lookup
+      // tracks relocated CC config trees.
       try {
-        const registryPath = resolve(homedir(), ".claude", "plugins", "installed_plugins.json");
+        const registryPath = resolve(resolveClaudeConfigDir(), "plugins", "installed_plugins.json");
         if (existsSync(registryPath)) {
           const registry = JSON.parse(readFileSync(registryPath, "utf-8"));
           const entries = registry?.plugins?.["context-mode@context-mode"];
@@ -1019,15 +1024,18 @@ function statuslineForward(): void {
   // marketplace clone (#418-synced, stable across upgrades) and to the path
   // Claude Code itself loads from (installed_plugins.json) keeps the bar
   // alive instead of silently going blank.
+  // Issue #460 round-3: marketplace + registry paths must follow
+  // $CLAUDE_CONFIG_DIR so relocated CC trees still find the statusline binary.
+  const claudeRoot = resolveClaudeConfigDir();
   const candidates: string[] = [
     resolve(getPluginRoot(), "bin", "statusline.mjs"),
-    resolve(homedir(), ".claude", "plugins", "marketplaces", "context-mode", "bin", "statusline.mjs"),
+    resolve(claudeRoot, "plugins", "marketplaces", "context-mode", "bin", "statusline.mjs"),
   ];
 
   // installed_plugins.json may list one or more install paths CC actually
   // loads from. Prefer those if they exist.
   try {
-    const registryPath = resolve(homedir(), ".claude", "plugins", "installed_plugins.json");
+    const registryPath = resolve(claudeRoot, "plugins", "installed_plugins.json");
     if (existsSync(registryPath)) {
       const registry = JSON.parse(readFileSync(registryPath, "utf-8"));
       const entries = registry?.plugins?.["context-mode@context-mode"];

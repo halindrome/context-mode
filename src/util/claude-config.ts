@@ -9,9 +9,14 @@
  *
  * Mirrors the contract of `hooks/session-helpers.mjs::resolveConfigDir` and
  * `ClaudeCodeAdapter.getConfigDir`:
- *   - env unset or empty string → ~/.claude
+ *   - env unset, empty string, or whitespace-only → ~/.claude
  *   - env starts with `~`, `~/`, or `~\` → expanded against homedir()
  *   - otherwise → resolved to absolute (relative paths anchor to cwd)
+ *
+ * Whitespace guard: shells that quote-pad the env value (`CLAUDE_CONFIG_DIR=" "`)
+ * would otherwise resolve to `cwd/<spaces>` — silently writing settings into
+ * the project tree. Trim before the truthy check so quote-padding falls back
+ * to `~/.claude` like a sane default.
  *
  * Cross-platform note: tilde regex strips a single leading `/` OR `\` so
  * `~\Users\foo` works on Windows. `path.resolve` handles drive-letter joining.
@@ -21,7 +26,7 @@ import { homedir } from "node:os";
 
 export function resolveClaudeConfigDir(env: NodeJS.ProcessEnv = process.env): string {
   const envVal = env.CLAUDE_CONFIG_DIR;
-  if (envVal) {
+  if (envVal && envVal.trim() !== "") {
     if (envVal.startsWith("~")) {
       return resolve(homedir(), envVal.replace(/^~[/\\]?/, ""));
     }

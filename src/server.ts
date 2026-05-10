@@ -36,6 +36,7 @@ import { buildNodeCommand, type HookAdapter } from "./adapters/types.js";
 import { detectPlatform, getSessionDirSegments } from "./adapters/detect.js";
 import { resolveCodexConfigDir } from "./adapters/codex/paths.js";
 import { getHookScriptPaths } from "./util/hook-config.js";
+import { resolveClaudeConfigDir } from "./util/claude-config.js";
 import { loadDatabase } from "./db-base.js";
 import { AnalyticsEngine, formatReport, getLifetimeStats, OPUS_INPUT_PRICE_PER_TOKEN } from "./session/analytics.js";
 const __pkg_dir = dirname(fileURLToPath(import.meta.url));
@@ -133,14 +134,12 @@ let _insightChild: ChildProcess | null = null;
  * `hooks/session-helpers.mjs::resolveConfigDir` and
  * `ClaudeCodeAdapter.getConfigDir` so the pre-detection path agrees with
  * hooks/adapter on where Claude Code session data lives. See issue #453.
+ *
+ * Issue #460 round-3: delegates to the canonical util so empty/whitespace
+ * env values fall back instead of poisoning downstream `join()` calls.
  */
 function resolveClaudeConfigRoot(): string {
-  const envVal = process.env.CLAUDE_CONFIG_DIR;
-  if (envVal) {
-    if (envVal.startsWith("~")) return join(homedir(), envVal.replace(/^~[/\\]?/, ""));
-    return envVal;
-  }
-  return join(homedir(), ".claude");
+  return resolveClaudeConfigDir();
 }
 
 async function getDiagnosticAdapter(): Promise<HookAdapter | null> {
@@ -386,10 +385,14 @@ function healCacheMidSession(): void {
   if (_cacheHealDone) return;
   _cacheHealDone = true;
   try {
-    const ipPath = resolve(homedir(), ".claude", "plugins", "installed_plugins.json");
+    // Issue #460 round-3: honor $CLAUDE_CONFIG_DIR so users who relocate
+    // their CC config root don't have plugin cache healing operate against
+    // the wrong tree (and silently miss dangling-symlink cleanup).
+    const claudeRoot = resolveClaudeConfigDir();
+    const ipPath = resolve(claudeRoot, "plugins", "installed_plugins.json");
     if (!existsSync(ipPath)) return;
     const ip = JSON.parse(readFileSync(ipPath, "utf-8"));
-    const cacheRoot = resolve(homedir(), ".claude", "plugins", "cache");
+    const cacheRoot = resolve(claudeRoot, "plugins", "cache");
     // Plugin root: build/ for tsc, plugin root for bundle
     const pluginRoot = existsSync(resolve(__pkg_dir, "package.json")) ? __pkg_dir : dirname(__pkg_dir);
     for (const [key, entries] of Object.entries((ip.plugins ?? {}) as Record<string, Array<{ installPath?: string }>>)) {

@@ -103,4 +103,17 @@ describe("CLAUDE_CONFIG_DIR honors getSettingsPath", () => {
       join(homedir(), ".claude", "settings.json"),
     );
   });
+
+  /**
+   * Issue #460 round-3: whitespace-only env values would otherwise resolve
+   * to `<cwd>/<spaces>` because the truthy guard catches them. Trim guard
+   * lives in `resolveClaudeConfigDir`; this test pins the adapter routing
+   * through the util.
+   */
+  it("env=' ' whitespace → falls back to ~/.claude/settings.json", () => {
+    process.env.CLAUDE_CONFIG_DIR = "   ";
+    expect(adapter.getSettingsPath()).toBe(
+      join(homedir(), ".claude", "settings.json"),
+    );
+  });
 });
