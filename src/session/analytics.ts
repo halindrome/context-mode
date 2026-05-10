@@ -1390,6 +1390,95 @@ function formatDuration(uptimeMin: string): string {
 }
 
 /**
+ * One day on the horizontal narrative timeline. `ms` is midnight-UTC of
+ * the day (caller is responsible for normalising); `count` is captures
+ * for that day; `rescueBytes` (when >0) overlays the ◆ /compact glyph.
+ */
+export interface TimelineDay {
+  ms: number;
+  count: number;
+  rescueBytes?: number;
+}
+
+/**
+ * Render the proportional-spacing horizontal day strip used in section 1
+ * of the 5-section narrative. Returns the lines verbatim ready to splice
+ * into the formatReport line buffer:
+ *
+ *     apr 28 ●──────────────────────●────█──────────────────────◆────● may 10
+ *
+ *       apr 28   277 captures
+ *       may 4    438 captures  ← peak
+ *       may 9    261 captures  ◆ /compact rescued 1552 KB
+ *       may 10   100 captures
+ *
+ *     ●  active day      █  peak day      ◆  /compact rescue
+ *
+ * The strip body is exactly 56 chars wide. Day positions are computed as
+ * `round((day - first) / (last - first) * 55)`. Glyph priority for a
+ * column: rescue (◆) > peak (█) > active (●). Filler is the box-drawing
+ * `─` character so the strip reads cleanly in monospace terminals.
+ */
+export function renderHorizontalTimeline(
+  days: TimelineDay[],
+  locale: string,
+  tz: string,
+): string[] {
+  if (days.length === 0) return [];
+  // Sort ascending so first/last bookends + bar positions are stable.
+  const sorted = [...days].sort((a, b) => a.ms - b.ms);
+  const first = sorted[0];
+  const last  = sorted[sorted.length - 1];
+  const span  = Math.max(1, last.ms - first.ms);
+
+  // Locate the peak day (max count). Ties: earliest wins so the visual
+  // pin matches the chronologically first big day.
+  let peak = sorted[0];
+  for (const d of sorted) if (d.count > peak.count) peak = d;
+
+  // Build the 56-char strip body.
+  const WIDTH = 56;
+  const body = Array.from({ length: WIDTH }, () => "─");
+  for (const d of sorted) {
+    const col = Math.round(((d.ms - first.ms) / span) * (WIDTH - 1));
+    let glyph = "●";
+    if (d === peak)               glyph = "█";
+    if ((d.rescueBytes ?? 0) > 0) glyph = "◆"; // rescue beats peak
+    body[col] = glyph;
+  }
+
+  // Lowercase short month names ("apr"/"may"/"jan") matching the target.
+  const monthDay = (ms: number): string => {
+    const dt = new Intl.DateTimeFormat(locale, {
+      timeZone: tz,
+      month: "short",
+      day: "numeric",
+    }).formatToParts(new Date(ms));
+    const month = (dt.find((p) => p.type === "month")?.value ?? "").toLowerCase();
+    const day   = dt.find((p) => p.type === "day")?.value ?? "";
+    return `${month} ${day}`;
+  };
+
+  const out: string[] = [];
+  out.push(`  ${monthDay(first.ms)} ${body.join("")} ${monthDay(last.ms)}`);
+  out.push("");
+
+  // Daily detail rows — count + " ← peak" + "◆ /compact rescued N KB".
+  for (const d of sorted) {
+    const label   = monthDay(d.ms).padEnd(7);
+    const captures = `${d.count} captures`;
+    const peakStr  = d === peak                  ? "  ← peak" : "";
+    const rescue   = (d.rescueBytes ?? 0) > 0
+      ? `  ◆ /compact rescued ${Math.round((d.rescueBytes ?? 0) / 1024)} KB`
+      : "";
+    out.push(`    ${label}  ${captures}${peakStr}${rescue}`);
+  }
+  out.push("");
+  out.push("  ●  active day      █  peak day      ◆  /compact rescue");
+  return out;
+}
+
+/**
  * Render a UTC ms timestamp as a human-readable local datetime string in
  * the canonical Mert-approved format:
  *
