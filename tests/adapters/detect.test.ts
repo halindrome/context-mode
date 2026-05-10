@@ -12,6 +12,7 @@ import { KiroAdapter } from "../../src/adapters/kiro/index.js";
 import { QwenCodeAdapter } from "../../src/adapters/qwen-code/index.js";
 import { JetBrainsCopilotAdapter } from "../../src/adapters/jetbrains-copilot/index.js";
 import { OMPAdapter } from "../../src/adapters/omp/index.js";
+import { PiAdapter } from "../../src/adapters/pi/index.js";
 
 // ─────────────────────────────────────────────────────────
 // detectPlatform — env var detection
@@ -424,6 +425,44 @@ describe("getAdapter", () => {
   it("returns OMPAdapter for omp", async () => {
     const adapter = await getAdapter("omp");
     expect(adapter).toBeInstanceOf(OMPAdapter);
+  });
+
+  it("returns PiAdapter for pi (NOT ClaudeCodeAdapter — bug B2 fix)", async () => {
+    // Before this fix, getAdapter("pi") fell through to default and
+    // returned ClaudeCodeAdapter. That misrouted Pi sessions to
+    // ~/.claude/context-mode/sessions/ instead of ~/.pi/.
+    const adapter = await getAdapter("pi");
+    expect(adapter).toBeInstanceOf(PiAdapter);
+    expect(adapter).not.toBeInstanceOf(ClaudeCodeAdapter);
+  });
+
+  it("clientInfo 'Pi CLI' resolves sessionsDir to ~/.pi/ (end-to-end)", async () => {
+    // Reproduces the exact server.ts:3402-3404 path:
+    //   const clientInfo = server.server.getClientVersion();
+    //   const signal = detectPlatform(clientInfo ?? undefined);
+    //   _detectedAdapter = await getAdapter(signal.platform);
+    // Pi MCP bridge sends clientInfo.name="Pi CLI" per
+    // src/adapters/client-map.ts:25; the resulting sessionsDir MUST
+    // live under ~/.pi, NEVER under ~/.claude.
+    const signal = detectPlatform({ name: "Pi CLI", version: "0.73.0" });
+    expect(signal.platform).toBe("pi");
+
+    const adapter = await getAdapter(signal.platform);
+    expect(adapter).toBeInstanceOf(PiAdapter);
+
+    const sessionsDir = adapter.getSessionDir();
+    expect(sessionsDir).toContain(".pi");
+    expect(sessionsDir).not.toContain(".claude");
+    expect(sessionsDir.endsWith(`/.pi/context-mode/sessions`)).toBe(true);
+  });
+
+  it("clientInfo 'Pi Coding Agent' resolves sessionsDir to ~/.pi/", async () => {
+    // Second alias from src/adapters/client-map.ts:26.
+    const signal = detectPlatform({ name: "Pi Coding Agent", version: "1.0" });
+    expect(signal.platform).toBe("pi");
+    const adapter = await getAdapter(signal.platform);
+    expect(adapter.getSessionDir()).toContain(".pi");
+    expect(adapter.getSessionDir()).not.toContain(".claude");
   });
 
   it("returns ClaudeCodeAdapter for unknown platform", async () => {
