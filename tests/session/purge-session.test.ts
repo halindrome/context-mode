@@ -464,3 +464,34 @@ describe("purgeSession — issue #520 slice 1: requires sessionId for scope:'ses
     })).toThrow(TypeError);
   });
 });
+
+// Slice 2 — scoped wipe deletes target session's session_events rows
+// but preserves rows for OTHER sessions in the same project DB.
+describe("purgeSession — issue #520 slice 2: per-session DB row wipe", () => {
+  it("wipes target session_events rows; sibling session preserved", async () => {
+    const { SessionDB } = await import("../../src/session/db.js");
+    const projectDir = makeRepo("i520s2");
+    const sessionsDir = makeTmpDir("sess-i520s2");
+    const suffix = getWorktreeSuffix(projectDir);
+    const canonicalHash = hashProjectDirCanonical(projectDir);
+    const dbPath = join(sessionsDir, `${canonicalHash}${suffix}.db`);
+
+    // Seed two sessions into the project DB. Use distinct data_hash values
+    // to bypass the SessionDB dedup window (same type+hash collapses).
+    const seed = new SessionDB({ dbPath });
+    seed.insertEvent("scratch", { type: "file", category: "file", data: "/scratch/x.ts", priority: 2 }, "PreToolUse");
+    seed.insertEvent("scratch", { type: "file", category: "file", data: "/scratch/y.ts", priority: 2 }, "PreToolUse");
+    seed.insertEvent("main",    { type: "file", category: "file", data: "/main/z.ts",    priority: 2 }, "PreToolUse");
+    seed.close(); // close() releases handle but preserves the file
+
+    purgeSession({ projectDir, sessionsDir, scope: "session", sessionId: "scratch" });
+
+    // Reopen and verify
+    const verify = new SessionDB({ dbPath });
+    expect(verify.getEvents("scratch")).toHaveLength(0);
+    expect(verify.getEvents("main")).toHaveLength(1);
+    verify.close();
+    // DB file MUST still exist — scoped purge does not wipe the file
+    expect(existsSync(dbPath)).toBe(true);
+  });
+});

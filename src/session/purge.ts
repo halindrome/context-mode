@@ -32,12 +32,13 @@
  *     sweep collapses into a single unique-path pass.
  */
 
-import { unlinkSync } from "node:fs";
+import { existsSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
 import {
   getWorktreeSuffix,
   hashProjectDirCanonical,
   hashProjectDirLegacy,
+  SessionDB,
 } from "./db.js";
 
 /** Canonical SQLite sidecar suffixes. The empty string is the main DB. */
@@ -189,6 +190,43 @@ export function purgeSession(opts: PurgeOpts): PurgeResult {
       "purgeSession: scope:'session' requires sessionId. " +
       "Pass scope:'project' for the legacy whole-project wipe."
     );
+  }
+
+  // ── Session-scoped path (issue #520). ─────────────────────────────────
+  // Wipe ONLY this sessionId's rows from the project's SessionDB. The DB
+  // file itself, the events.md sidecar, the FTS5 store, and the stats
+  // file are all left intact — those are project-scoped concerns. The
+  // label "session rows for <id>" appears once when at least one row was
+  // removed, mirroring the project-scoped UI contract.
+  if (effectiveScope === "session" && sessionId) {
+    const worktreeSuffix = getWorktreeSuffix(projectDir);
+    const canonicalHash = hashProjectDirCanonical(projectDir);
+    const legacyHash = hashProjectDirLegacy(projectDir);
+    const hashes = canonicalHash === legacyHash
+      ? [canonicalHash]
+      : [canonicalHash, legacyHash];
+    let rowsRemoved = false;
+    for (const h of hashes) {
+      const dbPath = join(sessionsDir, `${h}${worktreeSuffix}.db`);
+      if (!existsSync(dbPath)) continue;
+      let db: SessionDB | null = null;
+      try {
+        db = new SessionDB({ dbPath });
+        const before = db.getEvents(sessionId).length;
+        db.deleteSession(sessionId);
+        if (before > 0) rowsRemoved = true;
+      } catch {
+        // Best-effort — corrupt DB is logged elsewhere; do not block purge.
+      } finally {
+        // close() releases the handle WITHOUT deleting the file —
+        // this is what makes the scoped wipe non-destructive at the
+        // file-system level. Using cleanup() here would erase the
+        // entire DB (main + WAL + SHM), defeating per-session scope.
+        try { db?.close(); } catch { /* best effort */ }
+      }
+    }
+    if (rowsRemoved) deleted.push(`session rows for ${sessionId}`);
+    return { deleted, wipedPaths };
   }
 
   // ── 1. Knowledge base FTS5 store (per-platform). ──────────────────────
