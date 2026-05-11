@@ -49,6 +49,39 @@ describe("package.json `version` script `git add` list", () => {
   });
 });
 
+describe("shipped manifests are in lockstep with package.json", () => {
+  // Catches drift like `.cursor-plugin/plugin.json` stuck at v1.0.111
+  // while package.json was at v1.0.118 — happened because the cursor
+  // manifest was missing from the npm `version` lifecycle `git add` list
+  // so even though version-sync rewrote it, the change was never staged.
+  const pkg = JSON.parse(readFileSync(resolve(REPO_ROOT, "package.json"), "utf8")) as {
+    version: string;
+  };
+  const SHIPPED = [
+    ".claude-plugin/plugin.json",
+    ".claude-plugin/marketplace.json",
+    ".cursor-plugin/plugin.json",
+    ".codex-plugin/plugin.json",
+    ".codex-plugin/marketplace.json",
+    ".openclaw-plugin/openclaw.plugin.json",
+    ".openclaw-plugin/package.json",
+    "openclaw.plugin.json",
+    ".pi/extensions/context-mode/package.json",
+  ];
+  for (const manifest of SHIPPED) {
+    it(`${manifest} matches package.json version`, () => {
+      const content = JSON.parse(readFileSync(resolve(REPO_ROOT, manifest), "utf8")) as {
+        version?: string;
+        metadata?: { version?: string };
+        plugins?: Array<{ version?: string }>;
+      };
+      const reported = content.version ?? content.metadata?.version ?? content.plugins?.[0]?.version;
+      expect(reported, `${manifest} has no recognizable version field`).toBeDefined();
+      expect(reported).toBe(pkg.version);
+    });
+  }
+});
+
 describe("version-sync end-to-end", () => {
   it("rewrites every manifest (including .cursor-plugin and .codex-plugin) to the package.json version", () => {
     // Copy a minimal subset of the repo into a scratch dir, then run
