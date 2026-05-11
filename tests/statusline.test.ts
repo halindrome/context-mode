@@ -33,6 +33,8 @@ import { join, resolve, delimiter } from "node:path";
 import { spawnSync } from "node:child_process";
 import Database from "better-sqlite3";
 
+import { buildIsolatedEnvObject } from "./util/isolated-env.js";
+
 const STATUSLINE = resolve(
   process.cwd(),
   "bin",
@@ -106,14 +108,17 @@ function seedDb(opts: {
   return dbPath;
 }
 
-// Isolate the spawned statusline's HOME so getMultiAdapterLifetimeStats()
-// — which scans `~/.{adapter}/context-mode/sessions/` — cannot leak data
-// from concurrently-running tests (or the developer's real adapter dirs)
-// into render decisions. Tests that intentionally seed a multi-adapter
-// homedir must pass their own HOME/USERPROFILE in `env` to override this.
+// Isolate the spawned statusline's env so getMultiAdapterLifetimeStats()
+// (which scans `~/.{adapter}/context-mode/sessions/`) and OpenCode's
+// getConfigDir (which reads APPDATA / XDG_CONFIG_HOME) cannot leak data from
+// concurrently-running tests (or the developer's real adapter dirs) into
+// render decisions. Crucially we set APPDATA/LOCALAPPDATA/XDG_* alongside
+// HOME/USERPROFILE — on Windows the latter alone was insufficient and PR
+// #515's BRAND_NEW assertion fell through. Tests that intentionally seed a
+// multi-adapter homedir pass their own HOME/USERPROFILE in `env` to override
+// this baseline (last spread in spawn `env` wins).
 function isolatedHomeEnv(): Record<string, string> {
-  const isoHome = mkdtempSync(join(tmpdir(), "ctx-statusline-iso-home-"));
-  return { HOME: isoHome, USERPROFILE: isoHome };
+  return buildIsolatedEnvObject().env;
 }
 
 function runStatusline(env: Record<string, string>) {
