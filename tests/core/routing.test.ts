@@ -292,6 +292,22 @@ describe("Bash structurally-bounded allowlist: extended commands (#517)", () => 
       expect(decision, `expected null for ${command}`).toBeNull();
     }
   });
+
+  it("ln -s a b → no nudge; ln -v a b → still nudged (verbose floods)", () => {
+    // Mirrors cp/mv/rm discipline (#470 defense): ln is silent on success,
+    // but `-v` / `--verbose` prints one line per link — flooding on bulk
+    // symlink operations. The "silent" invariant only holds without -v.
+    for (const command of ["ln -s a b", "ln a b", "ln -sf /src /dst"]) {
+      resetGuidanceThrottle(SID);
+      const decision = routePreToolUse("Bash", { command }, "/test", "claude-code", SID);
+      expect(decision, `expected null for ${command}`).toBeNull();
+    }
+    for (const command of ["ln -v a b", "ln -sv a b", "ln --verbose a b"]) {
+      resetGuidanceThrottle(SID);
+      const decision = routePreToolUse("Bash", { command }, "/test", "claude-code", SID);
+      expect(decision?.action, `expected nudge for ${command}`).toBe("context");
+    }
+  });
 });
 
 describe("Bash structurally-bounded allowlist: newline injection (#470)", () => {
