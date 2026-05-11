@@ -2334,6 +2334,25 @@ describe("Platform-aware session paths via adapter", () => {
     expect(utilSrc).not.toContain("OPENCLAW_HOME");
   });
 
+  // Issue #521 Slice 2: transcriptsRoot is the Claude Code transcript dir
+  // (`~/.claude/projects`). Passing it on non-Claude-Code platforms (Cursor,
+  // OpenCode, Codex, ...) is wrong — the most-recently-modified jsonl could
+  // belong to an unrelated Claude Code window, returning that project's cwd
+  // to a Cursor MCP. getProjectDir() MUST gate transcriptsRoot on the active
+  // platform via detectPlatform(); only "claude-code" gets the path.
+  test("getProjectDir gates transcriptsRoot on detected platform (Claude Code only)", () => {
+    const fn = serverSrc.match(/function getProjectDir[\s\S]*?^}/m);
+    expect(fn).not.toBeNull();
+    const body = fn![0];
+    // Must reference detectPlatform so the gate is dynamic per-process.
+    expect(body).toContain("detectPlatform");
+    // Must check for the claude-code platform string (literal — pinning the
+    // gate predicate so a typo or platform-id rename is caught here).
+    expect(body).toContain("claude-code");
+    // Still passes transcriptsRoot when the gate matches.
+    expect(body).toContain("transcriptsRoot");
+  });
+
   // ── Content DB is platform-isolated (not shared) ──
   test("getStorePath uses platform-specific dir, not shared ~/.context-mode/", () => {
     const fn = serverSrc.match(/function getStorePath[\s\S]*?^}/m);
