@@ -584,4 +584,33 @@ describe("healPluginJsonMcpServers (Issue #523)", () => {
     });
   });
 
+  // Slice 6 — Windows path: handles AppData\Local\Temp\ prefix.
+  it("Windows path: handles AppData\\Local\\Temp\\ prefix", () => {
+    const cacheRoot = makeTmp("ctx-issue523-cache-");
+    const pluginRoot = resolve(
+      cacheRoot,
+      "context-mode",
+      "context-mode",
+      "1.0.118",
+    );
+    mkdirSync(pluginRoot, { recursive: true });
+    const winPoisoned =
+      "C:\\Users\\Mert\\AppData\\Local\\Temp\\context-mode-upgrade-1747000000000\\start.mjs";
+    const pluginJsonPath = buildPoisonedPluginJson({
+      pluginRoot,
+      args0: winPoisoned,
+    });
+
+    const result = healPluginJsonMcpServers({
+      pluginRoot,
+      pluginCacheRoot: cacheRoot,
+      pluginKey: "context-mode@context-mode",
+    });
+
+    expect(result.healed).toContain("plugin-json-args");
+    const after = JSON.parse(readFileSync(pluginJsonPath, "utf-8"));
+    expect(after.mcpServers["context-mode"].args[0]).toBe(
+      "${CLAUDE_PLUGIN_ROOT}/start.mjs",
+    );
+  });
 });
