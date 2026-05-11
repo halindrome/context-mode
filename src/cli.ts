@@ -14,7 +14,7 @@
 
 import * as p from "@clack/prompts";
 import color from "picocolors";
-import { execFileSync, execFile as nodeExecFile } from "node:child_process";
+import { execFileSync, execSync, execFile as nodeExecFile, type ExecSyncOptions } from "node:child_process";
 import { readFileSync, writeFileSync, cpSync, accessSync, existsSync, readdirSync, rmSync, closeSync, openSync, chmodSync, mkdirSync, constants } from "node:fs";
 import { request as httpsRequest } from "node:https";
 import { resolve, dirname, join } from "node:path";
@@ -178,11 +178,16 @@ export function npmExecFile(args: string[], opts: Record<string, unknown> = {}):
 }
 
 export function npmExec(command: string, opts: Record<string, unknown> = {}): void {
-  const { execSync: es } = require("node:child_process");
-  es(isWin ? command.replace(/^npm /, "npm.cmd ") : command, {
+  // Issue #511: use top-level static import (line 17) — never inline `require("node:...")`
+  // in ESM-bundled sources. esbuild rewrites them to a `__require` shim that throws
+  // `Dynamic require of "node:child_process" is not supported` under Node ESM/Bun.
+  // Cast preserves the prior `require()`-as-`any` shape; `shell: true` is the documented
+  // Node behavior even though @types/node typed `shell` as `string | undefined`.
+  const execOpts = {
     ...opts,
     ...(isWin ? { shell: true } : {}),
-  });
+  } as unknown as ExecSyncOptions;
+  execSync(isWin ? command.replace(/^npm /, "npm.cmd ") : command, execOpts);
 }
 
 /**
