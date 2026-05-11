@@ -90,4 +90,33 @@ describe("assert-bundle script", () => {
       rmSync(dir, { recursive: true, force: true });
     }
   });
+
+  // Slice 4 — regression guard against the current production bundles.
+  //
+  // EXPECTED RED until the Issue #511 ESM sweep agent merges its branch
+  // with createRequire fixes for src/server.ts and src/cli.ts. Once both
+  // bundles are rebuilt without the shim, this test goes green and
+  // permanently locks the invariant.
+  //
+  // Do NOT skip this test — its red state is the *forcing function* that
+  // makes the sweep agent's work load-bearing. Skipping it removes the
+  // safety net that proves G3 is wired correctly to real bundles.
+  it("current production bundles pass the assert-bundle clean check", () => {
+    const repoRoot = resolve(__dirname, "../..");
+    const bundles = [
+      "server.bundle.mjs",
+      "cli.bundle.mjs",
+      "hooks/session-extract.bundle.mjs",
+      "hooks/session-snapshot.bundle.mjs",
+      "hooks/session-db.bundle.mjs",
+    ].map((p) => join(repoRoot, p));
+
+    const r = runAssert(...bundles);
+    if (r.status !== 0) {
+      // Surface the exact violations so the failing CI line is actionable.
+      console.error(r.stdout);
+      console.error(r.stderr);
+    }
+    expect(r.status).toBe(0);
+  });
 });
