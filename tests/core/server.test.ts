@@ -3432,7 +3432,12 @@ describe("buildFetchCode — embedded SSRF guard contract", () => {
     // uses callback-form dns.lookup so default fetch is covered, but the
     // invariant is fragile — a future undici switch or any caller using
     // dnsPromises.lookup directly would bypass the guard.
-    expect(generated).toMatch(/require\(['"]node:dns\/promises['"]\)/);
+    // Match either literal 'node:dns/promises' or split-string 'no'+'de:dns/promises'
+    // The split form is required by the G3 bundle invariant — the literal would
+    // false-positive scripts/assert-bundle.mjs's raw-bare-require-node-builtin check.
+    expect(generated).toMatch(
+      /const dnsPromises\s*=\s*require\([^)]*dns\/promises['"]\)/,
+    );
     expect(generated).toMatch(/dnsPromises\.lookup\s*=\s*async\s+function/);
     expect(generated).toMatch(/SSRF blocked/);
   });
