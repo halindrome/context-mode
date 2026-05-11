@@ -466,7 +466,32 @@ async function doctor(): Promise<number> {
     }
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : String(err);
-    if (message.includes("Cannot find module") || message.includes("MODULE_NOT_FOUND")) {
+    // Distinguish package-missing from binding-missing (#514). Both
+    // throw with similar shapes from `import("better-sqlite3")` but the
+    // recovery commands differ:
+    //   - package-missing → `npm install better-sqlite3 --no-optional`
+    //     (npm@7+ silently drops optionalDependencies on engine
+    //     mismatch, e.g. Node 26 vs better-sqlite3@12.x — we name the
+    //     package explicitly + flip the optional filter to recover)
+    //   - binding-missing → `npm rebuild better-sqlite3` (#408 flow,
+    //     Windows + missing prebuild-install shim)
+    const pluginRootForDoctor = getPluginRoot();
+    const bsqPackageDir = resolve(pluginRootForDoctor, "node_modules", "better-sqlite3");
+    const packageMissing = !existsSync(bsqPackageDir);
+
+    if (packageMissing) {
+      criticalFails++;
+      p.log.error(
+        color.red("FTS5 / better-sqlite3: FAIL") +
+          color.dim(" — package-missing") +
+          color.dim(
+            `\n  Path: ${bsqPackageDir}` +
+            "\n  Root cause: npm silently skipped better-sqlite3 because the package's `engines` field excluded the running Node (issue #514, e.g. Node 26 vs better-sqlite3@12.x)." +
+            `\n  Try (primary): cd "${pluginRootForDoctor}" && npm install better-sqlite3 --no-optional` +
+            "\n  Try (fallback): /context-mode:ctx-upgrade",
+          ),
+      );
+    } else if (message.includes("Cannot find module") || message.includes("MODULE_NOT_FOUND")) {
       p.log.warn(color.yellow("FTS5 / better-sqlite3: SKIP") + color.dim(" — module not available (restart session after upgrade)"));
     } else {
       criticalFails++;
