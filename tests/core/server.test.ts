@@ -2324,6 +2324,7 @@ describe("Platform-aware session paths via adapter", () => {
       "OPENCODE_PROJECT_DIR",
       "PI_PROJECT_DIR",
       "IDEA_INITIAL_DIRECTORY",
+      "CURSOR_CWD",
       "CONTEXT_MODE_PROJECT_DIR",
     ]) {
       expect(utilSrc).toContain(v);
