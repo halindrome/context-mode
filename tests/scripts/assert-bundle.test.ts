@@ -1,7 +1,7 @@
 import "../setup-home";
 import { describe, it, expect } from "vitest";
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
@@ -45,6 +45,31 @@ describe("assert-bundle script", () => {
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+
+  it("is wired into package.json so the build chain runs it after bundle", () => {
+    const pkgPath = resolve(__dirname, "../../package.json");
+    const pkg = JSON.parse(readFileSync(pkgPath, "utf-8")) as {
+      scripts?: Record<string, string>;
+    };
+    const scripts = pkg.scripts ?? {};
+    // Must expose a dedicated `assert-bundle` script that targets every
+    // produced bundle.
+    expect(scripts["assert-bundle"]).toBeDefined();
+    expect(scripts["assert-bundle"]).toMatch(/scripts\/assert-bundle\.mjs/);
+    expect(scripts["assert-bundle"]).toMatch(/server\.bundle\.mjs/);
+    expect(scripts["assert-bundle"]).toMatch(/cli\.bundle\.mjs/);
+    expect(scripts["assert-bundle"]).toMatch(/hooks\/.*\.bundle\.mjs/);
+
+    // The build chain must invoke it. Either `build` calls `assert-bundle`
+    // directly, or a `postbundle` / `postbuild` script does so. Any of those
+    // is acceptable — what matters is that `npm run build` ends with the
+    // assertion.
+    const wired =
+      /assert-bundle/.test(scripts.build ?? "") ||
+      /assert-bundle/.test(scripts.postbuild ?? "") ||
+      /assert-bundle/.test(scripts.postbundle ?? "");
+    expect(wired).toBe(true);
   });
 
   it("exits 0 on a clean fixture bundle that uses createRequire", () => {
