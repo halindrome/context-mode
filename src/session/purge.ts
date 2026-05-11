@@ -34,6 +34,7 @@
 
 import { existsSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
+import { loadDatabase } from "../db-base.js";
 import {
   getWorktreeSuffix,
   hashProjectDirCanonical,
@@ -226,6 +227,50 @@ export function purgeSession(opts: PurgeOpts): PurgeResult {
       }
     }
     if (rowsRemoved) deleted.push(`session rows for ${sessionId}`);
+
+    // Per-session FTS5 chunk wipe. The chunks table has a `session_id
+    // UNINDEXED` column (src/store.ts schema). The public index() path
+    // currently inserts NULL — but a future per-session-tagged path
+    // (e.g. tool-call indexing keyed to a session) will populate it,
+    // and the SQL contract here keeps that future correct from day one.
+    // Today this is a safe no-op against existing data.
+    //
+    // Caller is responsible for closing any persistent ContentStore
+    // handle BEFORE invoking purgeSession (Windows file lock). The
+    // ctx_purge handler does this via _store?.cleanup() before delegating.
+    const ftsTargets: string[] = [];
+    if (storePath && existsSync(storePath)) ftsTargets.push(storePath);
+    if (contentDir) {
+      const canonicalH = hashProjectDirCanonical(projectDir);
+      const legacyH    = hashProjectDirLegacy(projectDir);
+      const hh = canonicalH === legacyH ? [canonicalH] : [canonicalH, legacyH];
+      for (const h of hh) {
+        const p = join(contentDir, `${h}.db`);
+        if (existsSync(p) && !ftsTargets.includes(p)) ftsTargets.push(p);
+      }
+    }
+    let chunksRemoved = false;
+    for (const path of ftsTargets) {
+      try {
+        const Database = loadDatabase();
+        const fts = new Database(path, { timeout: 30000 });
+        try {
+          const before = (fts.prepare(
+            "SELECT COUNT(*) AS c FROM chunks WHERE session_id = ?"
+          ).get(sessionId) as { c: number }).c;
+          fts.prepare("DELETE FROM chunks WHERE session_id = ?").run(sessionId);
+          fts.prepare("DELETE FROM chunks_trigram WHERE session_id = ?").run(sessionId);
+          if (before > 0) chunksRemoved = true;
+        } finally {
+          try { fts.close(); } catch { /* best effort */ }
+        }
+      } catch {
+        // Best-effort — schema mismatch / corrupt DB / missing FTS5 must not
+        // block the per-session SessionDB wipe that already succeeded.
+      }
+    }
+    if (chunksRemoved) deleted.push(`FTS5 chunks for ${sessionId}`);
+
     return { deleted, wipedPaths };
   }
 
