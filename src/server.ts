@@ -3045,12 +3045,27 @@ server.registerTool(
       }
     } catch { /* best effort — don't block upgrade */ }
 
+    // Issue #542 — thread MCP clientInfo into the spawned upgrade
+    // process. detectPlatform() runs IN-PROCESS here (no spawn boundary)
+    // so clientInfo from the MCP handshake is the highest-confidence
+    // signal available. We forward the resolved PlatformId as a
+    // --platform flag (cross-shell safe on POSIX, Git Bash, PowerShell,
+    // and cmd.exe — unlike env-var prefixes). If detection fails we
+    // skip the flag and let upgrade()'s own detectPlatform() fall back.
+    let platformFlag = "";
+    try {
+      const { detectPlatform } = await import("./adapters/detect.js");
+      const clientInfo = server.server.getClientVersion();
+      const signal = detectPlatform(clientInfo ?? undefined);
+      platformFlag = ` --platform ${signal.platform}`;
+    } catch { /* best effort — fall back to upgrade()'s own detect */ }
+
     let cmd: string;
 
     if (existsSync(bundlePath)) {
-      cmd = `${buildNodeCommand(bundlePath)} upgrade`;
+      cmd = `${buildNodeCommand(bundlePath)} upgrade${platformFlag}`;
     } else if (existsSync(fallbackPath)) {
-      cmd = `${buildNodeCommand(fallbackPath)} upgrade`;
+      cmd = `${buildNodeCommand(fallbackPath)} upgrade${platformFlag}`;
     } else {
       // Inline fallback: neither CLI file exists (e.g. marketplace installs).
       // Generate a self-contained node -e script that performs the upgrade.
