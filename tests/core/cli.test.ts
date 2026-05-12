@@ -196,11 +196,31 @@ describe(".mcp.json — MCP server config", () => {
     expect(args[0]).toContain("CLAUDE_PLUGIN_ROOT");
   });
 
-  it("repo-root .mcp.json uses relative path to silence CLAUDE_PLUGIN_ROOT warning", () => {
-    const mcp = JSON.parse(readFileSync(resolve(ROOT, ".mcp.json"), "utf-8"));
-    const args = mcp.mcpServers["context-mode"].args;
-    expect(args[0]).not.toContain("CLAUDE_PLUGIN_ROOT");
-    expect(args[0]).toMatch(/^\.\/|^start\.mjs$/);
+  it(".mcp.json.example template MUST use ${CLAUDE_PLUGIN_ROOT} placeholder (closes #531)", () => {
+    // Architectural lock-in after PR #253 (aea633c) regression:
+    // .mcp.json is no longer tracked in source. The canonical template lives
+    // at .mcp.json.example and MUST use the placeholder so that any
+    // contributor or tool that copies it gets the marketplace-correct form.
+    // The placeholder form is what cli.ts upgrade() writes to the plugin
+    // cache (line 843) and what .claude-plugin/plugin.json mcpServers uses.
+    const example = JSON.parse(
+      readFileSync(resolve(ROOT, ".mcp.json.example"), "utf-8"),
+    );
+    const args = example.mcpServers["context-mode"].args;
+    expect(args[0]).toContain("${CLAUDE_PLUGIN_ROOT}");
+    expect(args[0]).toContain("start.mjs");
+  });
+
+  it("package.json files[] MUST NOT ship .mcp.json (architectural lock — closes #531)", () => {
+    // PR #253 flip-flop: source .mcp.json kept switching between the
+    // placeholder form (correct for end-users via marketplace install) and
+    // the relative form (correct for contributors opening the repo as a
+    // regular project). Stop shipping it in the tarball so the two roles
+    // never collide again. End users get MCP via .claude-plugin/plugin.json
+    // and cli.ts upgrade()'s plugin-cache write — both placeholder.
+    const pkg = JSON.parse(readFileSync(resolve(ROOT, "package.json"), "utf-8"));
+    expect(pkg.files).toBeDefined();
+    expect(pkg.files).not.toContain(".mcp.json");
   });
 });
 
