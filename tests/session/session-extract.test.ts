@@ -2569,6 +2569,19 @@ describe("Blocked-On Events", () => {
     assert.equal(blockerEvents.length, 1);
   });
 
+  // ─── Issue #535: Chinese (CJK) blocker patterns ───
+  test("extracts blocker from Chinese 报错 keyword", () => {
+    const events = extractUserEvents("API 报错 了, 部署被阻塞");
+    const blockerEvents = events.filter(e => e.type === "blocker");
+    assert.equal(blockerEvents.length, 1);
+  });
+
+  test("extracts blocker from Chinese 卡住 keyword", () => {
+    const events = extractUserEvents("我卡住了, 等审核");
+    const blockerEvents = events.filter(e => e.type === "blocker");
+    assert.equal(blockerEvents.length, 1);
+  });
+
   // Resolution tests
 
   test("extracts blocker_resolved from 'unblocked' pattern", () => {

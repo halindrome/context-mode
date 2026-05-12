@@ -899,6 +899,8 @@ const BLOCKER_PATTERNS: RegExp[] = [
   // Turkish patterns
   /\bbekliyor\b/i,
   /\bbekliyorum\b/i,
+  // Chinese (CJK) patterns — issue #535. \b is ASCII-only and skips CJK.
+  /报错|卡住|崩溃|失败|无法|阻塞|等待|被卡|出错|阻挡/,
 ];
 
 const BLOCKER_RESOLVED_PATTERNS: RegExp[] = [
