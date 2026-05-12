@@ -13,6 +13,17 @@ import { strict as assert } from "node:assert";
 import { describe, test } from "vitest";
 import { extractUserEvents } from "../../src/session/extract.js";
 import type { SessionEvent } from "../../src/session/extract.js";
+import { buildResumeSnapshot, type StoredEvent } from "../../src/session/snapshot.js";
+
+function makeUserPromptEvent(data: string, isoTimestamp?: string): StoredEvent {
+  return {
+    type: "user_prompt",
+    category: "user-prompt",
+    data,
+    priority: 1,
+    created_at: isoTimestamp ?? new Date().toISOString(),
+  };
+}
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -236,5 +247,46 @@ describe("Slice 8: blocker_resolved — Unicode checkmark or marker prefix", () 
 
   test('a message without checkmark/marker is NOT resolved', () => {
     assert.equal(hasBlockerResolved("the bug is back"), false);
+  });
+});
+
+// ════════════════════════════════════════════════════════════════════════════
+// SLICE 9: <recent_user_messages> raw-prompt fallback in the snapshot
+// ════════════════════════════════════════════════════════════════════════════
+
+describe("Slice 9: recent_user_messages safety-net section", () => {
+  test('buildResumeSnapshot renders the last 3 user prompts verbatim', () => {
+    const events: StoredEvent[] = [
+      makeUserPromptEvent("first prompt that should be dropped"),
+      makeUserPromptEvent("второе сообщение"),
+      makeUserPromptEvent("第三条消息"),
+      makeUserPromptEvent("الرسالة الأخيرة"),
+    ];
+    const xml = buildResumeSnapshot(events);
+
+    assert.ok(xml.includes("<recent_user_messages"), "should emit the section");
+    assert.ok(xml.includes("</recent_user_messages>"), "should close the section");
+    assert.ok(xml.includes("второе сообщение"), "should keep Russian prompt");
+    assert.ok(xml.includes("第三条消息"), "should keep Chinese prompt");
+    assert.ok(xml.includes("الرسالة الأخيرة"), "should keep Arabic prompt");
+    assert.ok(!xml.includes("first prompt that should be dropped"), "should drop older prompts");
+  });
+
+  test('individual prompts longer than 400 chars are truncated', () => {
+    const long = "a".repeat(800);
+    const xml = buildResumeSnapshot([makeUserPromptEvent(long)]);
+    assert.ok(xml.includes("<recent_user_messages"));
+    // The truncated message should be present but shorter than the original.
+    const aRuns = xml.match(/a+/g) ?? [];
+    const longestRun = aRuns.reduce((m, r) => Math.max(m, r.length), 0);
+    assert.ok(
+      longestRun <= 400,
+      `expected longest run of 'a' ≤ 400, got ${longestRun}`,
+    );
+  });
+
+  test('no user_prompt events -> section is omitted', () => {
+    const xml = buildResumeSnapshot([]);
+    assert.equal(xml.includes("<recent_user_messages"), false);
   });
 });
