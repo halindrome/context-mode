@@ -731,7 +731,7 @@ Full configs: [`configs/antigravity/mcp_config.json`](configs/antigravity/mcp_co
      "description": "Context-mode hooks for context window protection",
      "hooks": {
        "preToolUse": [
-         { "matcher": "execute_bash|fs_read|@context-mode/ctx_execute|@context-mode/ctx_execute_file|@context-mode/ctx_batch_execute", "command": "context-mode hook kiro pretooluse" }
+         { "matcher": "execute_bash|fs_read|@context-mode/ctx_execute|@context-mode/ctx_execute_file|@context-mode/ctx_batch_execute|@(?!context-mode/)", "command": "context-mode hook kiro pretooluse" }
        ],
        "postToolUse": [
          { "matcher": "*", "command": "context-mode hook kiro posttooluse" }
