@@ -272,7 +272,11 @@ export function isPiShortCircuitArgv(argv: readonly string[]): boolean {
 export default function piExtension(pi: any): void {
   const buildDir = dirname(fileURLToPath(import.meta.url));
   const pluginRoot = resolve(buildDir, "..", "..", "..");
-  const projectDir = process.env.PI_PROJECT_DIR || process.cwd();
+  // Issue #542 — Pi's runtime sets PI_CONFIG_DIR (not PI_PROJECT_DIR).
+  // PI_PROJECT_DIR remains supported as a legacy override for callers
+  // that historically synthesized it. Cwd is the universal final
+  // fallback.
+  const projectDir = process.env.PI_CONFIG_DIR || process.env.PI_PROJECT_DIR || process.cwd();
 
   const db = getOrCreateDB();
 
