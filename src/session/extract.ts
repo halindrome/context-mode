@@ -873,7 +873,10 @@ function extractUserDecision(message: string): SessionEvent[] {
  *   filter — no per-language keyword list.
  */
 
-const ROLE_MIN_CHARS = 12;
+// Lower bound accommodates information-dense scripts (Chinese, Japanese,
+// Korean) where a complete persona sentence may use as few as 8 codepoints
+// — e.g. "你是高级工程师" — while still excluding bare single-token noise.
+const ROLE_MIN_CHARS = 8;
 const ROLE_MAX_CHARS = 120;
 const TWO_LEXICAL_TOKENS_PATTERN = /\p{L}+\s+\p{L}+/u;
 const CONTINUOUS_LETTER_RUN_PATTERN = /\p{L}{6,}/u;

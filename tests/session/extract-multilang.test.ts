@@ -290,3 +290,146 @@ describe("Slice 9: recent_user_messages safety-net section", () => {
     assert.equal(xml.includes("<recent_user_messages"), false);
   });
 });
+
+// ════════════════════════════════════════════════════════════════════════════
+// SLICE 10: cross-language regression guards — 8 languages × 5 categories
+// ════════════════════════════════════════════════════════════════════════════
+
+/**
+ * Each language contributes one fixture per universal-rule category.
+ * The expectation columns capture the structural shape — not the
+ * spoken-language keyword. If a future refactor preserves the
+ * universal-rule semantics, every fixture stays green; if it drifts
+ * back to keyword matching, this matrix catches the regression.
+ */
+type CategoryExpectation = {
+  intent?: string | null;
+  decision?: boolean;
+  role?: boolean;
+  blocker?: boolean;
+  blockerResolved?: boolean;
+};
+
+const LANGUAGE_MATRIX: Array<{
+  language: string;
+  message: string;
+  expect: CategoryExpectation;
+}> = [
+  // ── English ──
+  { language: "English",  message: "why does the hook not fire?",                       expect: { intent: "investigate" } },
+  { language: "English",  message: "add login page",                                    expect: { intent: "implement" } },
+  { language: "English",  message: "don't use useState, use useReducer instead",        expect: { decision: true } },
+  { language: "English",  message: "You are a senior backend engineer",                 expect: { role: true } },
+  { language: "English",  message: "Error: cannot read property",                       expect: { blocker: true } },
+  { language: "English",  message: "✅ Fixed the auth bug",                             expect: { blockerResolved: true } },
+
+  // ── Turkish ──
+  { language: "Turkish",  message: "neden bu hook çalışmıyor?",                         expect: { intent: "investigate" } },
+  { language: "Turkish",  message: "giriş sayfası ekle",                                expect: { intent: "implement" } },
+  { language: "Turkish",  message: "useState kullanma, useReducer kullan",              expect: { decision: true } },
+  { language: "Turkish",  message: "Sen kıdemli bir backend mühendisisin",              expect: { role: true } },
+  { language: "Turkish",  message: "Exception: NullPointerException",                   expect: { blocker: true } },
+  { language: "Turkish",  message: "fixed: auth hatası giderildi",                      expect: { blockerResolved: true } },
+
+  // ── Chinese ──
+  { language: "Chinese",  message: "为什么这个 hook 没有触发？",                        expect: { intent: "investigate" } },
+  { language: "Chinese",  message: "创建登录页面",                                       expect: { intent: "implement" } },
+  { language: "Chinese",  message: "不要用 setState，用 useReducer",                    expect: { decision: true } },
+  { language: "Chinese",  message: "你是一名资深后端工程师",                            expect: { role: true } },
+  { language: "Chinese",  message: "Error: 找不到模块",                                  expect: { blocker: true } },
+  { language: "Chinese",  message: "fixed: 修复了登录问题",                              expect: { blockerResolved: true } },
+
+  // ── Arabic ──
+  { language: "Arabic",   message: "لماذا لم يعمل هذا؟",                                 expect: { intent: "investigate" } },
+  { language: "Arabic",   message: "أضف صفحة تسجيل الدخول",                              expect: { intent: "implement" } },
+  { language: "Arabic",   message: "لا تستخدم X، استخدم Y بدلاً من ذلك",                expect: { decision: true } },
+  { language: "Arabic",   message: "أنت مهندس واجهات خلفية محترف",                       expect: { role: true } },
+  { language: "Arabic",   message: "Traceback (most recent call last):",                expect: { blocker: true } },
+  { language: "Arabic",   message: "✓ تم الإصلاح",                                       expect: { blockerResolved: true } },
+
+  // ── Russian ──
+  { language: "Russian",  message: "почему этот хук не срабатывает?",                   expect: { intent: "investigate" } },
+  { language: "Russian",  message: "добавь страницу входа",                              expect: { intent: "implement" } },
+  { language: "Russian",  message: "не используй X, используй Y вместо",                expect: { decision: true } },
+  { language: "Russian",  message: "Ты опытный backend-инженер",                        expect: { role: true } },
+  { language: "Russian",  message: "Error: модуль не найден",                            expect: { blocker: true } },
+  { language: "Russian",  message: "resolved: кеш починили",                             expect: { blockerResolved: true } },
+
+  // ── Spanish ──
+  { language: "Spanish",  message: "¿por qué falla esto?",                              expect: { intent: "investigate" } },
+  { language: "Spanish",  message: "crear página de inicio",                            expect: { intent: "implement" } },
+  { language: "Spanish",  message: "no uses useState, usa useReducer en su lugar",      expect: { decision: true } },
+  { language: "Spanish",  message: "Eres un ingeniero backend senior",                  expect: { role: true } },
+  { language: "Spanish",  message: "Error: módulo no encontrado",                       expect: { blocker: true } },
+  { language: "Spanish",  message: "🎉 listo en producción",                            expect: { blockerResolved: true } },
+
+  // ── Hindi ──
+  { language: "Hindi",    message: "यह hook क्यों नहीं चलता?",                            expect: { intent: "investigate" } },
+  { language: "Hindi",    message: "लॉगिन पेज जोड़ो",                                    expect: { intent: "implement" } },
+  { language: "Hindi",    message: "useState मत लो, useReducer लो",                     expect: { decision: true } },
+  { language: "Hindi",    message: "तुम एक senior backend इंजीनियर हो",                  expect: { role: true } },
+  { language: "Hindi",    message: "Exception: कनेक्शन टूट गया",                          expect: { blocker: true } },
+  { language: "Hindi",    message: "✅ बग ठीक हो गया",                                    expect: { blockerResolved: true } },
+
+  // ── Japanese ──
+  { language: "Japanese", message: "なぜこのフックは動かない？",                          expect: { intent: "investigate" } },
+  { language: "Japanese", message: "ログインページを作って",                              expect: { intent: "implement" } },
+  { language: "Japanese", message: "useState を使わないで、useReducer を使って",          expect: { decision: true } },
+  { language: "Japanese", message: "あなたは経験豊富なエンジニアです",                    expect: { role: true } },
+  { language: "Japanese", message: "Error: モジュールが見つかりません",                    expect: { blocker: true } },
+  { language: "Japanese", message: "fixed: ログインのバグを修正",                          expect: { blockerResolved: true } },
+];
+
+describe("Slice 10: 8-language × 5-category regression matrix", () => {
+  for (const { language, message, expect: expected } of LANGUAGE_MATRIX) {
+    test(`${language} :: "${message.slice(0, 40)}…"`, () => {
+      const events = extractUserEvents(message);
+
+      if (expected.intent !== undefined) {
+        const got = events.find(e => e.type === "intent")?.data;
+        assert.equal(got, expected.intent ?? undefined, `intent: ${language}`);
+      }
+      if (expected.decision !== undefined) {
+        const has = Boolean(events.find(e => e.type === "decision"));
+        assert.equal(has, expected.decision, `decision: ${language}`);
+      }
+      if (expected.role !== undefined) {
+        const has = Boolean(events.find(e => e.type === "role"));
+        assert.equal(has, expected.role, `role: ${language}`);
+      }
+      if (expected.blocker !== undefined) {
+        const has = Boolean(events.find(e => e.type === "blocker"));
+        assert.equal(has, expected.blocker, `blocker: ${language}`);
+      }
+      if (expected.blockerResolved !== undefined) {
+        const has = Boolean(events.find(e => e.type === "blocker_resolved"));
+        assert.equal(has, expected.blockerResolved, `blocker_resolved: ${language}`);
+      }
+    });
+  }
+
+  test('non-English recall is non-zero across every detector', () => {
+    // Recall sanity check across all 7 non-English languages.
+    const buckets: Record<string, number> = {
+      investigate: 0,
+      implement: 0,
+      decision: 0,
+      role: 0,
+      blocker: 0,
+      blocker_resolved: 0,
+    };
+    for (const { language, message, expect: expected } of LANGUAGE_MATRIX) {
+      if (language === "English") continue;
+      const events = extractUserEvents(message);
+      if (expected.intent === "investigate" && events.find(e => e.type === "intent" && e.data === "investigate")) buckets.investigate++;
+      if (expected.intent === "implement"   && events.find(e => e.type === "intent" && e.data === "implement"))   buckets.implement++;
+      if (expected.decision && events.find(e => e.type === "decision")) buckets.decision++;
+      if (expected.role     && events.find(e => e.type === "role"))     buckets.role++;
+      if (expected.blocker  && events.find(e => e.type === "blocker"))  buckets.blocker++;
+      if (expected.blockerResolved && events.find(e => e.type === "blocker_resolved")) buckets.blocker_resolved++;
+    }
+    for (const [bucket, count] of Object.entries(buckets)) {
+      assert.ok(count >= 5, `${bucket} recall should be ≥5 across 7 non-EN languages, got ${count}`);
+    }
+  });
+});
