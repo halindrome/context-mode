@@ -1180,7 +1180,11 @@ describe("Shell-free upgrade (#185)", () => {
     const entryBody = CLI_SOURCE.slice(entryStart, CLI_SOURCE.indexOf("/* -------------------------------------------------------", entryStart + 20));
 
     expect(entryBody).toContain('} else if (args[0] === "upgrade") {');
-    expect(entryBody).toContain("upgrade().catch((err: unknown) => {");
+    // Issue #542 — entrypoint now forwards optional --platform <id> from
+    // the ctx_upgrade MCP handler. Match either invocation shape:
+    //   upgrade().catch(...)                      (legacy)
+    //   upgrade(... ? { platform: ... } : ...).catch(...)  (issue #542)
+    expect(entryBody).toMatch(/upgrade\([^)]*\)\.catch\(\(err: unknown\) => \{/);
     expect(entryBody).toContain("process.exit(1);");
   });
 
