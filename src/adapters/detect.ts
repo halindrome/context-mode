@@ -7,7 +7,8 @@
  *   3. Fallback to Claude Code (low confidence — most common)
  *
  * Verified env vars per platform (from source code audit):
- *   - Claude Code:    CLAUDE_PROJECT_DIR, CLAUDE_SESSION_ID | ~/.claude/
+ *   - Claude Code:    CLAUDE_CODE_ENTRYPOINT, CLAUDE_PLUGIN_ROOT,
+ *                     CLAUDE_PROJECT_DIR, CLAUDE_SESSION_ID | ~/.claude/
  *   - Gemini CLI:     GEMINI_PROJECT_DIR (hooks), GEMINI_CLI (MCP) | ~/.gemini/
  *   - KiloCode:       KILO, KILO_PID | ~/.config/kilo/
  *   - OpenCode:       OPENCODE, OPENCODE_PID | ~/.config/opencode/
@@ -18,12 +19,64 @@
  *   - JetBrains Copilot: IDEA_INITIAL_DIRECTORY, IDEA_HOME, JETBRAINS_CLIENT_ID | ~/.config/JetBrains/
  */
 
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { homedir } from "node:os";
 
 import type { PlatformId, DetectionSignal, HookAdapter } from "./types.js";
 import { CLIENT_NAME_TO_PLATFORM } from "./client-map.js";
+
+/**
+ * Issue #539 — fallback disambiguator. When env-var detection would
+ * otherwise resolve to vscode-copilot (because Microsoft's `code` exports
+ * VSCODE_PID into every spawned child), we look at
+ * ~/.claude/plugins/installed_plugins.json. If that file lists context-mode
+ * as an installed plugin, the runtime MUST be Claude Code — VS Code Copilot
+ * has no concept of Claude plugins. Memoized per-process: the file is read
+ * at most once, with a tri-state cache so a missing/malformed file does not
+ * trigger repeated I/O on the detect() hot path.
+ */
+type PluginCache = { hasCM: boolean } | "miss" | null;
+let claudeCodePluginCache: PluginCache = null;
+
+function claudeCodeHasContextModePlugin(): boolean {
+  if (claudeCodePluginCache !== null) {
+    return claudeCodePluginCache !== "miss" && claudeCodePluginCache.hasCM;
+  }
+  try {
+    const path = resolve(homedir(), ".claude", "plugins", "installed_plugins.json");
+    const raw = readFileSync(path, "utf-8");
+    const parsed = JSON.parse(raw) as {
+      plugins?: Record<string, unknown>;
+      enabledPlugins?: Record<string, unknown>;
+    };
+    const keys = [
+      ...Object.keys(parsed.plugins ?? {}),
+      ...Object.keys(parsed.enabledPlugins ?? {}),
+    ];
+    const hasCM = keys.some((k) => k.includes("context-mode"));
+    claudeCodePluginCache = { hasCM };
+    return hasCM;
+  } catch {
+    claudeCodePluginCache = "miss";
+    return false;
+  }
+}
+
+/** Test-only: reset the installed_plugins.json memo so each test starts cold. */
+export function __resetClaudeCodePluginCacheForTests(): void {
+  claudeCodePluginCache = null;
+}
+
+/**
+ * Test-only: pretend installed_plugins.json does not exist (or has no
+ * context-mode entry). Lets tests that exercise the genuine vscode-copilot
+ * env-var path run on a developer machine that actually has context-mode
+ * installed as a Claude Code plugin.
+ */
+export function __seedClaudeCodePluginCacheMissForTests(): void {
+  claudeCodePluginCache = "miss";
+}
 
 /**
  * High-confidence env vars per platform, checked in priority order.
@@ -34,7 +87,22 @@ export const PLATFORM_ENV_VARS = [
   // Order matters: forks listed BEFORE the fork's parent so collision
   // detection works. Every entry verified against platform's own runtime
   // source code (PR #376 follow-up: full audit, May 2026 — see git blame).
-  ["claude-code",        ["CLAUDE_PROJECT_DIR", "CLAUDE_SESSION_ID"]],
+  // Claude Code — verified against a live `env` dump (2026-05-11):
+  //   CLAUDE_CODE_ENTRYPOINT=cli              (set on every CC session)
+  //   CLAUDE_PLUGIN_ROOT=/Users/.../<version>  (set when a plugin is loaded)
+  //   CLAUDE_PROJECT_DIR=/Users/.../project    (set in hooks context)
+  //   CLAUDE_SESSION_ID=<uuid>                 (legacy session marker)
+  // CLAUDE_CODE_ENTRYPOINT and CLAUDE_PLUGIN_ROOT are CC-exclusive — they
+  // are the disambiguators for issue #539 (Claude Code running inside a
+  // VS Code integrated terminal that has VSCODE_PID set). They MUST be
+  // checked here so detect resolves to claude-code BEFORE falling through
+  // to vscode-copilot at line 70 below.
+  ["claude-code",        [
+    "CLAUDE_CODE_ENTRYPOINT",
+    "CLAUDE_PLUGIN_ROOT",
+    "CLAUDE_PROJECT_DIR",
+    "CLAUDE_SESSION_ID",
+  ]],
   // antigravity (Electron/VSCode fork) — google-gemini/gemini-cli
   // packages/core/src/ide/detect-ide.ts checks ANTIGRAVITY_CLI_ALIAS as the
   // canonical Antigravity marker. Listed before vscode-copilot.
@@ -157,6 +225,23 @@ export function detectPlatform(clientInfo?: { name: string; version?: string }):
 
   for (const [platform, vars] of PLATFORM_ENV_VARS) {
     if (vars.some((v) => process.env[v])) {
+      // Issue #539 belt-and-suspenders: VSCODE_PID/VSCODE_CWD are exported
+      // by VS Code into EVERY child process — including a Claude Code CLI
+      // launched from the integrated terminal. If env vars alone want to
+      // resolve to vscode-copilot, but ~/.claude/plugins/installed_plugins.json
+      // lists context-mode as a Claude Code plugin, the runtime must be
+      // Claude Code (VS Code Copilot has no plugin concept). The env-var
+      // tier above already handles the common case via CLAUDE_CODE_ENTRYPOINT
+      // / CLAUDE_PLUGIN_ROOT; this branch covers MCP-server-only boots where
+      // those vars have not propagated yet.
+      if (platform === "vscode-copilot" && claudeCodeHasContextModePlugin()) {
+        return {
+          platform: "claude-code",
+          confidence: "high",
+          reason:
+            "VSCODE_PID set but ~/.claude/plugins/installed_plugins.json lists context-mode (issue #539 fallback)",
+        };
+      }
       return {
         platform,
         confidence: "high",

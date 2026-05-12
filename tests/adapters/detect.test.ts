@@ -1,6 +1,10 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { sep } from "node:path";
-import { detectPlatform, getAdapter } from "../../src/adapters/detect.js";
+import {
+  detectPlatform,
+  getAdapter,
+  __seedClaudeCodePluginCacheMissForTests,
+} from "../../src/adapters/detect.js";
 import { ClaudeCodeAdapter } from "../../src/adapters/claude-code/index.js";
 import { GeminiCLIAdapter } from "../../src/adapters/gemini-cli/index.js";
 import { OpenCodeAdapter } from "../../src/adapters/opencode/index.js";
@@ -27,6 +31,12 @@ describe("detectPlatform", () => {
     // Clear all platform-specific env vars to get a clean slate
     delete process.env.CLAUDE_PROJECT_DIR;
     delete process.env.CLAUDE_SESSION_ID;
+    // Issue #539 follow-up: CLAUDE_CODE_ENTRYPOINT / CLAUDE_PLUGIN_ROOT are
+    // exported by Claude Code itself, so any test process that runs INSIDE
+    // CC will inherit them. Without this wipe, every non-claude-code env-var
+    // assertion below short-circuits to "claude-code" via PLATFORM_ENV_VARS.
+    delete process.env.CLAUDE_CODE_ENTRYPOINT;
+    delete process.env.CLAUDE_PLUGIN_ROOT;
     delete process.env.GEMINI_PROJECT_DIR;
     delete process.env.GEMINI_CLI;
     delete process.env.KILO;
@@ -48,6 +58,11 @@ describe("detectPlatform", () => {
     delete process.env.IDEA_HOME;
     delete process.env.JETBRAINS_CLIENT_ID;
     delete process.env.CONTEXT_MODE_PLATFORM;
+    // Issue #539 slice 2: tests in this file pre-date the installed_plugins.json
+    // fallback and assume env-var-only detection. Seed the plugin cache to a
+    // "miss" so the fallback never triggers — explicit slice-2 coverage lives
+    // in detect-claude-code-in-vscode.test.ts which exercises the real read.
+    __seedClaudeCodePluginCacheMissForTests();
     vi.restoreAllMocks();
   });
 
