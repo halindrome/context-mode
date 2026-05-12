@@ -278,14 +278,15 @@ export function detectPlatform(clientInfo?: { name: string; version?: string }):
     };
   }
 
-  if (existsSync(resolve(home, ".cursor"))) {
-    return {
-      platform: "cursor",
-      confidence: "medium",
-      reason: "~/.cursor/ directory exists",
-    };
-  }
-
+  // Issue #542 — CLI agents BEFORE host IDEs.
+  //
+  // Cursor (a VSCode fork) is the most installed editor across our user
+  // base. Checking ~/.cursor/ first means every CLI agent co-installed
+  // with Cursor (Pi, OMP, Kiro, Qwen) silently routes through
+  // CursorAdapter even though the agent owns the session — Cursor merely
+  // hosts the terminal. Reorder: agents (.kiro/.omp/.pi/.qwen/.openclaw)
+  // win the medium-confidence tier, editors (~/.cursor/, ~/.vscode/,
+  // JetBrains) lose. Verified by the detect-config-dir.test.ts matrix.
   if (existsSync(resolve(home, ".kiro"))) {
     return {
       platform: "kiro",
@@ -324,6 +325,15 @@ export function detectPlatform(clientInfo?: { name: string; version?: string }):
       platform: "openclaw",
       confidence: "medium",
       reason: "~/.openclaw/ directory exists",
+    };
+  }
+
+  // Cursor / host IDEs — checked AFTER all CLI agents (issue #542).
+  if (existsSync(resolve(home, ".cursor"))) {
+    return {
+      platform: "cursor",
+      confidence: "medium",
+      reason: "~/.cursor/ directory exists",
     };
   }
 
