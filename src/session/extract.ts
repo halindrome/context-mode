@@ -909,6 +909,8 @@ const BLOCKER_RESOLVED_PATTERNS: RegExp[] = [
   /\bgot the\s+\S+/i,
   /\bis ready now\b/i,
   /\bcan proceed\b/i,
+  // Chinese (CJK) patterns — issue #535. \b is ASCII-only and skips CJK.
+  /修好|解决|修复了|搞定|已就绪|可以继续|完成了/,
 ];
 
 function extractBlocker(message: string): SessionEvent[] {

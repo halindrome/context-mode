@@ -2625,6 +2625,19 @@ describe("Blocked-On Events", () => {
     assert.equal(blockerEvents.length, 0, "should NOT emit blocker when resolved");
   });
 
+  // ─── Issue #535: Chinese (CJK) resolution patterns ───
+  test("extracts blocker_resolved from Chinese 修好 keyword", () => {
+    const events = extractUserEvents("修好了那个 bug, 可以继续了");
+    const resolvedEvents = events.filter(e => e.type === "blocker_resolved");
+    assert.equal(resolvedEvents.length, 1);
+  });
+
+  test("extracts blocker_resolved from Chinese 解决 keyword", () => {
+    const events = extractUserEvents("问题已解决, 现在 staging 是好的");
+    const resolvedEvents = events.filter(e => e.type === "blocker_resolved");
+    assert.equal(resolvedEvents.length, 1);
+  });
+
   test("does not extract blocker from unrelated messages", () => {
     const events = extractUserEvents("Can you read the server.ts file?");
     const blockerEvents = events.filter(e => e.category === "blocked-on");
