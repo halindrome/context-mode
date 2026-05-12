@@ -27,6 +27,12 @@ describe("detectPlatform", () => {
     // Clear all platform-specific env vars to get a clean slate
     delete process.env.CLAUDE_PROJECT_DIR;
     delete process.env.CLAUDE_SESSION_ID;
+    // Issue #539 follow-up: CLAUDE_CODE_ENTRYPOINT / CLAUDE_PLUGIN_ROOT are
+    // exported by Claude Code itself, so any test process that runs INSIDE
+    // CC will inherit them. Without this wipe, every non-claude-code env-var
+    // assertion below short-circuits to "claude-code" via PLATFORM_ENV_VARS.
+    delete process.env.CLAUDE_CODE_ENTRYPOINT;
+    delete process.env.CLAUDE_PLUGIN_ROOT;
     delete process.env.GEMINI_PROJECT_DIR;
     delete process.env.GEMINI_CLI;
     delete process.env.KILO;
