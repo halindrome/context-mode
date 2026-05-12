@@ -229,6 +229,43 @@ function handleCommandText(
   return { text };
 }
 
+// ── Pi short-circuit argv detection (#534) ───────────────
+//
+// Pi's runtime loads every extension during module discovery, BEFORE its
+// `runCli()` decides whether the invocation is a real session or a
+// short-lived help / version print. Without this guard, even `pi --help`
+// causes us to spawn `server.bundle.mjs` as a long-lived stdio child —
+// which is then reparented to PID 1 the moment Pi's `--help` handler
+// returns. The MCP SDK's StdioServerTransport CPU-spins on the half-closed
+// pipe until the 30 s ppid poll catches up, accumulating multi-hour orphans
+// (see issue #534, plus the historical #311 / #388 fixes that only addressed
+// the *recovery* path — not the *prevention* path).
+//
+// Token set verified against the Pi 14.x source — specifically:
+//   refs/platforms/oh-my-pi/packages/coding-agent/src/cli.ts:runCli
+//
+//     if (first === "--help" || first === "-h" || first === "--version"
+//      || first === "-v" || first === "help") { /* short-circuit */ }
+//
+// We mirror it exactly — no inferred flags, no `-V` (Pi uses lowercase `-v`),
+// no `--no-help`. Anything else (including `pi stats --help`) routes through
+// the normal launch path and the bridge bootstraps as usual.
+
+const PI_SHORT_CIRCUIT_TOKENS = new Set(["--help", "-h", "--version", "-v", "help"]);
+
+/**
+ * Returns true iff `argv` matches a Pi top-level short-circuit invocation
+ * (help or version). Only argv[0] is inspected — Pi's runCli only checks
+ * the first token, and subcommand-level `--help` (e.g. `pi stats --help`)
+ * still spins up a real session, so we must NOT skip bootstrap there.
+ *
+ * Exported for unit tests.
+ */
+export function isPiShortCircuitArgv(argv: readonly string[]): boolean {
+  if (argv.length === 0) return false;
+  return PI_SHORT_CIRCUIT_TOKENS.has(argv[0]);
+}
+
 // ── Extension entry point ────────────────────────────────
 
 /** Pi extension default export. Called once by Pi runtime with the extension API. */
@@ -608,6 +645,19 @@ export default function piExtension(pi: any): void {
   // Best-effort: a missing bundle or a spawn failure must NOT prevent
   // the rest of the extension (session capture, hooks, slash commands)
   // from initializing. We log to stderr and continue.
+  // Short-circuit guard (#534): skip the MCP bridge bootstrap for
+  // `pi --help` / `pi --version` / `pi help` and similar. Pi prints and
+  // exits within milliseconds, but the bridge child would otherwise live
+  // long enough to be reparented to PID 1, half-close stdin, and pin a CPU
+  // core via the MCP SDK's stdio loop. We use process.argv directly so the
+  // guard works for any caller that boots Pi with a short-circuit token,
+  // regardless of how the runtime wires its CLI parser.
+  const piArgv = process.argv.slice(2);
+  if (isPiShortCircuitArgv(piArgv)) {
+    _mcpBridgeReady = Promise.resolve();
+    return;
+  }
+
   const serverBundle = resolve(pluginRoot, "server.bundle.mjs");
   if (existsSync(serverBundle)) {
     _mcpBridgeReady = bootstrapMCPTools(pi, serverBundle).then(
