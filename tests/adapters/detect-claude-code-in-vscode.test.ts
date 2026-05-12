@@ -170,4 +170,23 @@ describe("Issue #539 — Claude Code inside VS Code disambiguation", () => {
       rmSync(fakeHome, { recursive: true, force: true });
     }
   });
+
+  // ── Slice 4: MCP clientInfo highest-priority path ─────────
+  //
+  // When the MCP `initialize` handshake reports clientInfo.name as
+  // "claude-code", detect() MUST return claude-code regardless of any
+  // env-var combination — even the polluted-shell case where VSCODE_PID
+  // is set without any CC env marker. client-map.ts maps the name; this
+  // test pins the priority order at the detect() boundary.
+
+  it("prefers MCP clientInfo.name=\"claude-code\" over VSCODE_PID env detection", () => {
+    // Worst-case: every vscode-copilot env marker present, no CC env vars.
+    process.env.VSCODE_PID = "12345";
+    process.env.VSCODE_CWD = "/Users/me/project";
+
+    const signal = detectPlatform({ name: "claude-code" });
+    expect(signal.platform).toBe("claude-code");
+    expect(signal.confidence).toBe("high");
+    expect(signal.reason).toMatch(/clientInfo/i);
+  });
 });
