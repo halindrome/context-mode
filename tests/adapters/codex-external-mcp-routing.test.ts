@@ -1,0 +1,71 @@
+/**
+ * External MCP routing — Codex slice (#529 follow-up).
+ *
+ * PR #532 added the `mcp__(?!plugin_context-mode_)` PreToolUse matcher for
+ * Claude Code so external MCP servers (slack, telegram, gdrive, notion …)
+ * trigger the context-guidance nudge before their large payloads spill into
+ * context. This slice extends the same protection to Codex CLI.
+ *
+ * Codex MCP wire shape: `mcp__<server>__<tool>` (verified in
+ * configs/codex/hooks.json line 5 which already matches `mcp__.*__ctx_execute`
+ * style — proving hook tool_name carries the `mcp__` prefix for MCP-namespaced
+ * tools). Codex own context-mode tools surface as bare `ctx_execute` AND as
+ * `mcp__<server>__ctx_execute` (the existing PRE_TOOL_USE_MATCHER_PATTERN
+ * already wires both). The negative-lookahead pattern below carves out any
+ * `mcp__` tool name whose server segment contains `context-mode`.
+ */
+import { describe, it, expect, beforeEach } from "vitest";
+import { CodexAdapter } from "../../src/adapters/codex/index.js";
+import { EXTERNAL_MCP_MATCHER_PATTERN } from "../../src/adapters/codex/hooks.js";
+
+describe("CodexAdapter — external MCP routing (#529)", () => {
+  let adapter: CodexAdapter;
+  beforeEach(() => {
+    adapter = new CodexAdapter();
+  });
+
+  it("exports EXTERNAL_MCP_MATCHER_PATTERN constant", () => {
+    expect(typeof EXTERNAL_MCP_MATCHER_PATTERN).toBe("string");
+    expect(EXTERNAL_MCP_MATCHER_PATTERN.length).toBeGreaterThan(0);
+  });
+
+  it("EXTERNAL_MCP_MATCHER_PATTERN matches external MCP tools but not context-mode's own", () => {
+    const re = new RegExp(EXTERNAL_MCP_MATCHER_PATTERN);
+
+    // External MCP namespaces — MUST match
+    expect(re.test("mcp__slack__list_channels")).toBe(true);
+    expect(re.test("mcp__plugin_telegram__list_messages")).toBe(true);
+    expect(re.test("mcp__notion__query_database")).toBe(true);
+    expect(re.test("mcp__claude_ai_Google_Drive__search")).toBe(true);
+
+    // context-mode's own MCP — MUST NOT match
+    expect(re.test("mcp__context-mode__ctx_execute")).toBe(false);
+    expect(re.test("mcp__plugin_context-mode_context-mode__ctx_execute")).toBe(false);
+    expect(re.test("mcp__context-mode__ctx_search")).toBe(false);
+
+    // Non-MCP bare codex tool names — MUST NOT match
+    expect(re.test("local_shell")).toBe(false);
+    expect(re.test("ctx_execute")).toBe(false);
+    expect(re.test("Bash")).toBe(false);
+  });
+
+  it("generateHookConfig PreToolUse matcher includes the external MCP pattern", () => {
+    const config = adapter.generateHookConfig("/some/plugin/root") as Record<
+      string,
+      Array<{ matcher: string }>
+    >;
+    const preToolUseMatcher = config.PreToolUse?.[0]?.matcher ?? "";
+    expect(preToolUseMatcher).toContain(EXTERNAL_MCP_MATCHER_PATTERN);
+  });
+
+  it("configs/codex/hooks.json PreToolUse matcher contains EXTERNAL_MCP_MATCHER_PATTERN", async () => {
+    const { readFileSync } = await import("node:fs");
+    const { resolve } = await import("node:path");
+    const path = resolve(__dirname, "..", "..", "configs", "codex", "hooks.json");
+    const parsed = JSON.parse(readFileSync(path, "utf8")) as {
+      hooks: { PreToolUse: Array<{ matcher: string }> };
+    };
+    const matcher = parsed.hooks.PreToolUse[0]?.matcher ?? "";
+    expect(matcher).toContain(EXTERNAL_MCP_MATCHER_PATTERN);
+  });
+});
