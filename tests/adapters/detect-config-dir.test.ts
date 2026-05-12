@@ -26,7 +26,7 @@ const existsSyncMock = vi.mocked(fs.existsSync);
 
 // Derived from detect.ts's source-of-truth list so renames can't drift.
 const ALL_PLATFORM_ENV_VARS = [
-  ...PLATFORM_ENV_VARS.flatMap(([, vars]) => [...vars]),
+  ...[...PLATFORM_ENV_VARS.values()].flatMap((vars) => vars.map((v) => v.name)),
   "CONTEXT_MODE_PLATFORM",
 ];
 

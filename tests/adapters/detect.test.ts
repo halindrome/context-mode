@@ -581,3 +581,54 @@ describe("getAdapter", () => {
     expect(adapter).toBeInstanceOf(ClaudeCodeAdapter);
   });
 });
+
+// ─────────────────────────────────────────────────────────
+// Issue #545 — PLATFORM_ENV_VARS typed with workspace/identification roles.
+//
+// The registry must split each entry into {name, role} so resolveProjectDir
+// can ALGORITHMICALLY derive ALLOW (own-platform workspace vars) and BAN
+// (other platforms' workspace vars) sets. Adding a 16th adapter must require
+// only one row in the registry — no edit to the resolver.
+// ─────────────────────────────────────────────────────────
+
+describe("PLATFORM_ENV_VARS — typed registry (issue #545 algorithmic design)", () => {
+  it("each entry tags name + role: 'workspace' | 'identification'", async () => {
+    const { PLATFORM_ENV_VARS } = await import("../../src/adapters/detect.js");
+    const claudeEntries = PLATFORM_ENV_VARS.get("claude-code");
+    expect(claudeEntries).toBeDefined();
+    expect(claudeEntries).toContainEqual({ name: "CLAUDE_PROJECT_DIR", role: "workspace" });
+    expect(claudeEntries).toContainEqual({ name: "CLAUDE_CODE_ENTRYPOINT", role: "identification" });
+    expect(claudeEntries).toContainEqual({ name: "CLAUDE_PLUGIN_ROOT", role: "identification" });
+    expect(claudeEntries).toContainEqual({ name: "CLAUDE_SESSION_ID", role: "identification" });
+  });
+
+  it("getEnvVarNames(p) shim returns string[] for backwards compatibility", async () => {
+    const { getEnvVarNames } = await import("../../src/adapters/detect.js");
+    const names = getEnvVarNames("claude-code");
+    expect(Array.isArray(names)).toBe(true);
+    expect(names).toContain("CLAUDE_PROJECT_DIR");
+    expect(names).toContain("CLAUDE_CODE_ENTRYPOINT");
+  });
+
+  it("workspaceEnvVarsFor(p) returns only role=workspace names in registry order", async () => {
+    const { workspaceEnvVarsFor } = await import("../../src/adapters/detect.js");
+    const claude = workspaceEnvVarsFor("claude-code");
+    expect(claude).toEqual(["CLAUDE_PROJECT_DIR"]);
+    const codex = workspaceEnvVarsFor("codex");
+    // Codex has no workspace var — id-only registry rows.
+    expect(codex).toEqual([]);
+  });
+
+  it("foreignWorkspaceEnv(p) returns workspace vars from OTHER platforms", async () => {
+    const { foreignWorkspaceEnv } = await import("../../src/adapters/detect.js");
+    const banForPi = foreignWorkspaceEnv("pi");
+    // Other platforms' workspace vars must be banned for Pi.
+    expect(banForPi.has("CLAUDE_PROJECT_DIR")).toBe(true);
+    expect(banForPi.has("GEMINI_PROJECT_DIR")).toBe(true);
+    expect(banForPi.has("VSCODE_CWD")).toBe(true);
+    expect(banForPi.has("IDEA_INITIAL_DIRECTORY")).toBe(true);
+    // Identification vars (e.g. CLAUDE_PLUGIN_ROOT) are NEVER scrubbed.
+    expect(banForPi.has("CLAUDE_PLUGIN_ROOT")).toBe(false);
+    expect(banForPi.has("CLAUDE_CODE_ENTRYPOINT")).toBe(false);
+  });
+});

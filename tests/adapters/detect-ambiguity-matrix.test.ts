@@ -32,7 +32,7 @@ import {
 const existsSyncMock = vi.mocked(fs.existsSync);
 
 const ALL_PLATFORM_ENV_VARS = [
-  ...PLATFORM_ENV_VARS.flatMap(([, vars]) => [...vars]),
+  ...[...PLATFORM_ENV_VARS.values()].flatMap((vars) => vars.map((v) => v.name)),
   "CONTEXT_MODE_PLATFORM",
 ];
 
