@@ -202,3 +202,39 @@ describe("Slice 7: blocker — programming-domain error markers", () => {
     assert.equal(hasBlocker("why does this fail?"), false);
   });
 });
+
+// ════════════════════════════════════════════════════════════════════════════
+// SLICE 8: blocker_resolved — Unicode checkmark / structural marker
+// ════════════════════════════════════════════════════════════════════════════
+
+describe("Slice 8: blocker_resolved — Unicode checkmark or marker prefix", () => {
+  test('"✅ Fixed the auth bug" is a resolved blocker', () => {
+    assert.ok(hasBlockerResolved("✅ Fixed the auth bug"));
+  });
+
+  test('"✓ done" (light checkmark) is a resolved blocker', () => {
+    assert.ok(hasBlockerResolved("✓ done"));
+  });
+
+  test('"🎉 ship it" (emoji celebration) is a resolved blocker', () => {
+    assert.ok(hasBlockerResolved("🎉 ship it"));
+  });
+
+  test('"fixed: 修复了登录问题" (cross-script marker prefix) is a resolved blocker', () => {
+    assert.ok(hasBlockerResolved("fixed: 修复了登录问题"));
+  });
+
+  test('"resolved: cache miss in dev" is a resolved blocker', () => {
+    assert.ok(hasBlockerResolved("resolved: cache miss in dev"));
+  });
+
+  test('a checkmark beats a blocker marker — emits ONLY resolved', () => {
+    const events = extractUserEvents("✅ Error: cannot read property (was a stale build)");
+    assert.equal(events.filter(e => e.type === "blocker_resolved").length, 1);
+    assert.equal(events.filter(e => e.type === "blocker").length, 0);
+  });
+
+  test('a message without checkmark/marker is NOT resolved', () => {
+    assert.equal(hasBlockerResolved("the bug is back"), false);
+  });
+});
