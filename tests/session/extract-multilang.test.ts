@@ -60,3 +60,18 @@ describe("Slice 2: investigate intent — Arabic question mark U+061F", () => {
     assert.equal(intentMode("لماذا لم يعمل هذا؟"), "investigate");
   });
 });
+
+// ════════════════════════════════════════════════════════════════════════════
+// SLICE 3: investigate intent via Spanish opening question mark U+00BF
+// ════════════════════════════════════════════════════════════════════════════
+
+describe("Slice 3: investigate intent — Spanish opening ¿", () => {
+  test('"¿Por qué falla esto?" yields mode:"investigate"', () => {
+    assert.equal(intentMode("¿Por qué falla esto?"), "investigate");
+  });
+
+  test('opening-only "¿qué hora es" still yields mode:"investigate"', () => {
+    // Some users drop the closing mark on chat / mobile keyboards.
+    assert.equal(intentMode("¿qué hora es"), "investigate");
+  });
+});
