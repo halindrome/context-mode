@@ -50,3 +50,13 @@ describe("Slice 1: investigate intent — Chinese fullwidth question mark", () =
     assert.equal(intentMode("为什么这个 hook 没有触发？"), "investigate");
   });
 });
+
+// ════════════════════════════════════════════════════════════════════════════
+// SLICE 2: investigate intent via Arabic question mark
+// ════════════════════════════════════════════════════════════════════════════
+
+describe("Slice 2: investigate intent — Arabic question mark U+061F", () => {
+  test('"لماذا لم يعمل هذا؟" yields mode:"investigate"', () => {
+    assert.equal(intentMode("لماذا لم يعمل هذا؟"), "investigate");
+  });
+});
