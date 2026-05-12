@@ -14,7 +14,7 @@ import { dirname, resolve, join, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { homedir } from "node:os";
 import { healBetterSqlite3Binding } from "./heal-better-sqlite3.mjs";
-import { healInstalledPlugins, healSettingsEnabledPlugins, healPluginJsonMcpServers } from "./heal-installed-plugins.mjs";
+import { healInstalledPlugins, healSettingsEnabledPlugins, healPluginJsonMcpServers, healMcpJsonArgs } from "./heal-installed-plugins.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const pkgRoot = resolve(__dirname, "..");
@@ -123,10 +123,26 @@ if (isGlobalInstall()) {
               healedAny = true;
             }
           } catch { /* per-entry best effort */ }
+          // v1.0.122 — Issue #531 — Layer 6: asymmetric-heal sibling for
+          // .mcp.json. The #253/aea633c regression shipped a bare `./start.mjs`
+          // arg that Claude Code resolves against session CWD (not pluginRoot)
+          // → MODULE_NOT_FOUND on every ctx_* tool. When MCP is dead, the
+          // only escape hatch is `npm install -g context-mode` whose
+          // postinstall MUST run this heal too.
+          try {
+            const r = healMcpJsonArgs({
+              pluginRoot: installPath,
+              pluginCacheRoot: cacheRoot,
+              pluginKey: "context-mode@context-mode",
+            });
+            if (r && Array.isArray(r.healed) && r.healed.length > 0) {
+              healedAny = true;
+            }
+          } catch { /* per-entry best effort */ }
         }
       }
       if (healedAny) {
-        process.stderr.write("context-mode: healed plugin.json mcpServers args (Issue #523)\n");
+        process.stderr.write("context-mode: healed mcpServers args (Issues #523 + #531)\n");
       }
     }
   } catch { /* never block install */ }
