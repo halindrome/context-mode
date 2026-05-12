@@ -151,4 +151,99 @@ describe("Issue #531 — asymmetric-drift invariant", () => {
     expect(pkg.scripts.build, "build script must invoke assert-asymmetric-drift")
       .toMatch(/assert-asymmetric-drift|asymmetric-drift/);
   });
+
+  // ── Regression guard for the postinstall-heal scope bug ──────────────
+  // CI run 25734987495 (Windows-latest) failed on `npm run build` because
+  // scripts/postinstall.mjs section 4 called `normalizeHooksOnStartup`
+  // which rewrites `${CLAUDE_PLUGIN_ROOT}` → an absolute path in source-
+  // tracked `.claude-plugin/plugin.json`. The existing TMPDIR_UPGRADE_RE
+  // guard only skipped /ctx-upgrade staging, not contributor / CI installs.
+  // Result: every `npm install` from a git clone (CI runners + contributors)
+  // mutated the source file, and the very next step (`npm run build` →
+  // `assert-asymmetric-drift`) detected the drift and failed the build.
+  //
+  // Fix gated section 4 with `isGlobalInstall()` (same heuristic section -1
+  // uses: `npm_config_global=true` AND no `.git` walking up). This test
+  // drives the exact scenario CI exercises and locks the contract so the
+  // heal cannot silently regain mutation power.
+  test("postinstall.mjs DOES NOT mutate source-tracked plugin.json when run from a clone (Windows CI regression)", () => {
+    const { mkdtempSync, mkdirSync, writeFileSync, cpSync, rmSync } =
+      // eslint-disable-next-line @typescript-eslint/no-require-imports
+      require("node:fs") as typeof import("node:fs");
+    const { tmpdir } = require("node:os") as typeof import("node:os");
+    const { join } = require("node:path") as typeof import("node:path");
+
+    const scratch = mkdtempSync(join(tmpdir(), "postinstall-clone-"));
+    try {
+      // Simulate a contributor / CI clone: `.git` present, source-tracked
+      // plugin.json carries the literal placeholder.
+      mkdirSync(join(scratch, ".git"), { recursive: true });
+      mkdirSync(join(scratch, ".claude-plugin"), { recursive: true });
+      mkdirSync(join(scratch, "scripts"), { recursive: true });
+      mkdirSync(join(scratch, "hooks"), { recursive: true });
+      mkdirSync(join(scratch, "node_modules"), { recursive: true });
+
+      writeFileSync(
+        join(scratch, ".claude-plugin", "plugin.json"),
+        JSON.stringify({
+          name: "context-mode",
+          version: "0.0.0-test",
+          mcpServers: {
+            "context-mode": {
+              command: "node",
+              args: [PLACEHOLDER],
+            },
+          },
+        }),
+      );
+      // Also seed hooks.json since normalize-hooks targets that too.
+      writeFileSync(
+        join(scratch, "hooks", "hooks.json"),
+        JSON.stringify({ hooks: {} }),
+      );
+      writeFileSync(
+        join(scratch, "package.json"),
+        JSON.stringify({ name: "context-mode", version: "0.0.0-test" }),
+      );
+
+      // Copy the live postinstall + heal scripts + normalize-hooks. The
+      // test exercises the REAL scripts, not a mock — so a regression in
+      // the guard is caught even if the test's mental model drifts.
+      const scriptsToCopy = [
+        "postinstall.mjs",
+        "heal-better-sqlite3.mjs",
+        "heal-installed-plugins.mjs",
+      ];
+      for (const f of scriptsToCopy) {
+        cpSync(resolve(ROOT, "scripts", f), join(scratch, "scripts", f));
+      }
+      cpSync(
+        resolve(ROOT, "hooks", "normalize-hooks.mjs"),
+        join(scratch, "hooks", "normalize-hooks.mjs"),
+      );
+
+      // Run postinstall the same way npm does — env stripped of
+      // npm_config_global (this is the contributor / CI codepath).
+      const env = { ...process.env };
+      delete env.npm_config_global;
+      const r = spawnSync(process.execPath, ["scripts/postinstall.mjs"], {
+        cwd: scratch,
+        env,
+        encoding: "utf-8",
+        timeout: 30_000,
+      });
+      expect(r.status, `postinstall failed: ${r.stderr}`).toBe(0);
+
+      const after = readArgs0(
+        join(scratch, ".claude-plugin", "plugin.json"),
+        "context-mode",
+      );
+      expect(
+        after,
+        "postinstall.mjs mutated source-tracked .claude-plugin/plugin.json — section 4's heal must skip contributor / CI installs (isGlobalInstall guard)",
+      ).toBe(PLACEHOLDER);
+    } finally {
+      rmSync(scratch, { recursive: true, force: true });
+    }
+  });
 });

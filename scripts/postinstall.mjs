@@ -288,15 +288,25 @@ try { healBetterSqlite3Binding(pkgRoot); } catch { /* best effort — don't bloc
 // here too closes the gap for the very first hook fire after a fresh install
 // (before any MCP server has run).
 //
-// Guard: /ctx-upgrade clones the repo to `<tmpdir>/context-mode-upgrade-<epoch>/`
+// Guard 1: only run on REAL `npm install -g context-mode`. A contributor's
+// `npm install` from a git clone (or CI checkout) must NOT mutate the
+// source-tracked `.claude-plugin/plugin.json` — doing so substitutes the
+// literal `${CLAUDE_PLUGIN_ROOT}` with an absolute path and trips
+// `scripts/assert-asymmetric-drift.mjs` (Issue #531) in the build chain.
+// Reuses `isGlobalInstall()` (section -1 already gates that way); the
+// `.git` walk inside it is what keeps contributor / CI installs untouched.
+//
+// Guard 2: /ctx-upgrade clones the repo to `<tmpdir>/context-mode-upgrade-<epoch>/`
 // and runs `npm install` there before `cpSync`-ing files into the real pluginRoot
-// (src/cli.ts). If we normalize here, pkgRoot is the tmpdir → hooks.json gets
-// the tmpdir's absolute paths baked in → cpSync copies that poisoned hooks.json
-// into the real plugin dir → tmpdir is later cleaned → every hook fires with
-// `MODULE_NOT_FOUND`. Detect the upgrade staging path and skip; start.mjs will
-// normalize correctly on the next MCP boot from the real pluginRoot.
+// (src/cli.ts). The tmpdir has no `.git`, so `isGlobalInstall()` returns
+// true there — we need this second check to skip the staging dir. Without
+// it, pkgRoot is the tmpdir → hooks.json gets the tmpdir's absolute paths
+// baked in → cpSync copies that poisoned hooks.json into the real plugin
+// dir → tmpdir is later cleaned → every hook fires with MODULE_NOT_FOUND.
+// start.mjs normalizes correctly on the next MCP boot from the real
+// pluginRoot anyway.
 const TMPDIR_UPGRADE_RE = /[/\\]context-mode-upgrade-\d+[/\\]?$/;
-if (!TMPDIR_UPGRADE_RE.test(pkgRoot)) {
+if (isGlobalInstall() && !TMPDIR_UPGRADE_RE.test(pkgRoot)) {
   try {
     const { normalizeHooksOnStartup } = await import("../hooks/normalize-hooks.mjs");
     normalizeHooksOnStartup({
