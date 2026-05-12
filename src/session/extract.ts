@@ -964,33 +964,39 @@ function extractIntent(message: string): SessionEvent[] {
 /**
  * Category 25: blocked-on
  * Detect when work is blocked on something, or when a blocker is resolved.
+ *
+ * Universal-rule detector (Hybrid C, issue #535):
+ *   Programming-domain error markers are script-agnostic — they are
+ *   emitted by tooling regardless of the user's spoken language. The
+ *   words "Error", "Exception", "Traceback" stay in their original
+ *   English form inside a Chinese / Arabic / Russian terminal log.
+ *
+ *   blocker matches:
+ *     - the literal "Error:" / "Exception:" / "Traceback" tokens, OR
+ *     - a Python-style frame line ("File ", `line:col`), OR
+ *     - a JS / Java-style stack frame ("at <ident>(...)" with a
+ *       `:line:col` suffix).
+ *
+ *   blocker_resolved matches:
+ *     - a Unicode check-mark glyph (✓ U+2713, ✔ U+2714, ✅ U+2705,
+ *       ☑ U+2611, 🎉 U+1F389), OR
+ *     - the structural marker "fixed: …" / "resolved: …" — these are
+ *       programming-domain conventions (git log, PR titles, CHANGELOG
+ *       entries) rather than natural-language phrases.
  */
 
-const BLOCKER_PATTERNS: RegExp[] = [
-  /\bblocked on\b/i,
-  /\bwaiting for\b/i,
-  /\bneed\s+\S+\s+before\b/i,
-  /\bcan'?t proceed until\b/i,
-  /\bdepends on\b/i,
-  /\bblocked\b/i,
-  // Turkish patterns
-  /\bbekliyor\b/i,
-  /\bbekliyorum\b/i,
-];
-
-const BLOCKER_RESOLVED_PATTERNS: RegExp[] = [
-  /\bunblocked\b/i,
-  /\bresolved\b/i,
-  /\bgot the\s+\S+/i,
-  /\bis ready now\b/i,
-  /\bcan proceed\b/i,
-];
+const BLOCKER_MARKERS_PATTERN = /(?:\bError\s*:|\bException\s*:|\bTraceback\b|\bat\s+\S+\s*\([^)]*:\d+:\d+\))/u;
+const BLOCKER_RESOLVED_CHECKMARK_PATTERN = /[✓✔✅☑🎉]/u;
+const BLOCKER_RESOLVED_MARKER_PATTERN = /^\s*(?:fixed|resolved)\s*:/iu;
 
 function extractBlocker(message: string): SessionEvent[] {
   const events: SessionEvent[] = [];
 
-  // Check resolution first — if both match, resolution takes priority
-  const isResolved = BLOCKER_RESOLVED_PATTERNS.some(p => p.test(message));
+  // Resolution takes precedence — if both shapes match, render the
+  // happier signal so the snapshot reflects the latest state.
+  const isResolved =
+    BLOCKER_RESOLVED_CHECKMARK_PATTERN.test(message) ||
+    BLOCKER_RESOLVED_MARKER_PATTERN.test(message);
   if (isResolved) {
     events.push({
       type: "blocker_resolved",
@@ -1001,8 +1007,7 @@ function extractBlocker(message: string): SessionEvent[] {
     return events;
   }
 
-  const isBlocked = BLOCKER_PATTERNS.some(p => p.test(message));
-  if (isBlocked) {
+  if (BLOCKER_MARKERS_PATTERN.test(message)) {
     events.push({
       type: "blocker",
       category: "blocked-on",

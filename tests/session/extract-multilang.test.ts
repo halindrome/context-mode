@@ -170,3 +170,35 @@ describe("Slice 6: role — second-person persona statements across scripts", ()
     assert.equal(hasRole(longRun), false);
   });
 });
+
+// ════════════════════════════════════════════════════════════════════════════
+// SLICE 7: blocker — programming-domain markers (language-neutral)
+// ════════════════════════════════════════════════════════════════════════════
+
+describe("Slice 7: blocker — programming-domain error markers", () => {
+  test('"Error: cannot read property" is a blocker', () => {
+    assert.ok(hasBlocker("Error: cannot read property"));
+  });
+
+  test('Python "Traceback (most recent call last):" is a blocker', () => {
+    assert.ok(hasBlocker("Traceback (most recent call last):"));
+  });
+
+  test('Java "Exception: NullPointerException" is a blocker', () => {
+    assert.ok(hasBlocker("Exception: NullPointerException at line 42"));
+  });
+
+  test('Chinese-localised "Error: 找不到模块" is a blocker', () => {
+    // Programming-domain markers like `Error:` are emitted by tooling
+    // regardless of the user's native language — they are universal.
+    assert.ok(hasBlocker("Error: 找不到模块"));
+  });
+
+  test('a plain greeting is NOT a blocker', () => {
+    assert.equal(hasBlocker("hello there"), false);
+  });
+
+  test('a question is NOT a blocker', () => {
+    assert.equal(hasBlocker("why does this fail?"), false);
+  });
+});
