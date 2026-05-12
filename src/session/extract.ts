@@ -815,6 +815,8 @@ const DECISION_PATTERNS: RegExp[] = [
   /\b(no,?\s+(use|do|try|make))\b/i,
   // Turkish patterns
   /\b(hayır|hayir|evet|böyle|boyle|degil|değil|yerine|kullan)\b/i,
+  // Chinese (CJK) patterns — issue #535. \b is ASCII-only and skips CJK.
+  /不要用|不用|改用|换用|换成|决定|选择|应该用|不要|要用/,
 ];
 
 function extractUserDecision(message: string): SessionEvent[] {
@@ -839,6 +841,8 @@ const ROLE_PATTERNS: RegExp[] = [
   /\b(senior|staff|principal|lead)\s+(engineer|developer|architect)\b/i,
   // Turkish patterns
   /\b(gibi davran|rolünde|olarak çalış)\b/i,
+  // Chinese (CJK) patterns — issue #535. \b is ASCII-only and skips CJK.
+  /你是|作为|充当|扮演|担任|假装|角色/,
 ];
 
 function extractRole(message: string): SessionEvent[] {
@@ -858,11 +862,14 @@ function extractRole(message: string): SessionEvent[] {
  * Session mode classification from user messages.
  */
 
+// NOTE: Patterns include CJK (Chinese) keywords outside the `\b...\b` ASCII
+// word-boundary group, because `\b` only fires at ASCII↔non-ASCII transitions
+// and silently misses pure-CJK input (issue #535).
 const INTENT_PATTERNS: Array<{ mode: string; pattern: RegExp }> = [
-  { mode: "investigate", pattern: /\b(why|how does|explain|understand|what is|analyze|debug|look into)\b/i },
-  { mode: "implement",   pattern: /\b(create|add|build|implement|write|make|develop|fix)\b/i },
-  { mode: "discuss",     pattern: /\b(think about|consider|should we|what if|pros and cons|opinion)\b/i },
-  { mode: "review",      pattern: /\b(review|check|audit|verify|test|validate)\b/i },
+  { mode: "investigate", pattern: /\b(why|how does|explain|understand|what is|analyze|debug|look into)\b|为什么|怎么|如何|分析|调试|解释/i },
+  { mode: "implement",   pattern: /\b(create|add|build|implement|write|make|develop|fix)\b|创建|新增|添加|实现|编写|修复|开发/i },
+  { mode: "discuss",     pattern: /\b(think about|consider|should we|what if|pros and cons|opinion)\b|讨论|考虑|是否应该|意见|利弊/i },
+  { mode: "review",      pattern: /\b(review|check|audit|verify|test|validate)\b|审查|检查|审计|验证|测试/i },
 ];
 
 function extractIntent(message: string): SessionEvent[] {
@@ -892,6 +899,8 @@ const BLOCKER_PATTERNS: RegExp[] = [
   // Turkish patterns
   /\bbekliyor\b/i,
   /\bbekliyorum\b/i,
+  // Chinese (CJK) patterns — issue #535. \b is ASCII-only and skips CJK.
+  /报错|卡住|崩溃|失败|无法|阻塞|等待|被卡|出错|阻挡/,
 ];
 
 const BLOCKER_RESOLVED_PATTERNS: RegExp[] = [
@@ -900,6 +909,8 @@ const BLOCKER_RESOLVED_PATTERNS: RegExp[] = [
   /\bgot the\s+\S+/i,
   /\bis ready now\b/i,
   /\bcan proceed\b/i,
+  // Chinese (CJK) patterns — issue #535. \b is ASCII-only and skips CJK.
+  /修好|解决|修复了|搞定|已就绪|可以继续|完成了/,
 ];
 
 function extractBlocker(message: string): SessionEvent[] {
