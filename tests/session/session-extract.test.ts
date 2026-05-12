@@ -597,6 +597,13 @@ describe("Role Events", () => {
     const roleEvents = events.filter(e => e.type === "role");
     assert.equal(roleEvents.length, 1);
   });
+
+  // ─── Issue #535: Chinese (CJK) role patterns ───
+  test("extracts role from Chinese 你是 persona directive", () => {
+    const events = extractUserEvents("你是一名资深后端工程师");
+    const roleEvents = events.filter(e => e.type === "role");
+    assert.equal(roleEvents.length, 1);
+  });
 });
 
 // ════════════════════════════════════════════

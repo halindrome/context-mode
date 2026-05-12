@@ -841,6 +841,8 @@ const ROLE_PATTERNS: RegExp[] = [
   /\b(senior|staff|principal|lead)\s+(engineer|developer|architect)\b/i,
   // Turkish patterns
   /\b(gibi davran|rolünde|olarak çalış)\b/i,
+  // Chinese (CJK) patterns — issue #535. \b is ASCII-only and skips CJK.
+  /你是|作为|充当|扮演|担任|假装|角色/,
 ];
 
 function extractRole(message: string): SessionEvent[] {
