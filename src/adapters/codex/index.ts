@@ -74,8 +74,15 @@ type HooksConfigReadResult =
   | { ok: false; reason: "invalid_json"; error: string }
   | { ok: false; reason: "read_error"; error: string };
 
+// PreToolUse matcher: canonical Codex tool names + context-mode own MCP tools
+// (both bare and `mcp__<server>__<tool>` forms) + external MCP catch-all (#529).
+// The final `mcp__(?!.*context-mode)` segment uses a negative lookahead that
+// excludes any `mcp__` tool whose server segment contains `context-mode` so
+// context-mode's own MCP tools (already wired by the explicit entries above)
+// are not double-routed. Keep this as a single string literal — `codex.test.ts`
+// drift-guard parses the source with a `"([^"]+)"` regex.
 const PRE_TOOL_USE_MATCHER_PATTERN =
-  "local_shell|shell|shell_command|exec_command|container.exec|functions\\.exec_command|Bash|Shell|apply_patch|functions\\.apply_patch|Edit|Write|grep_files|ctx_execute|ctx_execute_file|ctx_batch_execute|ctx_fetch_and_index|ctx_search|ctx_index|mcp__.*__ctx_execute|mcp__.*__ctx_execute_file|mcp__.*__ctx_batch_execute|mcp__.*__ctx_fetch_and_index|mcp__.*__ctx_search|mcp__.*__ctx_index";
+  "local_shell|shell|shell_command|exec_command|container.exec|functions\\.exec_command|Bash|Shell|apply_patch|functions\\.apply_patch|Edit|Write|grep_files|ctx_execute|ctx_execute_file|ctx_batch_execute|ctx_fetch_and_index|ctx_search|ctx_index|mcp__.*__ctx_execute|mcp__.*__ctx_execute_file|mcp__.*__ctx_batch_execute|mcp__.*__ctx_fetch_and_index|mcp__.*__ctx_search|mcp__.*__ctx_index|mcp__(?!.*context-mode)";
 
 const CODEX_HOOK_COMMANDS = {
   PreToolUse: "context-mode hook codex pretooluse",

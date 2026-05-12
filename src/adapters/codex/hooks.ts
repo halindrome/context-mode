@@ -33,6 +33,30 @@ export const HOOK_TYPES = {
 } as const;
 
 // ─────────────────────────────────────────────────────────
+// External MCP routing matcher (#529)
+// ─────────────────────────────────────────────────────────
+
+/**
+ * Negative-lookahead matcher for external MCP tool namespaces on Codex CLI (#529).
+ *
+ * Codex CLI's hook `tool_name` payload uses `mcp__<server>__<tool>` for any
+ * MCP-namespaced tool — verified by configs/codex/hooks.json which already
+ * matches `mcp__.*__ctx_execute` style for context-mode's OWN MCP tools. This
+ * pattern fires PreToolUse for any external `mcp__<server>__<tool>` whose
+ * server segment does NOT contain `context-mode`. Without it, large payloads
+ * from slack / telegram / gdrive / notion-style MCPs bypass the routing nudge
+ * and flood the model's context — PostToolUse runs too late to keep raw data
+ * out.
+ *
+ * The negative lookahead `(?!.*context-mode)` covers both naming variants
+ * Codex sees in practice: the canonical `mcp__context-mode__ctx_*` AND the
+ * Claude Code plugin shim `mcp__plugin_context-mode_context-mode__ctx_*`.
+ * Codex own bare names (ctx_execute, local_shell, …) are not `mcp__`-prefixed
+ * and are unaffected.
+ */
+export const EXTERNAL_MCP_MATCHER_PATTERN = "mcp__(?!.*context-mode)";
+
+// ─────────────────────────────────────────────────────────
 // Routing instructions
 // ─────────────────────────────────────────────────────────
 
