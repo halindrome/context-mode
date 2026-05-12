@@ -1,15 +1,23 @@
 #!/usr/bin/env node
 // Issue #531 — asymmetric-drift invariant asserter.
 //
-// The repo ships TWO sibling files that BOTH carry the MCP server args:
+// The canonical MCP server config lives in TWO source-tracked files:
 //
-//   1. `.mcp.json`                            (Claude Code reads at plugin load)
-//   2. `.claude-plugin/plugin.json`           (used by some adapters / Cursor)
+//   1. `.mcp.json.example`                    (template; copied to .mcp.json
+//                                              locally by contributors. .mcp.json
+//                                              itself is .gitignored after the
+//                                              #531 architectural untrack — see
+//                                              .gitignore and tests/core/cli.test.ts
+//                                              "package.json files[] MUST NOT ship
+//                                              .mcp.json".)
+//   2. `.claude-plugin/plugin.json`           (Claude Code's primary read path
+//                                              for installed plugins. cli.ts
+//                                              upgrade() writes a matching
+//                                              .mcp.json into the plugin cache.)
 //
-// If they drift, fresh installs break silently (Claude Code uses #1) while
-// some adapter paths keep working (Cursor uses #2). That's how the #253
-// commit's bare `./start.mjs` regression survived undetected for a full
-// release cycle — there was no invariant.
+// If the two source-tracked files drift, fresh installs break silently
+// (the #253 regression survived a full release cycle because no invariant
+// caught the bare `./start.mjs` shape).
 //
 // This script is the build-chain half of the slice-9 invariant pair.
 // The vitest sibling (tests/scripts/asymmetric-drift-assert.test.ts) covers
@@ -17,10 +25,12 @@
 // into `npm run build` so any regression surfaces in CI before publish.
 //
 // Contract:
-//   - Read `.mcp.json` and `.claude-plugin/plugin.json` from --root (or cwd).
+//   - Read `.mcp.json.example` and `.claude-plugin/plugin.json` from --root.
 //   - Extract mcpServers["context-mode"].args[0] from each.
 //   - Assert both equal the literal `${CLAUDE_PLUGIN_ROOT}/start.mjs`.
 //   - Assert the two values are equal (the explicit drift check).
+//   - If a `.mcp.json` exists (contributor's local copy), check it too —
+//     but absence is fine (it's .gitignored).
 //   - Exit 0 on success, 1 with a violations report on failure.
 //
 // Usage:
@@ -75,22 +85,23 @@ function main() {
     ? resolve(explicitRoot)
     : resolve(__dirname, "..");
 
-  const mcpJsonPath = resolve(root, ".mcp.json");
+  const exampleJsonPath = resolve(root, ".mcp.json.example");
   const pluginJsonPath = resolve(root, ".claude-plugin", "plugin.json");
+  const localMcpJsonPath = resolve(root, ".mcp.json");
 
   /** @type {string[]} */
   const violations = [];
 
-  const mcp = readArgs0(mcpJsonPath);
+  const example = readArgs0(exampleJsonPath);
   const plg = readArgs0(pluginJsonPath);
 
-  if (!mcp.ok) violations.push(mcp.error);
+  if (!example.ok) violations.push(example.error);
   if (!plg.ok) violations.push(plg.error);
 
-  if (mcp.ok && mcp.value !== PLACEHOLDER) {
+  if (example.ok && example.value !== PLACEHOLDER) {
     violations.push(
-      `.mcp.json args[0] is "${mcp.value}" but must equal "${PLACEHOLDER}". ` +
-        `Fresh marketplace installs spawn MCP with session CWD (not pluginRoot) so any other shape throws MODULE_NOT_FOUND. (Issue #531 / #253 class.)`,
+      `.mcp.json.example args[0] is "${example.value}" but must equal "${PLACEHOLDER}". ` +
+        `Contributors copy this template to .mcp.json for local dev, so the template MUST hold the canonical form. (Issue #531 / #253 class.)`,
     );
   }
   if (plg.ok && plg.value !== PLACEHOLDER) {
@@ -98,10 +109,22 @@ function main() {
       `.claude-plugin/plugin.json args[0] is "${plg.value}" but must equal "${PLACEHOLDER}". (Issue #523 class.)`,
     );
   }
-  if (mcp.ok && plg.ok && mcp.value !== plg.value) {
+  if (example.ok && plg.ok && example.value !== plg.value) {
     violations.push(
-      `asymmetric drift: .mcp.json args[0]="${mcp.value}" vs .claude-plugin/plugin.json args[0]="${plg.value}". The two siblings MUST agree or Claude Code (reads .mcp.json) and adapters (read plugin.json) diverge on which start.mjs to spawn.`,
+      `asymmetric drift: .mcp.json.example args[0]="${example.value}" vs .claude-plugin/plugin.json args[0]="${plg.value}". The two source-tracked manifests MUST agree so contributors copying the template and end-users via marketplace install resolve the same start.mjs.`,
     );
+  }
+
+  // Contributor's local .mcp.json (if present) — must match the template.
+  // Absence is fine; the file is .gitignored after the #531 architectural untrack.
+  if (existsSync(localMcpJsonPath)) {
+    const local = readArgs0(localMcpJsonPath);
+    if (local.ok && local.value !== PLACEHOLDER) {
+      violations.push(
+        `local .mcp.json args[0] is "${local.value}" but must equal "${PLACEHOLDER}". ` +
+          `If you intentionally use a relative dev path locally, ignore — but this file would ship the regression if it ever lands in package.json files[]. Consider \`cp .mcp.json.example .mcp.json\` to reset.`,
+      );
+    }
   }
 
   if (violations.length > 0) {
@@ -113,7 +136,7 @@ function main() {
   }
 
   process.stdout.write(
-    `asymmetric-drift: OK (.mcp.json + .claude-plugin/plugin.json both pin args[0] to ${PLACEHOLDER})\n`,
+    `asymmetric-drift: OK (.mcp.json.example + .claude-plugin/plugin.json both pin args[0] to ${PLACEHOLDER})\n`,
   );
 }
 
