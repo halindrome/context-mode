@@ -882,14 +882,22 @@ const TWO_LEXICAL_TOKENS_PATTERN = /\p{L}+\s+\p{L}+/u;
 const CONTINUOUS_LETTER_RUN_PATTERN = /\p{L}{6,}/u;
 
 function looksLikeRole(trimmed: string): boolean {
-  if (QUESTION_MARK_PATTERN.test(trimmed)) return false;
-  if (CLAUSE_SEPARATOR_PATTERN.test(trimmed)) return false;
-  if (!ALPHABETIC_PATTERN.test(trimmed)) return false;
-  const codepointLength = [...trimmed].length;
+  // Role prompts are persona-prefix shaped: the FIRST SENTENCE declares the
+  // role (e.g. "You are a senior backend engineer. <long context...>").
+  // Apply the structural test to the first clause only — real-world role
+  // prompts often append context paragraphs that would blow the length cap
+  // if we tested the whole message. First-clause shape is the load-bearing
+  // signal across languages (English "You are X.", French "Tu es X.",
+  // Japanese "あなたは X です。" all parse the same way under a period split).
+  const firstClause = trimmed.split(/[.!\n。！]/u)[0].trim();
+  if (QUESTION_MARK_PATTERN.test(firstClause)) return false;
+  if (CLAUSE_SEPARATOR_PATTERN.test(firstClause)) return false;
+  if (!ALPHABETIC_PATTERN.test(firstClause)) return false;
+  const codepointLength = [...firstClause].length;
   if (codepointLength < ROLE_MIN_CHARS || codepointLength > ROLE_MAX_CHARS) return false;
   return (
-    TWO_LEXICAL_TOKENS_PATTERN.test(trimmed) ||
-    CONTINUOUS_LETTER_RUN_PATTERN.test(trimmed)
+    TWO_LEXICAL_TOKENS_PATTERN.test(firstClause) ||
+    CONTINUOUS_LETTER_RUN_PATTERN.test(firstClause)
   );
 }
 
