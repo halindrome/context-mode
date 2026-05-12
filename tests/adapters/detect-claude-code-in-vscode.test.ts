@@ -26,8 +26,27 @@
  * plugin loaded (which is the case when context-mode itself is active).
  */
 
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { detectPlatform } from "../../src/adapters/detect.js";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
+// Pin homedir() so installed_plugins.json detection can be exercised against
+// a temp HOME instead of the developer's real ~/.claude (which actually does
+// have context-mode installed in this repo's environment).
+const homedirMock = vi.hoisted(() => ({ current: "" }));
+vi.mock("node:os", async () => {
+  const actual = await vi.importActual<typeof import("node:os")>("node:os");
+  return {
+    ...actual,
+    homedir: () => homedirMock.current || actual.homedir(),
+  };
+});
+
+const {
+  detectPlatform,
+  __resetClaudeCodePluginCacheForTests,
+} = await import("../../src/adapters/detect.js");
 
 describe("Issue #539 — Claude Code inside VS Code disambiguation", () => {
   let savedEnv: NodeJS.ProcessEnv;
@@ -44,10 +63,14 @@ describe("Issue #539 — Claude Code inside VS Code disambiguation", () => {
     delete process.env.VSCODE_PID;
     delete process.env.VSCODE_CWD;
     delete process.env.CONTEXT_MODE_PLATFORM;
+    homedirMock.current = "";
+    __resetClaudeCodePluginCacheForTests();
   });
 
   afterEach(() => {
     process.env = savedEnv;
+    homedirMock.current = "";
+    __resetClaudeCodePluginCacheForTests();
   });
 
   it("returns claude-code (NOT vscode-copilot) when VSCODE_PID set AND CLAUDE_CODE_ENTRYPOINT set", () => {
@@ -75,4 +98,51 @@ describe("Issue #539 — Claude Code inside VS Code disambiguation", () => {
     expect(signal.platform).toBe("claude-code");
     expect(signal.confidence).toBe("high");
   });
+
+  // ── Slice 2: installed_plugins.json fallback ────────────
+  //
+  // Belt-and-suspenders: if BOTH env-var disambiguators happen to be absent
+  // (a real-world MCP-server-only boot we have not observed yet) but the
+  // user has ~/.claude/plugins/installed_plugins.json with a context-mode
+  // entry, treat that as proof the runtime is Claude Code with our plugin
+  // loaded. File is read once per process via memoization to keep detect()
+  // hot-path cost flat.
+
+  it("returns claude-code (NOT vscode-copilot) when VSCODE_PID set AND ~/.claude/plugins/installed_plugins.json has context-mode entry", () => {
+    // Create a fake $HOME with an installed_plugins.json that mentions
+    // context-mode the same way the real file does.
+    const fakeHome = mkdtempSync(join(tmpdir(), "ctx-mode-539-"));
+    try {
+      const pluginsDir = join(fakeHome, ".claude", "plugins");
+      mkdirSync(pluginsDir, { recursive: true });
+      writeFileSync(
+        join(pluginsDir, "installed_plugins.json"),
+        JSON.stringify({
+          version: 2,
+          plugins: {
+            "context-mode@context-mode": [
+              {
+                installPath:
+                  "/Users/me/.claude/plugins/cache/context-mode/context-mode/1.0.121",
+              },
+            ],
+          },
+          enabledPlugins: { "context-mode@context-mode": true },
+        }),
+      );
+
+      homedirMock.current = fakeHome;
+      __resetClaudeCodePluginCacheForTests();
+
+      process.env.VSCODE_PID = "12345";
+      process.env.VSCODE_CWD = "/Users/me/project";
+
+      const signal = detectPlatform();
+      expect(signal.platform).toBe("claude-code");
+      expect(signal.confidence).toBe("high");
+    } finally {
+      rmSync(fakeHome, { recursive: true, force: true });
+    }
+  });
+
 });

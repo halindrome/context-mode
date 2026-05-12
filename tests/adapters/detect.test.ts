@@ -1,6 +1,10 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { sep } from "node:path";
-import { detectPlatform, getAdapter } from "../../src/adapters/detect.js";
+import {
+  detectPlatform,
+  getAdapter,
+  __seedClaudeCodePluginCacheMissForTests,
+} from "../../src/adapters/detect.js";
 import { ClaudeCodeAdapter } from "../../src/adapters/claude-code/index.js";
 import { GeminiCLIAdapter } from "../../src/adapters/gemini-cli/index.js";
 import { OpenCodeAdapter } from "../../src/adapters/opencode/index.js";
@@ -54,6 +58,11 @@ describe("detectPlatform", () => {
     delete process.env.IDEA_HOME;
     delete process.env.JETBRAINS_CLIENT_ID;
     delete process.env.CONTEXT_MODE_PLATFORM;
+    // Issue #539 slice 2: tests in this file pre-date the installed_plugins.json
+    // fallback and assume env-var-only detection. Seed the plugin cache to a
+    // "miss" so the fallback never triggers — explicit slice-2 coverage lives
+    // in detect-claude-code-in-vscode.test.ts which exercises the real read.
+    __seedClaudeCodePluginCacheMissForTests();
     vi.restoreAllMocks();
   });
 
