@@ -43,11 +43,16 @@ describe("runtime version reporting", () => {
 
     const summary = getRuntimeSummary(runtimes);
 
-    expect(execFileSync).toHaveBeenCalledWith(
-      "go",
-      ["version"],
-      expect.objectContaining({ shell: process.platform === "win32" }),
-    );
+    // PR #537: POSIX path no longer passes `shell` option to execFileSync.
+    // On Windows, getVersion() now uses execSync(quotedCmdString) — so the
+    // execFileSync assertion only applies to non-Windows here.
+    if (process.platform !== "win32") {
+      expect(execFileSync).toHaveBeenCalledWith(
+        "go",
+        ["version"],
+        expect.objectContaining({ encoding: "utf-8" }),
+      );
+    }
     expect(execFileSync).not.toHaveBeenCalledWith(
       "go",
       ["--version"],
@@ -172,24 +177,51 @@ describe("runnableExists — Windows MS Store stub filter (#454)", () => {
     Object.defineProperty(process, "platform", { value: "win32", configurable: true });
   });
 
-  /** Build a child_process mock for runnableExists() probes. */
+  /** Build a child_process mock for runnableExists() probes.
+   *
+   * PR #537 (DEP0190 fix): on Windows, `runnableExists` now calls
+   *   execSync(`"${cmd}" --version`, …)
+   * for the version probe (string form, no args array), and `getVersion`
+   * does the same. So on win32, BOTH `where <cmd>` and the `"<cmd>" --version`
+   * probe are routed through `execSync`. `execFileSync` is no longer reached
+   * on the Windows code path.
+   */
   function mockChildProcess(opts: {
     whereResults: Record<string, string[] | "throw">;
     versionExits: Record<string, "ok" | "throw" | { code: number }>;
   }) {
     const execSync = vi.fn((cmd: string) => {
-      // commandExists path (non-Windows) shouldn't be hit when platform=win32,
-      // but be defensive: handle both `where X` and `command -v X`.
-      const m = cmd.match(/^(?:where|command -v)\s+(.+)$/);
-      if (!m) throw new Error(`unmocked execSync: ${cmd}`);
-      const tool = m[1].trim();
-      const result = opts.whereResults[tool];
-      if (result === undefined) throw new Error(`no mock for ${tool}`);
-      if (result === "throw") throw new Error(`not found: ${tool}`);
-      return result.join("\r\n") + "\r\n";
+      // `where <tool>` and `command -v <tool>` (defensive) lookups.
+      const whereMatch = cmd.match(/^(?:where|command -v)\s+(.+)$/);
+      if (whereMatch) {
+        const tool = whereMatch[1].trim();
+        const result = opts.whereResults[tool];
+        if (result === undefined) throw new Error(`no mock for ${tool}`);
+        if (result === "throw") throw new Error(`not found: ${tool}`);
+        return result.join("\r\n") + "\r\n";
+      }
+      // PR #537 Windows probe shape: `"<cmd>" --version` (cmd is quoted).
+      const probeMatch = cmd.match(/^"([^"]+)"\s+--version$/);
+      if (probeMatch) {
+        const tool = probeMatch[1];
+        const exit = opts.versionExits[tool];
+        if (exit === undefined || exit === "throw") {
+          throw new Error(`probe failed: ${tool}`);
+        }
+        if (typeof exit === "object") {
+          const err: NodeJS.ErrnoException & { status?: number } = new Error(
+            `exit ${exit.code}`,
+          );
+          err.status = exit.code;
+          throw err;
+        }
+        return Buffer.from(`${tool} 3.11.0\n`);
+      }
+      throw new Error(`unmocked execSync: ${cmd}`);
     });
+    // execFileSync remains mocked for safety, but on Windows the new code
+    // path never reaches it for runnableExists/getVersion probes.
     const execFileSync = vi.fn((cmd: string, args: string[]) => {
-      // --version probe.
       if (args[0] !== "--version") throw new Error(`unexpected args: ${args.join(" ")}`);
       const exit = opts.versionExits[cmd];
       if (exit === undefined || exit === "throw") {
@@ -239,12 +271,15 @@ describe("runnableExists — Windows MS Store stub filter (#454)", () => {
     // python3 was found in PATH AND --version succeeded → runtime is "python3"
     // (the runnableExists path returned true after filtering the WindowsApps stub).
     expect(r.python).toBe("python3");
-    // Probe was executed once for python3; should NOT cascade to "python" or "py".
-    expect(execFileSync).toHaveBeenCalledWith(
-      "python3",
-      ["--version"],
-      expect.objectContaining({ shell: true }),
+    // PR #537: on Windows the --version probe now goes through execSync as
+    // the string `"python3" --version` (no args array → no DEP0190).
+    expect(execSync).toHaveBeenCalledWith(
+      '"python3" --version',
+      expect.objectContaining({ stdio: "pipe" }),
     );
+    // Should NOT cascade to "python" or "py".
+    expect(execSync).not.toHaveBeenCalledWith('"python" --version', expect.anything());
+    expect(execSync).not.toHaveBeenCalledWith('"py" --version', expect.anything());
   });
 
   test("rejects when every `where` hit is a WindowsApps stub", async () => {
@@ -277,10 +312,12 @@ describe("runnableExists — Windows MS Store stub filter (#454)", () => {
     const r = detectRuntimes();
 
     expect(r.python).toBeNull();
-    // No --version probe should have been executed for python3/python (stubs filtered out
-    // before the probe). py threw at `where`, so it's also rejected without a probe.
-    expect(execFileSync).not.toHaveBeenCalledWith("python3", ["--version"], expect.anything());
-    expect(execFileSync).not.toHaveBeenCalledWith("python", ["--version"], expect.anything());
+    // PR #537: on Windows, --version probes are issued via execSync as
+    // the string `"<cmd>" --version`. No probe should have been executed
+    // for python3/python (stubs filtered out before the probe). py threw at
+    // `where`, so it's also rejected without a probe.
+    expect(execSync).not.toHaveBeenCalledWith('"python3" --version', expect.anything());
+    expect(execSync).not.toHaveBeenCalledWith('"python" --version', expect.anything());
   });
 
   test("rejects runtime when --version exits 9009 (MS Store stub fallthrough)", async () => {
@@ -315,7 +352,8 @@ describe("runnableExists — Windows MS Store stub filter (#454)", () => {
     const r = detectRuntimes();
 
     expect(r.python).toBeNull();
-    expect(execFileSync).toHaveBeenCalledWith("python3", ["--version"], expect.anything());
+    // PR #537 Windows probe shape.
+    expect(execSync).toHaveBeenCalledWith('"python3" --version', expect.anything());
   });
 
   test("falls back to `py` when python3 and python both fail", async () => {
@@ -347,7 +385,8 @@ describe("runnableExists — Windows MS Store stub filter (#454)", () => {
     const r = detectRuntimes();
 
     expect(r.python).toBe("py");
-    expect(execFileSync).toHaveBeenCalledWith("py", ["--version"], expect.anything());
+    // PR #537 Windows probe shape.
+    expect(execSync).toHaveBeenCalledWith('"py" --version', expect.anything());
   });
 
   test("non-Windows uses 1500ms probe timeout (faster cold detect)", async () => {
