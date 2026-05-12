@@ -13,6 +13,7 @@
 
 import { createHash } from "node:crypto";
 import { existsSync, mkdirSync } from "node:fs";
+import { homedir } from "node:os";
 import { join, resolve, dirname } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { SessionDB } from "../../session/db.js";
@@ -266,17 +267,70 @@ export function isPiShortCircuitArgv(argv: readonly string[]): boolean {
   return PI_SHORT_CIRCUIT_TOKENS.has(argv[0]);
 }
 
+/**
+ * Issue #545 — Pi workspace resolver.
+ *
+ * Pi's runtime sets PI_CONFIG_DIR to ~/.pi (its CONFIG dir, not the user's
+ * project). The extension previously used this as the project anchor, which
+ * meant every Pi session re-rooted under ~/.pi — collapsing all of a user's
+ * projects into a single phantom workspace. This helper picks the user's
+ * actual project directory while NEVER returning a path equal to or under
+ * ~/.pi/.
+ *
+ * Cascade:
+ *   1. PI_WORKSPACE_DIR — set by Pi's bridge (extension-set, freshest)
+ *   2. PI_PROJECT_DIR   — legacy/user override
+ *   3. PWD              — shell-set, survives process.chdir
+ *   4. cwd              — last resort
+ *
+ * Each candidate is rejected if it equals ~/.pi or lives under ~/.pi/. If
+ * every candidate is poisoned, falls back to homedir() as a safe non-config
+ * anchor — caller may still render a "no project context" notice but the
+ * function stays total.
+ */
+export function resolvePiWorkspaceDir(opts: {
+  env: Record<string, string | undefined>;
+  pwd: string | undefined;
+  cwd: string;
+  /** Optional override for tests; defaults to `os.homedir()`. */
+  home?: string;
+}): string {
+  const home = opts.home ?? homedir();
+  const piConfigDir = join(home, ".pi");
+  const isUnderPi = (p: string | undefined): boolean => {
+    if (!p) return true;
+    if (p === piConfigDir) return true;
+    // Match both POSIX (/) and Windows (\) child-of relations.
+    return p.startsWith(piConfigDir + "/") || p.startsWith(piConfigDir + "\\");
+  };
+  const candidates = [
+    opts.env.PI_WORKSPACE_DIR,
+    opts.env.PI_PROJECT_DIR,
+    opts.pwd,
+    opts.cwd,
+  ];
+  for (const c of candidates) {
+    if (c && !isUnderPi(c)) return c;
+  }
+  return home;
+}
+
 // ── Extension entry point ────────────────────────────────
 
 /** Pi extension default export. Called once by Pi runtime with the extension API. */
 export default function piExtension(pi: any): void {
   const buildDir = dirname(fileURLToPath(import.meta.url));
   const pluginRoot = resolve(buildDir, "..", "..", "..");
-  // Issue #542 — Pi's runtime sets PI_CONFIG_DIR (not PI_PROJECT_DIR).
-  // PI_PROJECT_DIR remains supported as a legacy override for callers
-  // that historically synthesized it. Cwd is the universal final
-  // fallback.
-  const projectDir = process.env.PI_CONFIG_DIR || process.env.PI_PROJECT_DIR || process.cwd();
+  // Issue #545 — Pi workspace resolver. PI_CONFIG_DIR is Pi's CONFIG dir
+  // (~/.pi), NOT the user's workspace; using it as the project anchor
+  // collapsed every Pi session into a single phantom workspace. The
+  // dedicated resolver picks PI_WORKSPACE_DIR > PI_PROJECT_DIR > PWD > cwd
+  // and refuses to return any path under ~/.pi/.
+  const projectDir = resolvePiWorkspaceDir({
+    env: process.env,
+    pwd: process.env.PWD,
+    cwd: process.cwd(),
+  });
 
   const db = getOrCreateDB();
 
