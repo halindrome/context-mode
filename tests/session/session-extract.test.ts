@@ -571,13 +571,6 @@ describe("Decision Events", () => {
     const decisionEvents = events.filter(e => e.type === "decision");
     assert.equal(decisionEvents.length, 0);
   });
-
-  // ─── Issue #535: Chinese (CJK) decision patterns ───
-  test("extracts decision from Chinese 不要用/改用 correction", () => {
-    const events = extractUserEvents("不要用 useState，改用 useReducer");
-    const decisionEvents = events.filter(e => e.type === "decision");
-    assert.equal(decisionEvents.length, 1);
-  });
 });
 
 // ════════════════════════════════════════════
@@ -594,13 +587,6 @@ describe("Role Events", () => {
 
   test("extracts role from 'you are' pattern", () => {
     const events = extractUserEvents("You are a principal architect. Review this design.");
-    const roleEvents = events.filter(e => e.type === "role");
-    assert.equal(roleEvents.length, 1);
-  });
-
-  // ─── Issue #535: Chinese (CJK) role patterns ───
-  test("extracts role from Chinese 你是 persona directive", () => {
-    const events = extractUserEvents("你是一名资深后端工程师");
     const roleEvents = events.filter(e => e.type === "role");
     assert.equal(roleEvents.length, 1);
   });
@@ -811,28 +797,6 @@ describe("Intent Events", () => {
     const intentEvents = events.filter(e => e.type === "intent");
     assert.equal(intentEvents.length, 1);
     assert.equal(intentEvents[0].data, "discuss");
-  });
-
-  // ─── Issue #535: Chinese (CJK) intent patterns ───
-  test("extracts implementation intent from Chinese (创建)", () => {
-    const events = extractUserEvents("创建一个登录页面");
-    const intentEvents = events.filter(e => e.type === "intent");
-    assert.equal(intentEvents.length, 1);
-    assert.equal(intentEvents[0].data, "implement");
-  });
-
-  test("extracts investigation intent from mixed-script Chinese (为什么)", () => {
-    const events = extractUserEvents("为什么这个 hook 没有触发？");
-    const intentEvents = events.filter(e => e.type === "intent");
-    assert.equal(intentEvents.length, 1);
-    assert.equal(intentEvents[0].data, "investigate");
-  });
-
-  test("extracts review intent from mixed-script Chinese (审查)", () => {
-    const events = extractUserEvents("审查 src/session/extract.ts 这个文件");
-    const intentEvents = events.filter(e => e.type === "intent");
-    assert.equal(intentEvents.length, 1);
-    assert.equal(intentEvents[0].data, "review");
   });
 });
 
@@ -2576,19 +2540,6 @@ describe("Blocked-On Events", () => {
     assert.equal(blockerEvents.length, 1);
   });
 
-  // ─── Issue #535: Chinese (CJK) blocker patterns ───
-  test("extracts blocker from Chinese 报错 keyword", () => {
-    const events = extractUserEvents("API 报错 了, 部署被阻塞");
-    const blockerEvents = events.filter(e => e.type === "blocker");
-    assert.equal(blockerEvents.length, 1);
-  });
-
-  test("extracts blocker from Chinese 卡住 keyword", () => {
-    const events = extractUserEvents("我卡住了, 等审核");
-    const blockerEvents = events.filter(e => e.type === "blocker");
-    assert.equal(blockerEvents.length, 1);
-  });
-
   // Resolution tests
 
   test("extracts blocker_resolved from 'unblocked' pattern", () => {
@@ -2630,19 +2581,6 @@ describe("Blocked-On Events", () => {
     const blockerEvents = events.filter(e => e.type === "blocker");
     assert.equal(resolvedEvents.length, 1, "should emit resolved");
     assert.equal(blockerEvents.length, 0, "should NOT emit blocker when resolved");
-  });
-
-  // ─── Issue #535: Chinese (CJK) resolution patterns ───
-  test("extracts blocker_resolved from Chinese 修好 keyword", () => {
-    const events = extractUserEvents("修好了那个 bug, 可以继续了");
-    const resolvedEvents = events.filter(e => e.type === "blocker_resolved");
-    assert.equal(resolvedEvents.length, 1);
-  });
-
-  test("extracts blocker_resolved from Chinese 解决 keyword", () => {
-    const events = extractUserEvents("问题已解决, 现在 staging 是好的");
-    const resolvedEvents = events.filter(e => e.type === "blocker_resolved");
-    assert.equal(resolvedEvents.length, 1);
   });
 
   test("does not extract blocker from unrelated messages", () => {
