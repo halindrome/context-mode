@@ -807,19 +807,38 @@ function extractWorktree(input: HookInput): SessionEvent[] {
 /**
  * Category 6: decision
  * User corrections / approach selections.
+ *
+ * Universal-rule detector (Hybrid C, issue #535):
+ *   A decision message typically takes the structural shape
+ *     "{negation/rejection} X {separator} Y" — across every human language.
+ *
+ *   We treat the following as the structural shape:
+ *     - contains a clause separator (ASCII `,` `;`, fullwidth `，` `；`,
+ *       Japanese ideographic `、`, Arabic `،`), AND
+ *     - codepoint length is in the corrective range (15..500), AND
+ *     - the message is not a question (no cross-script `?`), AND
+ *     - contains at least one alphabetic codepoint.
+ *
+ *   The renderer prints the raw message back to the next LLM, so the gate
+ *   only needs to be a coarse "looks like a correction" filter — the LLM
+ *   handles fine-grained interpretation. No per-language keyword list.
  */
 
-const DECISION_PATTERNS: RegExp[] = [
-  /\b(don'?t|do not|never|always|instead|rather|prefer)\b/i,
-  /\b(use|switch to|go with|pick|choose)\s+\w+\s+(instead|over|not)\b/i,
-  /\b(no,?\s+(use|do|try|make))\b/i,
-  // Turkish patterns
-  /\b(hayır|hayir|evet|böyle|boyle|degil|değil|yerine|kullan)\b/i,
-];
+const CLAUSE_SEPARATOR_PATTERN = /[,;，；、،]/u;
+const DECISION_MIN_CHARS = 15;
+const DECISION_MAX_CHARS = 500;
+
+function looksLikeDecision(trimmed: string): boolean {
+  if (QUESTION_MARK_PATTERN.test(trimmed)) return false;
+  if (!ALPHABETIC_PATTERN.test(trimmed)) return false;
+  if (!CLAUSE_SEPARATOR_PATTERN.test(trimmed)) return false;
+  const codepointLength = [...trimmed].length;
+  return codepointLength >= DECISION_MIN_CHARS && codepointLength <= DECISION_MAX_CHARS;
+}
 
 function extractUserDecision(message: string): SessionEvent[] {
-  const isDecision = DECISION_PATTERNS.some(p => p.test(message));
-  if (!isDecision) return [];
+  const trimmed = message.trim();
+  if (!looksLikeDecision(trimmed)) return [];
 
   return [{
     type: "decision",

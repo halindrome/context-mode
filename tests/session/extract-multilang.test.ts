@@ -108,3 +108,33 @@ describe("Slice 4: implement intent — short imperative across scripts", () => 
     assert.equal(intentMode("add login page?"), "investigate");
   });
 });
+
+// ════════════════════════════════════════════════════════════════════════════
+// SLICE 5: decision — language-agnostic via negation/alternation structure
+// ════════════════════════════════════════════════════════════════════════════
+
+describe("Slice 5: decision — universal negation+alternative pattern", () => {
+  test('English "don\'t use useState, use useReducer instead" is a decision', () => {
+    assert.ok(hasDecision("don't use useState, use useReducer instead"));
+  });
+
+  test('Russian "не используй X, используй Y вместо" is a decision', () => {
+    assert.ok(hasDecision("не используй X, используй Y вместо"));
+  });
+
+  test('Chinese "不要用 setState，用 useReducer" is a decision', () => {
+    assert.ok(hasDecision("不要用 setState，用 useReducer"));
+  });
+
+  test('Turkish "useState kullanma, useReducer kullan" is a decision', () => {
+    assert.ok(hasDecision("useState kullanma, useReducer kullan"));
+  });
+
+  test('a plain question is NOT a decision', () => {
+    assert.equal(hasDecision("what time is it?"), false);
+  });
+
+  test('a single-word noun is NOT a decision', () => {
+    assert.equal(hasDecision("test"), false);
+  });
+});
