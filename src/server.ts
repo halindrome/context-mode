@@ -37,7 +37,7 @@ import {
 } from "./session/event-emit.js";
 import { persistToolCallCounter, restoreSessionStats } from "./session/persist-tool-calls.js";
 import { searchAllSources } from "./search/unified.js";
-import { buildNodeCommand, type HookAdapter } from "./adapters/types.js";
+import { buildNodeCommand, type HookAdapter, type PlatformId } from "./adapters/types.js";
 import { detectPlatform, getSessionDirSegments } from "./adapters/detect.js";
 import { resolveCodexConfigDir } from "./adapters/codex/paths.js";
 import { getHookScriptPaths } from "./util/hook-config.js";
@@ -218,17 +218,29 @@ function getProjectDir(): string {
   // modified Claude Code session's cwd — wrong project entirely. Gate the
   // path on detected platform so non-Claude hosts skip the heuristic and
   // fall through to PWD/cwd cleanly.
+  //
+  // Issue #545 (v1.0.124): pass strictPlatform for ALL adapters so the
+  // env-var cascade is built ALGORITHMICALLY from the platform's own
+  // workspace vars + universal escape hatch — foreign workspace vars (e.g.
+  // CLAUDE_PROJECT_DIR leaked into Pi's MCP child env from the user's shell)
+  // cannot win, regardless of cascade order. start.mjs intentionally does
+  // NOT pass strictPlatform — host detection is unreliable at the entrypoint
+  // and the legacy literal cascade is preserved there for semver safety.
   let transcriptsRoot: string | undefined;
+  let strictPlatform: PlatformId | undefined;
   try {
-    if (detectPlatform().platform === "claude-code") {
+    const detected = detectPlatform().platform;
+    strictPlatform = detected;
+    if (detected === "claude-code") {
       transcriptsRoot = join(homedir(), ".claude", "projects");
     }
-  } catch { /* detection failure — leave undefined, resolver skips heuristic */ }
+  } catch { /* detection failure — leave both undefined, resolver uses legacy cascade */ }
   return resolveProjectDir({
     env: process.env,
     cwd: process.cwd(),
     pwd: process.env.PWD,
     transcriptsRoot,
+    strictPlatform,
   });
 }
 
