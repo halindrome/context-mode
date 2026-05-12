@@ -534,6 +534,22 @@ describe("getAdapter", () => {
     expect(adapter.getSessionDir()).not.toContain(".claude");
   });
 
+  it("clientInfo 'omp-coding-agent' resolves to omp adapter (issue #542 rebrand)", async () => {
+    // refs/platforms/oh-my-pi/packages/coding-agent/src/mcp/client.ts:46-49
+    // ships clientInfo.name = "omp-coding-agent" as the rebrand canonical
+    // name. Verifies the high-confidence clientInfo tier short-circuits
+    // before falling through to the config-dir heuristic (which is the
+    // root cause of issue #542 misdetecting OMP/Pi installs as Cursor).
+    const signal = detectPlatform({ name: "omp-coding-agent", version: "1.0.0" });
+    expect(signal.platform).toBe("omp");
+    expect(signal.confidence).toBe("high");
+    expect(signal.reason).toContain("clientInfo");
+    expect(signal.reason).toContain("omp-coding-agent");
+
+    const adapter = await getAdapter(signal.platform);
+    expect(adapter).toBeInstanceOf(OMPAdapter);
+  });
+
   it("returns ClaudeCodeAdapter for unknown platform", async () => {
     const adapter = await getAdapter("unknown" as any);
     expect(adapter).toBeInstanceOf(ClaudeCodeAdapter);
