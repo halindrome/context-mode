@@ -58,11 +58,18 @@ describe("runtime version reporting", () => {
       ["--version"],
       expect.anything(),
     );
-    expect(execFileSync).toHaveBeenCalledWith(
-      "node",
-      ["--version"],
-      expect.anything(),
-    );
+    // PR #537: on Windows getVersion() routes through `execSync(quotedCmdString)`
+    // rather than execFileSync, so the mocked execFileSync is never called for
+    // `node --version` on win32. L49 above already gates the `go version`
+    // assertion the same way — this matching gate was missed in PR #537's
+    // sweep and was caught by CI run 25740169321.
+    if (process.platform !== "win32") {
+      expect(execFileSync).toHaveBeenCalledWith(
+        "node",
+        ["--version"],
+        expect.anything(),
+      );
+    }
     expect(summary).toContain("Go:         go (go version go1.26.2 darwin/arm64)");
     expect(summary).not.toContain("Go:         go (unknown)");
   });
