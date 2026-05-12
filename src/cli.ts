@@ -139,7 +139,17 @@ const args = process.argv.slice(2);
 if (args[0] === "doctor") {
   doctor().then((code) => process.exit(code));
 } else if (args[0] === "upgrade") {
-  upgrade().catch((err: unknown) => {
+  // Issue #542 — accept --platform <id> from the ctx_upgrade MCP handler,
+  // which forwards the live MCP clientInfo's resolved PlatformId. The flag
+  // wins over upgrade()'s own detectPlatform() heuristic chain so an
+  // ambiguous config-dir collision (e.g. ~/.cursor + ~/.pi both present)
+  // can never misroute the upgrade.
+  const platformFlagIdx = args.indexOf("--platform");
+  const platformArg =
+    platformFlagIdx >= 0 && args[platformFlagIdx + 1]
+      ? args[platformFlagIdx + 1]
+      : undefined;
+  upgrade(platformArg ? { platform: platformArg } : undefined).catch((err: unknown) => {
     const message = err instanceof Error ? err.message : String(err);
     p.log.error(color.red(message));
     process.exit(1);
@@ -706,11 +716,18 @@ async function insight(port: number) {
  * Upgrade — adapter-aware hook configuration
  * ------------------------------------------------------- */
 
-async function upgrade() {
+async function upgrade(opts?: { platform?: string }) {
   if (process.stdout.isTTY) console.clear();
 
-  // Detect platform
-  const detection = detectPlatform();
+  // Issue #542 — when the MCP ctx_upgrade handler threads through an
+  // explicit --platform <id> (resolved from live clientInfo), trust it
+  // over the local heuristic chain. detectPlatform() with no args cannot
+  // see the MCP handshake and falls through to the config-dir tier,
+  // which misdetects Pi/OMP installs as Cursor on systems where both
+  // ~/.cursor/ and ~/.pi/ exist.
+  const detection = opts?.platform
+    ? { platform: opts.platform as Parameters<typeof getAdapter>[0], confidence: "high" as const, reason: `--platform ${opts.platform} from ctx_upgrade handler` }
+    : detectPlatform();
   const adapter = await getAdapter(detection.platform);
 
   p.intro(color.bgCyan(color.black(" context-mode upgrade ")));

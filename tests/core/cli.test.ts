@@ -410,6 +410,122 @@ describe("ABI-aware native binary caching (#148)", () => {
     expect(existsSync(join(releaseDir, "better_sqlite3.abi115.node"))).toBe(true);
     expect(existsSync(join(releaseDir, "better_sqlite3.abi137.node"))).toBe(true);
   });
+
+  // ── Bun ABI cache seeding (#543) ────────────────────────────
+  //
+  // When ensureNativeCompat runs under Bun, it early-returns BEFORE writing
+  // better_sqlite3.abi${N}.node — so the very next /ctx-upgrade run (which
+  // checks for that file as the success marker) prints a spurious
+  // "Native addon ABI cache missing" warning.
+  //
+  // Bun spoofs process.versions.modules to the Node ABI (e.g. 137 on
+  // Darwin/Bun-1.2+, matching Node 24), so a plain file-copy of the active
+  // better_sqlite3.node to the ABI-tagged path produces the CORRECT
+  // filename for any subsequent Node boot at the same ABI level.
+  //
+  // The fix lives BEFORE the existing `if (typeof globalThis.Bun !== "undefined") return;`
+  // guard inside ensureNativeCompat: if the active binary exists AND the
+  // ABI cache file does NOT, copy active → cache, then early-return.
+  //
+  // @see https://github.com/mksglu/context-mode/issues/543
+
+  describe("Bun ABI cache seeding (#543)", () => {
+    let bunBackup: unknown;
+    const hadBun = "Bun" in globalThis;
+
+    beforeEach(() => {
+      bunBackup = (globalThis as any).Bun;
+      // Simulate Bun runtime without actually running under Bun.
+      (globalThis as any).Bun = { version: "test-shim" };
+    });
+
+    afterEach(() => {
+      if (hadBun) {
+        (globalThis as any).Bun = bunBackup;
+      } else {
+        delete (globalThis as any).Bun;
+      }
+    });
+
+    test("under Bun, with active .node but no abi cache: seeds the cache via copy", async () => {
+      // Load AFTER the Bun shim is installed so the function captures it.
+      const ensureNativeCompat = await loadEnsureNativeCompat();
+      createFakeBinary(binaryPath, "active-binary-from-postinstall");
+      // Cache file is intentionally absent — this is the #543 scenario.
+      expect(existsSync(abiCachePath())).toBe(false);
+
+      ensureNativeCompat(tempDir);
+
+      // The fix: copy active → abi-tagged so the next /ctx-upgrade boot
+      // (under Node) finds the marker file and reports "ABI cache present".
+      expect(existsSync(abiCachePath())).toBe(true);
+      expect(readFileSync(abiCachePath(), "utf-8")).toBe("active-binary-from-postinstall");
+      // Active binary remains untouched.
+      expect(readFileSync(binaryPath, "utf-8")).toBe("active-binary-from-postinstall");
+    });
+
+    test("under Bun, without active .node source: does not throw and does not create cache", async () => {
+      const ensureNativeCompat = await loadEnsureNativeCompat();
+      // No active binary present — Bun-only install or pre-postinstall state.
+      expect(existsSync(binaryPath)).toBe(false);
+
+      expect(() => ensureNativeCompat(tempDir)).not.toThrow();
+
+      // No cache should be invented out of thin air.
+      expect(existsSync(abiCachePath())).toBe(false);
+    });
+
+    test("under Bun, when abi cache already exists: does not overwrite", async () => {
+      const ensureNativeCompat = await loadEnsureNativeCompat();
+      createFakeBinary(binaryPath, "fresh-active");
+      createFakeBinary(abiCachePath(), "preexisting-cache");
+
+      ensureNativeCompat(tempDir);
+
+      // Idempotent: existing cache must be preserved untouched.
+      expect(readFileSync(abiCachePath(), "utf-8")).toBe("preexisting-cache");
+    });
+
+    test("under Bun, when nativeDir is missing entirely: does not throw and does not create cache", async () => {
+      const ensureNativeCompat = await loadEnsureNativeCompat();
+      // Remove the release directory before invocation.
+      rmSync(releaseDir, { recursive: true, force: true });
+      expect(existsSync(releaseDir)).toBe(false);
+
+      expect(() => ensureNativeCompat(tempDir)).not.toThrow();
+
+      // Cache MUST NOT be created because the source dir doesn't exist —
+      // creating files inside a deleted directory would either throw or
+      // re-materialize state the user explicitly removed.
+      expect(existsSync(abiCachePath())).toBe(false);
+    });
+
+    test("under Bun, cache filename uses cross-platform resolve() (no hard-coded separators)", () => {
+      // Source-contract guard: the fix must reuse the existing resolve()-based
+      // path construction (nativeDir / binaryPath / abiCachePath are already
+      // resolve()'d at the top of ensureNativeCompat). A future maintainer
+      // adding hard-coded "/" or "\\" inside the Bun branch would break
+      // Windows. We assert the fix lives inside ensureNativeCompat AND that
+      // no new path concatenation with hard-coded separators appears in
+      // the Bun branch.
+      const src = readFileSync(resolve(ROOT, "hooks", "ensure-deps.mjs"), "utf-8");
+      const fnMatch = src.match(/^export function ensureNativeCompat\b[\s\S]*?^}/m);
+      expect(fnMatch).not.toBeNull();
+      const body = fnMatch![0];
+      // The fix must reference both source and destination paths.
+      expect(body).toMatch(/binaryPath/);
+      expect(body).toMatch(/abiCachePath/);
+      // Cross-platform safety: no path string built with "\\" or "/" literals
+      // inside the Bun gate region. We anchor on the Bun gate comment and
+      // scan the surrounding region for forbidden hard-coded separators.
+      const bunGateIdx = body.indexOf("Bun ships bun:sqlite");
+      expect(bunGateIdx).toBeGreaterThan(-1);
+      const bunRegion = body.slice(Math.max(0, bunGateIdx - 200), bunGateIdx + 600);
+      // No string concatenation with hard-coded path separators in the Bun region.
+      expect(bunRegion).not.toMatch(/["'][^"']*\\\\better_sqlite3/);
+      expect(bunRegion).not.toMatch(/["']\/[^"']*better_sqlite3\.node["']/);
+    });
+  });
 });
 
 // ── bun:sqlite adapter (#45) ──────────────────────────────────────────
@@ -1180,7 +1296,11 @@ describe("Shell-free upgrade (#185)", () => {
     const entryBody = CLI_SOURCE.slice(entryStart, CLI_SOURCE.indexOf("/* -------------------------------------------------------", entryStart + 20));
 
     expect(entryBody).toContain('} else if (args[0] === "upgrade") {');
-    expect(entryBody).toContain("upgrade().catch((err: unknown) => {");
+    // Issue #542 — entrypoint now forwards optional --platform <id> from
+    // the ctx_upgrade MCP handler. Match either invocation shape:
+    //   upgrade().catch(...)                      (legacy)
+    //   upgrade(... ? { platform: ... } : ...).catch(...)  (issue #542)
+    expect(entryBody).toMatch(/upgrade\([^)]*\)\.catch\(\(err: unknown\) => \{/);
     expect(entryBody).toContain("process.exit(1);");
   });
 
