@@ -619,6 +619,13 @@ describe("PLATFORM_ENV_VARS — typed registry (issue #545 algorithmic design)",
     expect(codex).toEqual([]);
   });
 
+  // Slice 2 — Pi's workspace var registry. PI_WORKSPACE_DIR (extension-set,
+  // freshest) before PI_PROJECT_DIR (user override) per registry-author order.
+  it("workspaceEnvVarsFor('pi') returns [PI_WORKSPACE_DIR, PI_PROJECT_DIR] in cascade order", async () => {
+    const { workspaceEnvVarsFor } = await import("../../src/adapters/detect.js");
+    expect(workspaceEnvVarsFor("pi")).toEqual(["PI_WORKSPACE_DIR", "PI_PROJECT_DIR"]);
+  });
+
   it("foreignWorkspaceEnv(p) returns workspace vars from OTHER platforms", async () => {
     const { foreignWorkspaceEnv } = await import("../../src/adapters/detect.js");
     const banForPi = foreignWorkspaceEnv("pi");
