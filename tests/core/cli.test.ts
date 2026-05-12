@@ -196,11 +196,21 @@ describe(".mcp.json — MCP server config", () => {
     expect(args[0]).toContain("CLAUDE_PLUGIN_ROOT");
   });
 
-  it("repo-root .mcp.json uses relative path to silence CLAUDE_PLUGIN_ROOT warning", () => {
+  it("repo-root .mcp.json uses ${CLAUDE_PLUGIN_ROOT} placeholder (Issue #531)", () => {
+    // Issue #531 (closes #253 / commit aea633c regression):
+    // The shipped `.mcp.json` template MUST use the literal
+    // `${CLAUDE_PLUGIN_ROOT}/start.mjs` placeholder. The prior version of
+    // this test asserted a bare relative `./start.mjs` to "silence a
+    // CLAUDE_PLUGIN_ROOT warning" — but that bare relative path broke
+    // every fresh marketplace install: Claude Code spawns the MCP child
+    // with session CWD (not pluginRoot) inherited, so `./start.mjs`
+    // throws MODULE_NOT_FOUND on every ctx_* tool. The placeholder is
+    // resolved by Claude at load-time to the actual cache dir and
+    // survives /ctx-upgrade. See also the asymmetric-drift invariant in
+    // tests/scripts/asymmetric-drift-assert.test.ts.
     const mcp = JSON.parse(readFileSync(resolve(ROOT, ".mcp.json"), "utf-8"));
     const args = mcp.mcpServers["context-mode"].args;
-    expect(args[0]).not.toContain("CLAUDE_PLUGIN_ROOT");
-    expect(args[0]).toMatch(/^\.\/|^start\.mjs$/);
+    expect(args[0]).toBe("${CLAUDE_PLUGIN_ROOT}/start.mjs");
   });
 });
 
