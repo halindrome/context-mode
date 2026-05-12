@@ -189,8 +189,11 @@ function getVersion(cmd: string, args: string[] = ["--version"]): string {
   try {
     // DEP0190 fix: avoid args array with shell:true on Windows.
     if (process.platform === "win32") {
+      // Hardening (PR #537 review): quote any cmd.exe metacharacter, not just
+      // whitespace. Current arg sources are internally controlled, but cheap
+      // defense-in-depth for future call sites.
       const cmdStr = [cmd, ...args]
-        .map(a => /\s/.test(a) ? JSON.stringify(a) : a)
+        .map(a => /[\s"&|<>^()%!]/.test(a) ? JSON.stringify(a) : a)
         .join(" ");
       return execSync(cmdStr, {
         encoding: "utf-8",
