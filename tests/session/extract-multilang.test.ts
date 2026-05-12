@@ -138,3 +138,35 @@ describe("Slice 5: decision — universal negation+alternative pattern", () => {
     assert.equal(hasDecision("test"), false);
   });
 });
+
+// ════════════════════════════════════════════════════════════════════════════
+// SLICE 6: role — structural persona statement across scripts
+// ════════════════════════════════════════════════════════════════════════════
+
+describe("Slice 6: role — second-person persona statements across scripts", () => {
+  test('English "You are a senior backend engineer" is a role', () => {
+    assert.ok(hasRole("You are a senior backend engineer"));
+  });
+
+  test('French "Tu es un développeur senior" is a role', () => {
+    assert.ok(hasRole("Tu es un développeur senior"));
+  });
+
+  test('Japanese "あなたは経験豊富なエンジニアです" is a role', () => {
+    assert.ok(hasRole("あなたは経験豊富なエンジニアです"));
+  });
+
+  test('Turkish "Sen kıdemli bir backend mühendisisin" is a role', () => {
+    assert.ok(hasRole("Sen kıdemli bir backend mühendisisin"));
+  });
+
+  test('a question is NOT a role', () => {
+    assert.equal(hasRole("what time is it?"), false);
+  });
+
+  test('a long discursive paragraph is NOT a role', () => {
+    const longRun =
+      "We have been discussing this architecture for a while and there are several trade-offs to weigh before committing to any single approach right now.";
+    assert.equal(hasRole(longRun), false);
+  });
+});

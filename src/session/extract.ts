@@ -851,18 +851,48 @@ function extractUserDecision(message: string): SessionEvent[] {
 /**
  * Category 7: role
  * Persona / behavioral directive patterns.
+ *
+ * Universal-rule detector (Hybrid C, issue #535):
+ *   A persona/role statement is structurally a single non-question clause
+ *   of moderate length containing more than one lexical token — e.g.
+ *     "You are a senior engineer", "Tu es développeur",
+ *     "あなたは経験豊富なエンジニアです", "Sen kıdemli mühendisisin".
+ *
+ *   We treat the following as the structural shape:
+ *     - codepoint length is in the persona range (12..120), AND
+ *     - is not a question (no cross-script `?`), AND
+ *     - is a single clause (no clause separator that would mark it as a
+ *       decision), AND
+ *     - carries enough lexical density: either two whitespace-separated
+ *       runs of letters, OR a continuous Unicode-letter run of ≥6
+ *       codepoints (a fallback for scripts without word spaces — Japanese,
+ *       Chinese, Thai).
+ *
+ *   The renderer prints the raw message back to the next LLM verbatim,
+ *   so the gate only needs a coarse "looks like a persona statement"
+ *   filter — no per-language keyword list.
  */
 
-const ROLE_PATTERNS: RegExp[] = [
-  /\b(act as|you are|behave like|pretend|role of|persona)\b/i,
-  /\b(senior|staff|principal|lead)\s+(engineer|developer|architect)\b/i,
-  // Turkish patterns
-  /\b(gibi davran|rolünde|olarak çalış)\b/i,
-];
+const ROLE_MIN_CHARS = 12;
+const ROLE_MAX_CHARS = 120;
+const TWO_LEXICAL_TOKENS_PATTERN = /\p{L}+\s+\p{L}+/u;
+const CONTINUOUS_LETTER_RUN_PATTERN = /\p{L}{6,}/u;
+
+function looksLikeRole(trimmed: string): boolean {
+  if (QUESTION_MARK_PATTERN.test(trimmed)) return false;
+  if (CLAUSE_SEPARATOR_PATTERN.test(trimmed)) return false;
+  if (!ALPHABETIC_PATTERN.test(trimmed)) return false;
+  const codepointLength = [...trimmed].length;
+  if (codepointLength < ROLE_MIN_CHARS || codepointLength > ROLE_MAX_CHARS) return false;
+  return (
+    TWO_LEXICAL_TOKENS_PATTERN.test(trimmed) ||
+    CONTINUOUS_LETTER_RUN_PATTERN.test(trimmed)
+  );
+}
 
 function extractRole(message: string): SessionEvent[] {
-  const isRole = ROLE_PATTERNS.some(p => p.test(message));
-  if (!isRole) return [];
+  const trimmed = message.trim();
+  if (!looksLikeRole(trimmed)) return [];
 
   return [{
     type: "role",
