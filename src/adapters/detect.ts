@@ -7,7 +7,8 @@
  *   3. Fallback to Claude Code (low confidence — most common)
  *
  * Verified env vars per platform (from source code audit):
- *   - Claude Code:    CLAUDE_PROJECT_DIR, CLAUDE_SESSION_ID | ~/.claude/
+ *   - Claude Code:    CLAUDE_CODE_ENTRYPOINT, CLAUDE_PLUGIN_ROOT,
+ *                     CLAUDE_PROJECT_DIR, CLAUDE_SESSION_ID | ~/.claude/
  *   - Gemini CLI:     GEMINI_PROJECT_DIR (hooks), GEMINI_CLI (MCP) | ~/.gemini/
  *   - KiloCode:       KILO, KILO_PID | ~/.config/kilo/
  *   - OpenCode:       OPENCODE, OPENCODE_PID | ~/.config/opencode/
@@ -34,7 +35,22 @@ export const PLATFORM_ENV_VARS = [
   // Order matters: forks listed BEFORE the fork's parent so collision
   // detection works. Every entry verified against platform's own runtime
   // source code (PR #376 follow-up: full audit, May 2026 — see git blame).
-  ["claude-code",        ["CLAUDE_PROJECT_DIR", "CLAUDE_SESSION_ID"]],
+  // Claude Code — verified against a live `env` dump (2026-05-11):
+  //   CLAUDE_CODE_ENTRYPOINT=cli              (set on every CC session)
+  //   CLAUDE_PLUGIN_ROOT=/Users/.../<version>  (set when a plugin is loaded)
+  //   CLAUDE_PROJECT_DIR=/Users/.../project    (set in hooks context)
+  //   CLAUDE_SESSION_ID=<uuid>                 (legacy session marker)
+  // CLAUDE_CODE_ENTRYPOINT and CLAUDE_PLUGIN_ROOT are CC-exclusive — they
+  // are the disambiguators for issue #539 (Claude Code running inside a
+  // VS Code integrated terminal that has VSCODE_PID set). They MUST be
+  // checked here so detect resolves to claude-code BEFORE falling through
+  // to vscode-copilot at line 70 below.
+  ["claude-code",        [
+    "CLAUDE_CODE_ENTRYPOINT",
+    "CLAUDE_PLUGIN_ROOT",
+    "CLAUDE_PROJECT_DIR",
+    "CLAUDE_SESSION_ID",
+  ]],
   // antigravity (Electron/VSCode fork) — google-gemini/gemini-cli
   // packages/core/src/ide/detect-ide.ts checks ANTIGRAVITY_CLI_ALIAS as the
   // canonical Antigravity marker. Listed before vscode-copilot.
