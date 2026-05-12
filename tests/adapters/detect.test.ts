@@ -54,6 +54,12 @@ describe("detectPlatform", () => {
     delete process.env.VSCODE_CWD;
     delete process.env.QWEN_PROJECT_DIR;
     delete process.env.PI_CODING_AGENT_DIR;
+    // Issue #542 — Pi-runtime markers (PI_CONFIG_DIR, PI_SESSION_FILE,
+    // PI_COMPILED) replace the stale PI_PROJECT_DIR detection signal.
+    delete process.env.PI_CONFIG_DIR;
+    delete process.env.PI_SESSION_FILE;
+    delete process.env.PI_COMPILED;
+    delete process.env.PI_PROJECT_DIR;
     delete process.env.IDEA_INITIAL_DIRECTORY;
     delete process.env.IDEA_HOME;
     delete process.env.JETBRAINS_CLIENT_ID;
@@ -222,14 +228,34 @@ describe("detectPlatform", () => {
   });
 
   // ── Pi ─────────────────────────────────────────────────
-  // Pi runtime sets PI_PROJECT_DIR before invoking the extension —
-  // verified by src/adapters/pi/extension.ts:154 + src/server.ts:153 consumers.
+  // Issue #542 — PI_PROJECT_DIR is consumed by src/adapters/pi/extension.ts
+  // but is NOT auto-set by the Pi runtime (verified at
+  // refs/platforms/oh-my-pi/packages/coding-agent/src/mcp/transports/stdio.ts:55-63
+  // — env passthrough only, no synthesis). Detection markers now use the
+  // Pi-exclusive PI_CONFIG_DIR / PI_SESSION_FILE / PI_COMPILED set by
+  // the runtime.
 
-  it("detects pi via PI_PROJECT_DIR env var", () => {
-    process.env.PI_PROJECT_DIR = "/some/project";
+  it("detects pi via PI_CONFIG_DIR env var", () => {
+    process.env.PI_CONFIG_DIR = "/home/u/.pi";
     const signal = detectPlatform();
     expect(signal.platform).toBe("pi");
     expect(signal.confidence).toBe("high");
+  });
+
+  it("detects pi via PI_SESSION_FILE env var", () => {
+    process.env.PI_SESSION_FILE = "/home/u/.pi/sessions/abc.json";
+    const signal = detectPlatform();
+    expect(signal.platform).toBe("pi");
+    expect(signal.confidence).toBe("high");
+  });
+
+  it("does NOT match pi on PI_PROJECT_DIR alone (issue #542 — dead marker removed)", () => {
+    // PI_PROJECT_DIR is consumed by src/adapters/pi/extension.ts but is
+    // not auto-set by the Pi runtime, so it cannot be a detection signal.
+    // Test guards against regressing back to the broken marker.
+    process.env.PI_PROJECT_DIR = "/some/project";
+    const signal = detectPlatform();
+    expect(signal.platform).not.toBe("pi");
   });
 
   // ── OMP (Oh My Pi) ──────────────────────────────────────
@@ -245,9 +271,9 @@ describe("detectPlatform", () => {
     expect(signal.confidence).toBe("high");
   });
 
-  it("prefers omp over pi when both PI_CODING_AGENT_DIR and PI_PROJECT_DIR are set", () => {
+  it("prefers omp over pi when both PI_CODING_AGENT_DIR and PI_CONFIG_DIR are set", () => {
     process.env.PI_CODING_AGENT_DIR = "/home/user/.omp/agent";
-    process.env.PI_PROJECT_DIR = "/some/project";
+    process.env.PI_CONFIG_DIR = "/home/u/.pi";
     const signal = detectPlatform();
     expect(signal.platform).toBe("omp");
     expect(signal.confidence).toBe("high");

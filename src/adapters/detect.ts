@@ -139,9 +139,15 @@ export const PLATFORM_ENV_VARS = [
   // agent-dir override per `packages/utils/src/dirs.ts:193`. Listed
   // BEFORE pi so OMP is not misclassified as Pi when both are installed.
   ["omp",                ["PI_CODING_AGENT_DIR"]],
-  // pi — PI_PROJECT_DIR consumed by src/adapters/pi/extension.ts:154 + src/server.ts:153
-  // — implies the Pi runtime sets it before invoking the extension.
-  ["pi",                 ["PI_PROJECT_DIR"]],
+  // pi — Issue #542 marker correction. PI_PROJECT_DIR is a consumer-set
+  // var (read by src/adapters/pi/extension.ts) but is NOT auto-set by
+  // the Pi runtime — verified against
+  //   refs/platforms/oh-my-pi/packages/coding-agent/src/mcp/transports/stdio.ts:55-63
+  // (env passthrough only, no synthesis). The Pi runtime DOES set
+  // PI_CONFIG_DIR (config dir override), PI_SESSION_FILE (active session
+  // path), and PI_COMPILED (binary build marker). PI_CODING_AGENT_DIR is
+  // owned by OMP above; keep it there.
+  ["pi",                 ["PI_CONFIG_DIR", "PI_SESSION_FILE", "PI_COMPILED"]],
   // openclaw — removed (runtime never sets OPENCLAW_HOME or OPENCLAW_CLI;
   // detection falls through to ~/.openclaw/ config-dir tier below).
   // kiro — not listed (no auto-set process env vars; ~/.kiro/ config-dir tier).
