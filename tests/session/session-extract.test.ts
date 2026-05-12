@@ -827,6 +827,13 @@ describe("Intent Events", () => {
     assert.equal(intentEvents.length, 1);
     assert.equal(intentEvents[0].data, "investigate");
   });
+
+  test("extracts review intent from mixed-script Chinese (审查)", () => {
+    const events = extractUserEvents("审查 src/session/extract.ts 这个文件");
+    const intentEvents = events.filter(e => e.type === "intent");
+    assert.equal(intentEvents.length, 1);
+    assert.equal(intentEvents[0].data, "review");
+  });
 });
 
 // ════════════════════════════════════════════
