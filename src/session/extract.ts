@@ -815,6 +815,8 @@ const DECISION_PATTERNS: RegExp[] = [
   /\b(no,?\s+(use|do|try|make))\b/i,
   // Turkish patterns
   /\b(hayır|hayir|evet|böyle|boyle|degil|değil|yerine|kullan)\b/i,
+  // Chinese (CJK) patterns — issue #535. \b is ASCII-only and skips CJK.
+  /不要用|不用|改用|换用|换成|决定|选择|应该用|不要|要用/,
 ];
 
 function extractUserDecision(message: string): SessionEvent[] {

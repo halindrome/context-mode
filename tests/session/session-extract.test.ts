@@ -571,6 +571,13 @@ describe("Decision Events", () => {
     const decisionEvents = events.filter(e => e.type === "decision");
     assert.equal(decisionEvents.length, 0);
   });
+
+  // ─── Issue #535: Chinese (CJK) decision patterns ───
+  test("extracts decision from Chinese 不要用/改用 correction", () => {
+    const events = extractUserEvents("不要用 useState，改用 useReducer");
+    const decisionEvents = events.filter(e => e.type === "decision");
+    assert.equal(decisionEvents.length, 1);
+  });
 });
 
 // ════════════════════════════════════════════
