@@ -359,21 +359,48 @@ function matchesContextModeTool(toolName, ctxName, legacyName) {
   return raw.includes("context-mode") && leaf === legacyName;
 }
 
-// External MCP detection (#529). MCP-namespaced tool names follow the
-// `mcp__<server>__<tool>` convention on Claude Code / Gemini CLI / Antigravity
-// / Qwen Code (see core/tool-naming.mjs). Tools belonging to context-mode itself
-// are excluded — they have dedicated routing branches above (ctx_execute,
-// ctx_execute_file, ctx_batch_execute) and re-routing them here would
-// double-process the call.
+// External MCP detection (#529 + 15-adapter coverage follow-up).
+//
+// MCP-namespaced tool names follow per-platform conventions (see
+// core/tool-naming.mjs):
+//   - `mcp__<server>__<tool>`     Claude Code / Gemini CLI / Antigravity / Qwen Code / Codex
+//   - `MCP:<tool>`                Cursor
+//   - `@<server>/<tool>`          Kiro
+//
+// Tools belonging to context-mode itself are excluded — they have dedicated
+// routing branches above (ctx_execute, ctx_execute_file, ctx_batch_execute)
+// and re-routing them here would double-process the call.
 const MCP_PREFIX = "mcp__";
-const CONTEXT_MODE_MCP_SUBSTRING = "context-mode";
+const CURSOR_MCP_PREFIX = "MCP:";
+const KIRO_MCP_PREFIX = "@";
+const CTX_TOOL_PREFIX = "ctx_";
+const CONTEXT_MODE_SUBSTRING = "context-mode";
 
 function isExternalMcpTool(toolName) {
   const raw = String(toolName ?? "");
-  if (!raw.startsWith(MCP_PREFIX)) return false;
-  const server = raw.slice(MCP_PREFIX.length).split("__")[0];
-  if (!server) return false;
-  return !server.includes(CONTEXT_MODE_MCP_SUBSTRING);
+
+  // Claude / Codex / Gemini / Qwen / Antigravity wire shape.
+  if (raw.startsWith(MCP_PREFIX)) {
+    const server = raw.slice(MCP_PREFIX.length).split("__")[0];
+    if (!server) return false;
+    return !server.includes(CONTEXT_MODE_SUBSTRING);
+  }
+
+  // Cursor wire shape: `MCP:<tool>` — own tools are `MCP:ctx_*`. There is no
+  // server segment, so the discriminator is the tool-leaf prefix.
+  if (raw.startsWith(CURSOR_MCP_PREFIX)) {
+    const tool = raw.slice(CURSOR_MCP_PREFIX.length);
+    return tool.length > 0 && !tool.startsWith(CTX_TOOL_PREFIX);
+  }
+
+  // Kiro wire shape: `@<server>/<tool>` — own tools are `@context-mode/ctx_*`.
+  if (raw.startsWith(KIRO_MCP_PREFIX) && raw.includes("/")) {
+    const server = raw.slice(KIRO_MCP_PREFIX.length).split("/")[0];
+    if (!server) return false;
+    return !server.includes(CONTEXT_MODE_SUBSTRING);
+  }
+
+  return false;
 }
 
 /**
