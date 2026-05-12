@@ -856,23 +856,36 @@ function extractRole(message: string): SessionEvent[] {
 /**
  * Category 13: intent
  * Session mode classification from user messages.
+ *
+ * Universal-rule detector (Hybrid C, issue #535):
+ *   investigate — message contains a question mark from any script:
+ *                 ASCII `?` U+003F, fullwidth `？` U+FF1F, Arabic `؟` U+061F,
+ *                 Spanish opening `¿` U+00BF.
+ *                 (Greek `;` U+037E and Armenian `՞` U+055E are excluded —
+ *                  Greek shares its codepoint with ASCII semicolon, which
+ *                  would produce false positives across the corpus.)
+ *
+ * Structural / Unicode-aware — no per-language keyword list.
  */
 
-const INTENT_PATTERNS: Array<{ mode: string; pattern: RegExp }> = [
-  { mode: "investigate", pattern: /\b(why|how does|explain|understand|what is|analyze|debug|look into)\b/i },
-  { mode: "implement",   pattern: /\b(create|add|build|implement|write|make|develop|fix)\b/i },
-  { mode: "discuss",     pattern: /\b(think about|consider|should we|what if|pros and cons|opinion)\b/i },
-  { mode: "review",      pattern: /\b(review|check|audit|verify|test|validate)\b/i },
-];
+const QUESTION_MARK_PATTERN = /[?？؟¿]/u;
 
 function extractIntent(message: string): SessionEvent[] {
-  const match = INTENT_PATTERNS.find(({ pattern }) => pattern.test(message));
-  if (!match) return [];
+  const trimmed = message.trim();
+  if (!trimmed) return [];
+
+  let mode: string | undefined;
+
+  if (QUESTION_MARK_PATTERN.test(trimmed)) {
+    mode = "investigate";
+  }
+
+  if (!mode) return [];
 
   return [{
     type: "intent",
     category: "intent",
-    data: safeString(match.mode),
+    data: safeString(mode),
     priority: 4,
   }];
 }

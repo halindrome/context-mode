@@ -1,0 +1,52 @@
+/**
+ * Multilingual extract-user-events behavior tests.
+ *
+ * Verifies that universal-rule detectors (structural / Unicode-aware) work
+ * for any human language — not just the keyword sets baked into the old
+ * keyword arrays. Drives behavior through the public `extractUserEvents`
+ * interface so the tests survive any internal refactor.
+ *
+ * Issue: mksglu/context-mode#535
+ */
+
+import { strict as assert } from "node:assert";
+import { describe, test } from "vitest";
+import { extractUserEvents } from "../../src/session/extract.js";
+import type { SessionEvent } from "../../src/session/extract.js";
+
+// ── Helpers ──────────────────────────────────────────────────────────────────
+
+function findEvent(events: SessionEvent[], type: string): SessionEvent | undefined {
+  return events.find(e => e.type === type);
+}
+
+function intentMode(message: string): string | undefined {
+  const events = extractUserEvents(message);
+  return findEvent(events, "intent")?.data;
+}
+
+function hasDecision(message: string): boolean {
+  return Boolean(findEvent(extractUserEvents(message), "decision"));
+}
+
+function hasRole(message: string): boolean {
+  return Boolean(findEvent(extractUserEvents(message), "role"));
+}
+
+function hasBlocker(message: string): boolean {
+  return Boolean(findEvent(extractUserEvents(message), "blocker"));
+}
+
+function hasBlockerResolved(message: string): boolean {
+  return Boolean(findEvent(extractUserEvents(message), "blocker_resolved"));
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// SLICE 1: investigate intent via Unicode question-mark family
+// ════════════════════════════════════════════════════════════════════════════
+
+describe("Slice 1: investigate intent — Chinese fullwidth question mark", () => {
+  test('"为什么这个 hook 没有触发？" yields mode:"investigate"', () => {
+    assert.equal(intentMode("为什么这个 hook 没有触发？"), "investigate");
+  });
+});
