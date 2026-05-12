@@ -858,11 +858,14 @@ function extractRole(message: string): SessionEvent[] {
  * Session mode classification from user messages.
  */
 
+// NOTE: Patterns include CJK (Chinese) keywords outside the `\b...\b` ASCII
+// word-boundary group, because `\b` only fires at ASCII↔non-ASCII transitions
+// and silently misses pure-CJK input (issue #535).
 const INTENT_PATTERNS: Array<{ mode: string; pattern: RegExp }> = [
-  { mode: "investigate", pattern: /\b(why|how does|explain|understand|what is|analyze|debug|look into)\b/i },
-  { mode: "implement",   pattern: /\b(create|add|build|implement|write|make|develop|fix)\b/i },
-  { mode: "discuss",     pattern: /\b(think about|consider|should we|what if|pros and cons|opinion)\b/i },
-  { mode: "review",      pattern: /\b(review|check|audit|verify|test|validate)\b/i },
+  { mode: "investigate", pattern: /\b(why|how does|explain|understand|what is|analyze|debug|look into)\b|为什么|怎么|如何|分析|调试|解释/i },
+  { mode: "implement",   pattern: /\b(create|add|build|implement|write|make|develop|fix)\b|创建|新增|添加|实现|编写|修复|开发/i },
+  { mode: "discuss",     pattern: /\b(think about|consider|should we|what if|pros and cons|opinion)\b|讨论|考虑|是否应该|意见|利弊/i },
+  { mode: "review",      pattern: /\b(review|check|audit|verify|test|validate)\b|审查|检查|审计|验证|测试/i },
 ];
 
 function extractIntent(message: string): SessionEvent[] {

@@ -798,6 +798,21 @@ describe("Intent Events", () => {
     assert.equal(intentEvents.length, 1);
     assert.equal(intentEvents[0].data, "discuss");
   });
+
+  // ─── Issue #535: Chinese (CJK) intent patterns ───
+  test("extracts implementation intent from Chinese (创建)", () => {
+    const events = extractUserEvents("创建一个登录页面");
+    const intentEvents = events.filter(e => e.type === "intent");
+    assert.equal(intentEvents.length, 1);
+    assert.equal(intentEvents[0].data, "implement");
+  });
+
+  test("extracts investigation intent from mixed-script Chinese (为什么)", () => {
+    const events = extractUserEvents("为什么这个 hook 没有触发？");
+    const intentEvents = events.filter(e => e.type === "intent");
+    assert.equal(intentEvents.length, 1);
+    assert.equal(intentEvents[0].data, "investigate");
+  });
 });
 
 // ════════════════════════════════════════════
