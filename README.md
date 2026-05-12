@@ -146,7 +146,7 @@ This gives you all 11 MCP tools without automatic routing. The model can still u
      "hooks": {
        "BeforeTool": [
          {
-           "matcher": "run_shell_command|read_file|read_many_files|grep_search|search_file_content|web_fetch|activate_skill|mcp__plugin_context-mode",
+           "matcher": "run_shell_command|read_file|read_many_files|grep_search|search_file_content|web_fetch|activate_skill|mcp__plugin_context-mode|mcp__context-mode|mcp__(?!.*context-mode)",
            "hooks": [{ "type": "command", "command": "context-mode hook gemini-cli beforetool" }]
          }
        ],
