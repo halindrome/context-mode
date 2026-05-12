@@ -152,6 +152,155 @@ They MUST be honored on every ops cycle, without exception:
 12. **Competitive context.** A Codex-equivalent EM exists. The owner
     believes you should outperform it. Ship like you mean it.
 
+---
+
+### Lessons Learned — DO NOT REPEAT (recorded permanent failures)
+
+These are architectural anti-patterns we have ALREADY fallen into and
+fixed publicly. They MUST NOT recur. Every future ops cycle MUST check
+these before proposing a solution:
+
+**L1 — Per-language keyword arrays do not scale (Issue #535).**
+Hand-curated regex word lists per human language (English, Turkish,
+Chinese, …) are a maintenance trap. Thousands of languages exist; every
+new user report drops another array on the maintainer. NEVER add a
+language-specific keyword list to extract / match user-facing text.
+Use Unicode-aware structural detectors (script-agnostic patterns,
+codepoint families like `[?？؟¿]`, programming-domain markers like
+`Error:` / `Traceback`, sentence-shape heuristics) plus a raw-text
+safety net (last N user messages verbatim in the resume block) so the
+next LLM can interpret what the structural detector missed. The CJK
+keyword PR was REVERTED in v1.0.122 because it walked straight into
+this trap.
+
+**L2 — Asymmetric heal: one canonical source per invariant (Issues
+#531 + #523).** When two sibling files MUST agree (`.mcp.json` and
+`.claude-plugin/plugin.json mcpServers.args` both encoding the same
+spawn shape), do NOT heal one and leave the other to drift. Either
+collapse them to a single source-of-truth OR write a build-chain CI
+asserter that fails loud on any divergence. PR #253's regression
+survived a full release cycle because we shipped a heal for one file
+and assumed the other was "unaffected" — it was not. Whenever you
+introduce a heal layer, enumerate ALL siblings carrying the same
+contract and either heal them all OR add a drift-guard test.
+
+**L3 — Bundles regen on `main` push, never committed on `next`
+(memory `project_ci_bundles.md`).** `cli.bundle.mjs` /
+`server.bundle.mjs` / `hooks/*.bundle.mjs` are produced by
+`bundle.yml` automatically. Manual bundle commits in feature branches
+or contributor PRs cause merge friction, policy drift, and stale
+shipping. Strip bundle files from any contributor PR before merge.
+Never `git add *.bundle.mjs` on a `next`-target branch yourself.
+
+**L4 — `.mcp.json` is dual-purpose AND must not ship via npm
+(Issue #531 architectural).** The repo-root `.mcp.json` serves two
+contradictory roles: contributor dev convenience (relative path works
+because cwd = repo root) vs end-user marketplace install (placeholder
+form is required). Solution: untrack the file (`.gitignore` it),
+remove it from `package.json files[]`, ship a `.mcp.json.example`
+template, and let `cli.ts upgrade()` write the canonical placeholder
+form into the plugin cache. Future architectural conflicts of the
+form "two roles, one file" should resolve the same way: stop
+tracking the file, ship a template, generate the live file at
+install time.
+
+**L5 — Hook code must remain synchronous and dependency-free.**
+`extract.ts` declares "pure functions, zero side effects, sync
+hot-path" in its file header for a reason: hooks run on EVERY
+UserPromptSubmit and blocking on an LLM/network call would stall
+the user's tool calls. NEVER add an external API call (Claude /
+OpenAI / embedding service) inside a hook. If you need
+deferred-LLM extraction, do it at session-resume RENDER time
+(boot-time, cached), not at hook time.
+
+**L6 — Always investigate git history BEFORE proposing a fix.**
+For every reported issue, run `git log --follow --all -- <file>`
+and `git log -S '<pattern>'` on the relevant code. Recurrence is
+common — many issues are old fixes coming undone (#253 → #531,
+#411 → #523, #311/#388 → #534). If your fix would re-introduce
+the original problem the prior commit was solving, you MUST find
+a third-way solution that preserves both invariants.
+
+**L7 — Bundle-invariant CI gate (G3 architectural guardrail).**
+`scripts/assert-bundle.mjs` exists because we shipped `Dynamic
+require of "node:fs"` in v1.0.118 — a bug class that would have
+been caught at build time by a 30-line script. When you encounter
+a class of bug that "should have been caught at build time", add
+the build-time assertion BEFORE shipping the fix. Build-time
+guardrails compound: each one prevents a future class permanently.
+
+**L8 — Cross-OS test isolation: APPDATA/LOCALAPPDATA/XDG_*/TMPDIR.**
+Tests that use `tests/setup-home.ts` only scoping `HOME`/`USERPROFILE`
+will leak into Windows `%APPDATA%` and `%LOCALAPPDATA%` paths and
+fail-by-accident on the windows-latest runner. Use the
+`withIsolatedEnv()` helper introduced in v1.0.119 for any test that
+touches adapter discovery, FTS5, or session DB paths.
+
+---
+
+### refs/ — Platform Evidence Base (anti-hallucination ground truth)
+
+`refs/platforms/` is the project's shadow copy of every upstream
+runtime context-mode integrates with. It is THE evidence base for the
+anti-hallucination rule (principle #3 above). Whenever an agent claims
+"Codex does X" / "Cursor reads Y" / "Pi exposes hook Z", the claim
+MUST be backed by a `refs/platforms/<name>/<file>:<line>` citation
+from the actual upstream source — never from LLM training memory.
+
+The owner has been burned by silent LLM platform-behavior
+fabrication enough times that `refs/` exists specifically to make
+verification mechanical. If `refs/<platform>/` is missing or stale,
+work on that platform is BLOCKED until the agent re-clones.
+
+**Upstream repositories tracked in `refs/platforms/`:**
+
+| Platform | Upstream | Purpose |
+|---|---|---|
+| `codex` | https://github.com/openai/codex | OpenAI Codex CLI — plugin loader, marketplace, MCP launcher |
+| `gemini-cli` | https://github.com/google-gemini/gemini-cli | Google Gemini CLI — hooks API, MCP wiring |
+| `kilo` | https://github.com/Kilo-Org/kilocode | Kilo Code — OpenCode fork, hook surface |
+| `kiro-meta` | https://github.com/kirodotdev/Kiro | Kiro — `@<server>/<tool>` MCP naming, settings format |
+| `oh-my-pi` | https://github.com/can1357/oh-my-pi | Pi coding agent — extension API, short-circuit flags, MCP bridge |
+| `openclaw` | https://github.com/openclaw/openclaw | OpenClaw — plugin paradigm (`before_tool_call` interception) |
+| `opencode` | https://github.com/sst/opencode | OpenCode — `chat.message` / `tool.execute.before` |
+| `qwen-code` | https://github.com/QwenLM/qwen-code | Qwen Code — Gemini fork, `qwen-cli-mcp-client-*` naming |
+| `vscode-copilot` | https://github.com/microsoft/vscode-copilot-chat | VSCode Copilot — `.vscode/mcp.json` reader |
+| `zed` | https://github.com/zed-industries/zed | Zed — MCP-only paradigm, no hook surface |
+
+**Auto-recovery protocol — MUST follow when `refs/` is missing
+or stale.**
+
+`refs/` lives outside the published npm tarball and is git-ignored
+in the context-mode repo so the publish artifact stays small. That
+means a fresh clone of context-mode does NOT include `refs/`. Any
+ops agent that needs to verify a platform claim MUST first ensure
+the relevant `refs/platforms/<name>/` exists with the upstream
+source it expects. If even one platform directory is missing, the
+agent's response MUST be:
+
+1. Detect the gap: `[ ! -d refs/platforms/<name> ]` or empty.
+2. Issue parallel clones — `ctx_batch_execute(commands, concurrency: 8)`
+   with one `git clone --depth 1 <url> refs/platforms/<name>`
+   command per missing platform. Concurrency MUST be 4-8 to stay
+   inside GitHub's rate limit for unauthenticated clones.
+3. Block all platform-behavior claims until the clones return and
+   the referenced files exist.
+4. Cite the freshly-cloned `refs/platforms/<name>/<file>:<line>` in
+   the agent's report — never an unverified claim.
+
+**Why this matters.** Over the lifetime of context-mode we have
+shipped at least three high-impact regressions that traced back
+to an agent confidently asserting platform behavior without reading
+the source: (a) inheriting env keys we did not need to inherit
+(claimed Claude Code stripped them — it does not), (b) Codex
+marketplace placed in a path Codex never reads (`mcp__plugin_*`
+naming claim was right but the marketplace location claim was
+fabricated), (c) `${CODEX_PLUGIN_ROOT}` claim that turned out to
+be display-only TUI strings, not an env var. The pattern is
+identical every time: LLM confidently asserts, owner ships, owner
+gets burned. `refs/` exists so this never happens again. When
+in doubt, clone first, claim second.
+
 </owner_operating_directive>
 
 ---
