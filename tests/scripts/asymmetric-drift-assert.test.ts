@@ -54,9 +54,13 @@ function readArgs0(path: string, key: string): string | null {
 }
 
 describe("Issue #531 — asymmetric-drift invariant", () => {
-  test(".mcp.json args[0] is the ${CLAUDE_PLUGIN_ROOT}/start.mjs placeholder", () => {
-    const got = readArgs0(resolve(ROOT, ".mcp.json"), "context-mode");
-    expect(got, ".mcp.json missing or args[0] not a string").toBe(PLACEHOLDER);
+  test(".mcp.json.example args[0] is the ${CLAUDE_PLUGIN_ROOT}/start.mjs placeholder", () => {
+    // After the #531 architectural untrack (commit 9261377), .mcp.json is no
+    // longer tracked in source — the canonical template moved to
+    // .mcp.json.example. Contributors copy it to .mcp.json locally; end users
+    // get MCP via .claude-plugin/plugin.json. This test pins the template.
+    const got = readArgs0(resolve(ROOT, ".mcp.json.example"), "context-mode");
+    expect(got, ".mcp.json.example missing or args[0] not a string").toBe(PLACEHOLDER);
   });
 
   test(".claude-plugin/plugin.json args[0] is the ${CLAUDE_PLUGIN_ROOT}/start.mjs placeholder", () => {
@@ -67,17 +71,18 @@ describe("Issue #531 — asymmetric-drift invariant", () => {
     expect(got, "plugin.json missing or args[0] not a string").toBe(PLACEHOLDER);
   });
 
-  test(".mcp.json args[0] EQUALS .claude-plugin/plugin.json args[0] (drift guard)", () => {
-    // This is the core architectural invariant. If either sibling drifts,
-    // we fail loudly — preventing the silent class of bug that caused #531.
-    const mcpArgs = readArgs0(resolve(ROOT, ".mcp.json"), "context-mode");
+  test(".mcp.json.example args[0] EQUALS .claude-plugin/plugin.json args[0] (drift guard)", () => {
+    // Core architectural invariant. If the source-tracked template and the
+    // shipped Claude Code manifest ever drift, fresh installs break silently.
+    // This is the test-time mirror of scripts/assert-asymmetric-drift.mjs.
+    const exampleArgs = readArgs0(resolve(ROOT, ".mcp.json.example"), "context-mode");
     const pluginArgs = readArgs0(
       resolve(ROOT, ".claude-plugin", "plugin.json"),
       "context-mode",
     );
-    expect(mcpArgs).not.toBeNull();
+    expect(exampleArgs).not.toBeNull();
     expect(pluginArgs).not.toBeNull();
-    expect(mcpArgs).toBe(pluginArgs);
+    expect(exampleArgs).toBe(pluginArgs);
   });
 
   test("build-chain asserter script exists at scripts/assert-asymmetric-drift.mjs", () => {

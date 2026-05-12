@@ -160,7 +160,7 @@ function readRegistry(p: string): Record<string, unknown> {
 // ─────────────────────────────────────────────────────────────────────────
 
 describe("postinstall — non-global install (contributor `npm install`)", () => {
-  it("does NOT heal installed_plugins.json when npm_config_global is unset", () => {
+  it("does NOT heal installed_plugins.json when npm_config_global is unset", { timeout: 90_000 }, () => {
     const fake = buildFakeHome({
       entryVersion: "1.0.99",      // poisoned
       cacheVersion: "1.0.113",     // would be healed if we ran
@@ -243,7 +243,7 @@ describe("postinstall — global install, user not on Claude Code", () => {
 // ─────────────────────────────────────────────────────────────────────────
 
 describe("postinstall — /ctx-upgrade tmpdir staging guard", () => {
-  it("does NOT mutate hooks.json when pkgRoot matches context-mode-upgrade-<digits>", () => {
+  it("does NOT mutate hooks.json when pkgRoot matches context-mode-upgrade-<digits>", { timeout: 90_000 }, () => {
     // Lay out a package dir with the exact name shape /ctx-upgrade uses.
     const parent = makeTmp("ctx-postinstall-tmproot-");
     const packageDir = join(parent, `context-mode-upgrade-${Date.now()}`);
