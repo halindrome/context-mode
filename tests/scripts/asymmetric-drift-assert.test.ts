@@ -206,20 +206,33 @@ describe("Issue #531 — asymmetric-drift invariant", () => {
         JSON.stringify({ name: "context-mode", version: "0.0.0-test" }),
       );
 
-      // Copy the live postinstall + heal scripts + normalize-hooks. The
-      // test exercises the REAL scripts, not a mock — so a regression in
-      // the guard is caught even if the test's mental model drifts.
-      const scriptsToCopy = [
-        "postinstall.mjs",
-        "heal-better-sqlite3.mjs",
-        "heal-installed-plugins.mjs",
-      ];
-      for (const f of scriptsToCopy) {
-        cpSync(resolve(ROOT, "scripts", f), join(scratch, "scripts", f));
-      }
+      // Copy the live postinstall + normalize-hooks (the modules that
+      // implement section 4 — the actual code under test). Stub out the
+      // heal-* modules with no-ops so we don't pay for prebuild-install
+      // downloads (~20s, blows past CI's 30s budget) and registry walks.
+      // We're testing the GUARD on section 4, not the heal logic itself,
+      // so the heals being live adds nothing and removes determinism.
+      cpSync(
+        resolve(ROOT, "scripts", "postinstall.mjs"),
+        join(scratch, "scripts", "postinstall.mjs"),
+      );
       cpSync(
         resolve(ROOT, "hooks", "normalize-hooks.mjs"),
         join(scratch, "hooks", "normalize-hooks.mjs"),
+      );
+      writeFileSync(
+        join(scratch, "scripts", "heal-better-sqlite3.mjs"),
+        "export function healBetterSqlite3Binding() { /* stub */ }\n",
+      );
+      writeFileSync(
+        join(scratch, "scripts", "heal-installed-plugins.mjs"),
+        [
+          "export function healInstalledPlugins() { return { skipped: 'test-stub' }; }",
+          "export function healSettingsEnabledPlugins() { return { healed: [] }; }",
+          "export function healPluginJsonMcpServers() { return { healed: [] }; }",
+          "export function healMcpJsonArgs() { return { healed: [] }; }",
+          "",
+        ].join("\n"),
       );
 
       // Run postinstall the same way npm does — env stripped of
