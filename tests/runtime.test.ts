@@ -21,9 +21,25 @@ describe("runtime version reporting", () => {
       throw new Error(`unexpected version probe: ${cmd} ${args.join(" ")}`);
     });
 
+    // PR #537 Windows path: getVersion() routes through execSync(cmdStr) on
+    // win32 (DEP0190 fix — no args array with shell:true). The mock must
+    // recognise the same probe shapes via the joined command string so the
+    // summary assertions below also exercise the Windows codepath, not just
+    // POSIX. Returning undefined here (the prior vi.fn() default) caused the
+    // Windows summary to render "(unknown)" and CI run 25741355786 went red.
+    const execSync = vi.fn((cmdStr: string) => {
+      if (cmdStr === "go version") {
+        return "go version go1.26.2 darwin/arm64\n";
+      }
+      if (cmdStr === "node --version") {
+        return "v25.9.0\n";
+      }
+      throw new Error(`unexpected execSync probe: ${cmdStr}`);
+    });
+
     vi.doMock("node:child_process", () => ({
       execFileSync,
-      execSync: vi.fn(),
+      execSync,
     }));
 
     const { getRuntimeSummary } = await import("../src/runtime.js");
