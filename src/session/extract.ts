@@ -870,6 +870,26 @@ function extractRole(message: string): SessionEvent[] {
 
 const QUESTION_MARK_PATTERN = /[?？؟¿]/u;
 
+/**
+ * "Imperative tone" structural heuristic for implement intent:
+ *   - trimmed length < IMPERATIVE_MAX_CHARS codepoints (short directive,
+ *     not a discursive paragraph)
+ *   - contains no question mark from any script
+ *   - contains at least one alphabetic codepoint (filters pure punctuation noise)
+ *
+ * `[...str]` walks Unicode codepoints so CJK / Indic scripts are measured
+ * fairly against the budget rather than penalised by UTF-16 unit count.
+ */
+const ALPHABETIC_PATTERN = /\p{L}/u;
+const IMPERATIVE_MAX_CHARS = 60;
+
+function isImperativeTone(trimmed: string): boolean {
+  if (QUESTION_MARK_PATTERN.test(trimmed)) return false;
+  if (!ALPHABETIC_PATTERN.test(trimmed)) return false;
+  const codepointLength = [...trimmed].length;
+  return codepointLength > 0 && codepointLength < IMPERATIVE_MAX_CHARS;
+}
+
 function extractIntent(message: string): SessionEvent[] {
   const trimmed = message.trim();
   if (!trimmed) return [];
@@ -878,6 +898,8 @@ function extractIntent(message: string): SessionEvent[] {
 
   if (QUESTION_MARK_PATTERN.test(trimmed)) {
     mode = "investigate";
+  } else if (isImperativeTone(trimmed)) {
+    mode = "implement";
   }
 
   if (!mode) return [];

@@ -75,3 +75,36 @@ describe("Slice 3: investigate intent — Spanish opening ¿", () => {
     assert.equal(intentMode("¿qué hora es"), "investigate");
   });
 });
+
+// ════════════════════════════════════════════════════════════════════════════
+// SLICE 4: implement intent — short directive without a question mark
+// ════════════════════════════════════════════════════════════════════════════
+
+describe("Slice 4: implement intent — short imperative across scripts", () => {
+  test('English "add login page" yields mode:"implement"', () => {
+    assert.equal(intentMode("add login page"), "implement");
+  });
+
+  test('mixed Japanese/Latin "登录页面を作って" yields mode:"implement"', () => {
+    assert.equal(intentMode("登录页面を作って"), "implement");
+  });
+
+  test('Spanish "crear página de inicio" yields mode:"implement"', () => {
+    assert.equal(intentMode("crear página de inicio"), "implement");
+  });
+
+  test('Turkish "giriş sayfası ekle" yields mode:"implement"', () => {
+    assert.equal(intentMode("giriş sayfası ekle"), "implement");
+  });
+
+  test('a long paragraph without `?` does NOT yield implement (too discursive)', () => {
+    // 80+ chars of running text should fall through, not be classified.
+    const longRun =
+      "We have been discussing this architecture for a while now and there is a lot to unpack here.";
+    assert.notEqual(intentMode(longRun), "implement");
+  });
+
+  test('a message ending with `?` yields investigate not implement', () => {
+    assert.equal(intentMode("add login page?"), "investigate");
+  });
+});
