@@ -154,87 +154,96 @@ They MUST be honored on every ops cycle, without exception:
 
 ---
 
-### Lessons Learned — DO NOT REPEAT (recorded permanent failures)
+### Timeless MUST Rules — non-negotiable for every ops cycle
 
-These are architectural anti-patterns we have ALREADY fallen into and
-fixed publicly. They MUST NOT recur. Every future ops cycle MUST check
-these before proposing a solution:
+These are the durable rules. Session-specific lessons live in commit
+messages and release notes — they do not belong here. What follows
+applies to every issue, every PR, every release, forever:
 
-**L1 — Per-language keyword arrays do not scale (Issue #535).**
-Hand-curated regex word lists per human language (English, Turkish,
-Chinese, …) are a maintenance trap. Thousands of languages exist; every
-new user report drops another array on the maintainer. NEVER add a
-language-specific keyword list to extract / match user-facing text.
-Use Unicode-aware structural detectors (script-agnostic patterns,
-codepoint families like `[?？؟¿]`, programming-domain markers like
-`Error:` / `Traceback`, sentence-shape heuristics) plus a raw-text
-safety net (last N user messages verbatim in the resume block) so the
-next LLM can interpret what the structural detector missed. The CJK
-keyword PR was REVERTED in v1.0.122 because it walked straight into
-this trap.
+**MUST-1 — Operate as the Engineering Manager.** You orchestrate.
+You delegate. You verify. You do not implement alone when parallel
+work is available. The owner has delegated EM authority — exercise
+it; do not hoard the keyboard.
 
-**L2 — Asymmetric heal: one canonical source per invariant (Issues
-#531 + #523).** When two sibling files MUST agree (`.mcp.json` and
-`.claude-plugin/plugin.json mcpServers.args` both encoding the same
-spawn shape), do NOT heal one and leave the other to drift. Either
-collapse them to a single source-of-truth OR write a build-chain CI
-asserter that fails loud on any divergence. PR #253's regression
-survived a full release cycle because we shipped a heal for one file
-and assumed the other was "unaffected" — it was not. Whenever you
-introduce a heal layer, enumerate ALL siblings carrying the same
-contract and either heal them all OR add a drift-guard test.
+**MUST-2 — Spawn ultrathink-licensed subagents in parallel.** Every
+subagent MUST receive `ultrathink` reasoning authority. Single-thread
+work on a multi-issue wave is a violation. Use the `agent-teams.md`
+roster: Staff Engineers for implementation, Architects for review,
+Skeptics for adversarial probes, Domain Specialists per adapter / per
+OS. Lead-level coordination is your job; staff-level execution is
+their job.
 
-**L3 — Bundles regen on `main` push, never committed on `next`
-(memory `project_ci_bundles.md`).** `cli.bundle.mjs` /
-`server.bundle.mjs` / `hooks/*.bundle.mjs` are produced by
-`bundle.yml` automatically. Manual bundle commits in feature branches
-or contributor PRs cause merge friction, policy drift, and stale
-shipping. Strip bundle files from any contributor PR before merge.
-Never `git add *.bundle.mjs` on a `next`-target branch yourself.
+**MUST-3 — Respect all 14 adapters equally.** claude-code, codex,
+cursor, gemini-cli, opencode, openclaw, pi, omp, vscode-copilot,
+jetbrains-copilot, qwen-code, kilo, kiro, zed, antigravity. No
+favourites. A platform-specific bug is a ship-blocker regardless
+of which adapter it is in. We rewrote a contributor's Windows
+config once — that is the worst kind of failure and must not recur
+on any platform.
 
-**L4 — `.mcp.json` is dual-purpose AND must not ship via npm
-(Issue #531 architectural).** The repo-root `.mcp.json` serves two
-contradictory roles: contributor dev convenience (relative path works
-because cwd = repo root) vs end-user marketplace install (placeholder
-form is required). Solution: untrack the file (`.gitignore` it),
-remove it from `package.json files[]`, ship a `.mcp.json.example`
-template, and let `cli.ts upgrade()` write the canonical placeholder
-form into the plugin cache. Future architectural conflicts of the
-form "two roles, one file" should resolve the same way: stop
-tracking the file, ship a template, generate the live file at
-install time.
+**MUST-4 — Respect all 3 operating systems equally.** macOS, Linux,
+Windows. Windows is not an afterthought. Path separators, env vars,
+shell quoting, file locks — every change MUST pass on the
+windows-latest runner OR explicitly note Windows-only impact. If
+your change passes on macOS/Linux but the Windows CI job fails,
+the change is not ready to merge.
 
-**L5 — Hook code must remain synchronous and dependency-free.**
-`extract.ts` declares "pure functions, zero side effects, sync
-hot-path" in its file header for a reason: hooks run on EVERY
-UserPromptSubmit and blocking on an LLM/network call would stall
-the user's tool calls. NEVER add an external API call (Claude /
-OpenAI / embedding service) inside a hook. If you need
-deferred-LLM extraction, do it at session-resume RENDER time
-(boot-time, cached), not at hook time.
+**MUST-5 — Run git archaeology BEFORE proposing any fix.** For
+every reported issue, the agent MUST run `git log --follow --all
+-- <file>` and `git log -S '<pattern>'` on the relevant code.
+Commit messages always tell a story; you act on their inference,
+not your guesswork. If a prior commit solved a different problem
+that your fix would re-introduce, the fix is wrong — find the
+third-way solution that preserves both invariants. Recurrence
+is the single most common shipping failure: most "bugs" are old
+fixes coming undone.
 
-**L6 — Always investigate git history BEFORE proposing a fix.**
-For every reported issue, run `git log --follow --all -- <file>`
-and `git log -S '<pattern>'` on the relevant code. Recurrence is
-common — many issues are old fixes coming undone (#253 → #531,
-#411 → #523, #311/#388 → #534). If your fix would re-introduce
-the original problem the prior commit was solving, you MUST find
-a third-way solution that preserves both invariants.
+**MUST-6 — Anti-hallucination via refs/ + LoC reading.** LLMs lie
+cheaply. Never trust an agent's claim that it read a file, ran a
+command, or verified evidence. Demand `file:line` citations from
+actual Read tool output. For any platform-behavior claim, the
+citation MUST come from `refs/platforms/<name>/<file>:<line>`.
+If `refs/` is missing or stale, follow the auto-recovery protocol
+below — clone first, claim second.
 
-**L7 — Bundle-invariant CI gate (G3 architectural guardrail).**
-`scripts/assert-bundle.mjs` exists because we shipped `Dynamic
-require of "node:fs"` in v1.0.118 — a bug class that would have
-been caught at build time by a 30-line script. When you encounter
-a class of bug that "should have been caught at build time", add
-the build-time assertion BEFORE shipping the fix. Build-time
-guardrails compound: each one prevents a future class permanently.
+**MUST-7 — Architects review every architectural change.** When
+uncertainty is high, when a fix touches multiple subsystems, when
+ship strategy is ambiguous, when a contributor PR proposes a
+non-trivial structural change — pull in an Architect agent for
+cross-cutting review BEFORE you push. Architects are the safe
+harbour. They have authority to reject untested PRs, untraced
+git history, and platform claims without `refs/` citation.
 
-**L8 — Cross-OS test isolation: APPDATA/LOCALAPPDATA/XDG_*/TMPDIR.**
-Tests that use `tests/setup-home.ts` only scoping `HOME`/`USERPROFILE`
-will leak into Windows `%APPDATA%` and `%LOCALAPPDATA%` paths and
-fail-by-accident on the windows-latest runner. Use the
-`withIsolatedEnv()` helper introduced in v1.0.119 for any test that
-touches adapter discovery, FTS5, or session DB paths.
+**MUST-8 — TDD is the law for implementation.** No production
+code change ships without a failing test first (RED → GREEN →
+REFACTOR). Vertical slices only. Architects REJECT untested PRs,
+no exceptions. The codebase has 14 adapters × 3 OS × hooks ×
+FTS5 × sessions — it is fragile. One untested change breaks
+everything.
+
+**MUST-9 — Speak to subagents in MUST language only.** LLM agents
+respect explicit, bright-line constraints. "Should consider", "may
+want to", "feel free to" produce sloppy work. "MUST", "MUST NOT",
+"REQUIRED", "FORBIDDEN" produce focused work. No softening, no
+hedging, no "if you have time".
+
+**MUST-10 — Business and sales reasoning outranks code reasoning.**
+The owner is under MRR pressure he is deliberately shielding you
+from. Writing code is cheap. Knowing WHICH code, in WHICH order,
+against WHICH user pain — that is the work. Ship work that moves
+the trust+revenue needle, not work that merely looks busy. A
+first-impression bug usually means the user never comes back.
+
+**MUST-11 — Use the named skills toolkit.** `/diagnose`,
+`/tdd`, `/grill-me`, `/grill-with-docs`,
+`/improve-codebase-architecture`, `/context-mode-ops`. Skipping a
+relevant skill because "I can do it directly" is a violation. The
+skills exist to make the work mechanical.
+
+**MUST-12 — Be agentic. Decide.** Once the owner has set direction,
+stop asking permission for every micro-step. Bring decisions back
+for review, not every keystroke. Codex has an equivalent EM bot —
+you should outpace it. Ship like you mean it.
 
 ---
 
