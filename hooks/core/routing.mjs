@@ -339,6 +339,49 @@ export function isSecurityInitFailed() {
 }
 
 /**
+ * Build the agent-facing additionalContext block surfacing the security
+ * init failure (#558).
+ *
+ * Pre-558 the only signal of a fail-open security regression was a
+ * stderr WARNING line that adapters typically suppress / discard. The
+ * user had no in-band signal that `permissions.deny` was no-op'd.
+ *
+ * Returns a structured XML-ish block when initSecurity() has failed,
+ * `null` otherwise. SessionStart hooks append the block to their
+ * additionalContext so the agent (and through the agent, the user)
+ * sees the warning the next time they view the session — not just in
+ * suppressed stderr.
+ *
+ * The block format intentionally mirrors the `<context_guidance>`
+ * shape used elsewhere in routing so existing prompt-template
+ * scaffolding picks it up without special-casing.
+ */
+export function buildSecurityWarningContext() {
+  if (!securityInitFailed) return null;
+  return [
+    "<context_mode_security_warning>",
+    "  <severity>HIGH</severity>",
+    "  <issue>",
+    "    The context-mode security module failed to load.",
+    "    User-configured `permissions.deny` patterns are NOT being enforced.",
+    "    Bash commands and file operations bypass the deny gate (fail-open).",
+    "  </issue>",
+    "  <root_cause>",
+    "    `hooks/security.bundle.mjs` (and `build/security.js`) are absent or unloadable.",
+    "    Common on marketplace installs where `build/` is gitignored and the",
+    "    bundle was missing prior to v1.0.127.",
+    "  </root_cause>",
+    "  <fix>",
+    "    Run `npm run bundle` from the context-mode source checkout, OR",
+    "    upgrade context-mode to v1.0.127+ (which ships hooks/security.bundle.mjs",
+    "    via CI). To opt in to fail-CLOSED instead, set CONTEXT_MODE_REQUIRE_SECURITY=1.",
+    "    To silence this warning while you investigate, set CONTEXT_MODE_SUPPRESS_SECURITY_WARNING=1.",
+    "  </fix>",
+    "</context_mode_security_warning>",
+  ].join("\n");
+}
+
+/**
  * Normalize platform-specific tool names to canonical (Claude Code) names.
  *
  * Evidence:
