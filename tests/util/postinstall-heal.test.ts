@@ -182,7 +182,11 @@ describe("postinstall — non-global install (contributor `npm install`)", () =>
 // ─────────────────────────────────────────────────────────────────────────
 
 describe("postinstall — global install with poisoned registry", () => {
-  it("repairs entry.version + enabledPlugins and emits one stderr line", () => {
+  // 90s budget — see L163/L246/L465 for the same precedent. Section 3 of
+  // postinstall.mjs (heal-better-sqlite3) routinely takes 20-30s on cold
+  // macOS GHA runners, blowing past vitest's default 30s. CI run
+  // 25804274156 caught this gap.
+  it("repairs entry.version + enabledPlugins and emits one stderr line", { timeout: 90_000 }, () => {
     const fake = buildFakeHome({
       entryVersion: "1.0.99",         // poisoned
       cacheVersion: "1.0.113",        // truth
@@ -215,7 +219,10 @@ describe("postinstall — global install with poisoned registry", () => {
 // ─────────────────────────────────────────────────────────────────────────
 
 describe("postinstall — global install, user not on Claude Code", () => {
-  it("emits a single benign one-liner and never crashes", () => {
+  // 90s budget for the same reason as siblings (L163/L185/L246/L465) —
+  // heal-better-sqlite3 in section 3 of postinstall.mjs is the slow path
+  // and shares this whole-process budget on every spawn.
+  it("emits a single benign one-liner and never crashes", { timeout: 90_000 }, () => {
     const home = makeTmp("ctx-postinstall-home-bare-");
     const r = runPostinstall({ home, global: true });
     expect(r.status === 0 || r.status === null).toBe(true);
