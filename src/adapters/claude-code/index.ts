@@ -35,6 +35,7 @@ import {
   type PlatformCapabilities,
   type DiagnosticResult,
   type HookRegistration,
+  type HealthCheck,
 } from "../types.js";
 import {
   HOOK_TYPES,
@@ -237,6 +238,42 @@ export class ClaudeCodeAdapter extends ClaudeCodeBaseAdapter implements HookAdap
     });
 
     return results;
+  }
+
+  /**
+   * Adapter-defined health checks (Algo-D1).
+   *
+   * For each entry in HOOK_SCRIPTS (the canonical hookType → scriptName
+   * map), emit a HealthCheck that joins `pluginRoot + "hooks" +
+   * scriptName` and probes via `existsSync`. Crucially, this NEVER
+   * parses a hook command — pluginRoot and scriptName are both in our
+   * hand, so the regex round-trip that produced the #548 doubled-path
+   * FAIL is bypassed entirely.
+   *
+   * The check derives from HOOK_SCRIPTS (single source of truth in
+   * src/adapters/claude-code/hooks.ts), so adding a new hook event in
+   * that map auto-extends doctor coverage — no parallel hardcoded list
+   * to maintain.
+   */
+  getHealthChecks(pluginRoot: string): readonly HealthCheck[] {
+    return Object.entries(HOOK_SCRIPTS).map(([hookType, scriptName]) => {
+      const absolutePath = join(pluginRoot, "hooks", scriptName);
+      return {
+        name: `Hook script: ${hookType} (${scriptName})`,
+        check: () => {
+          // Direct existsSync — no hook-command parsing, no regex.
+          // pluginRoot is the value the doctor was invoked with;
+          // scriptName comes from the canonical HOOK_SCRIPTS map.
+          if (existsSync(absolutePath)) {
+            return { status: "OK" as const, detail: absolutePath };
+          }
+          return {
+            status: "FAIL" as const,
+            detail: `not found at ${absolutePath}`,
+          };
+        },
+      };
+    });
   }
 
   /** Read plugin hooks from hooks/hooks.json or .claude-plugin/hooks/hooks.json */

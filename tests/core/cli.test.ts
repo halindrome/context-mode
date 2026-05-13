@@ -958,6 +958,28 @@ describe("Bin entry uses cli.bundle.mjs", () => {
     }
   });
 
+  // ── Algo-D1: doctor consumes adapter.getHealthChecks ──
+  //
+  // The HookAdapter contract grew an OPTIONAL `getHealthChecks(pluginRoot)`
+  // returning HealthCheck[] (src/adapters/types.ts). Doctor must iterate
+  // `adapter.getHealthChecks?.(pluginRoot) ?? []` so claude-code's
+  // direct-existsSync hook checks are surfaced WITHOUT going back through
+  // the regex round-trip that produced the #548 doubled-path FAIL.
+  // Adapters that don't override the optional method get nothing — they
+  // don't have this class of check today.
+  it("cli doctor invokes adapter.getHealthChecks(pluginRoot) (Algo-D1)", () => {
+    const src = readFileSync(resolve(ROOT, "src", "cli.ts"), "utf-8");
+    const doctorStart = src.indexOf("async function doctor");
+    const doctorBody = src.slice(doctorStart, doctorStart + 8000);
+    // Wiring: doctor must call the optional method via the safe-call
+    // operator so adapters that don't override it are untouched.
+    expect(doctorBody).toMatch(/adapter\.getHealthChecks\?\.\(pluginRoot\)/);
+    // The result must be iterated and rendered with status branches —
+    // not silently dropped. Match the same `result.status === "OK"`
+    // shape the HealthCheck contract uses.
+    expect(doctorBody).toContain('result.status === "OK"');
+  });
+
   it("cli doctor renders hook warnings as WARN instead of FAIL", () => {
     const src = readFileSync(resolve(ROOT, "src", "cli.ts"), "utf-8");
     const loopStart = src.indexOf("for (const result of hookResults)");

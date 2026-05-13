@@ -271,6 +271,22 @@ export interface HookAdapter {
   /** Validate that hooks are properly configured for this platform. */
   validateHooks(pluginRoot: string): DiagnosticResult[];
 
+  /**
+   * Adapter-defined per-platform health checks (Algo-D1).
+   *
+   * OPTIONAL. Adapters that don't override return nothing — they don't
+   * have this class of check today. claude-code overrides with hook-script
+   * existence checks that join `pluginRoot + scriptName` directly via
+   * `existsSync`, so doctor never round-trips through a regex on a hook
+   * command (the #548 root cause).
+   *
+   * Adapter #16 with hook scripts inherits the contract by overriding;
+   * adapter #17 without hook scripts simply doesn't override. The doctor
+   * iterates `adapter.getHealthChecks?.(pluginRoot) ?? []` and renders
+   * each — no per-adapter wiring in the doctor body.
+   */
+  getHealthChecks?(pluginRoot: string): readonly HealthCheck[];
+
   /** Check if the plugin is registered/enabled on this platform. */
   checkPluginRegistration(): DiagnosticResult;
 
@@ -307,6 +323,24 @@ export interface DiagnosticResult {
   message: string;
   /** Suggested fix command (if applicable). */
   fix?: string;
+}
+
+/**
+ * Adapter-defined health check (Algo-D1).
+ *
+ * Lighter-weight than `DiagnosticResult`: adapters declare a name and a
+ * synchronous `check()` thunk. The doctor renders the result. The
+ * thunk-style intentionally avoids forcing adapters into async — the
+ * existsSync probe used by claude-code is sync and the doctor invokes it
+ * directly without an `await`. Adapters needing async work return a
+ * pre-resolved status (the check ran at thunk-creation time) or extend
+ * `validateHooks()` instead.
+ */
+export interface HealthCheck {
+  /** Human-readable check title (e.g. "Hook script exists: pretooluse.mjs"). */
+  readonly name: string;
+  /** Synchronous check thunk. Returns OK or FAIL with optional detail. */
+  check(): { status: "OK" | "FAIL"; detail?: string };
 }
 
 // ─────────────────────────────────────────────────────────

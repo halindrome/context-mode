@@ -1089,6 +1089,101 @@ describe("ClaudeCodeAdapter", () => {
     });
   });
 
+  // ── getHealthChecks (Algo-D1) ─────────────────────────
+  //
+  // The HookAdapter contract grew an OPTIONAL `getHealthChecks(pluginRoot)`
+  // (src/adapters/types.ts) returning HealthCheck[] — a uniform doctor
+  // surface across 15 adapters. Default behaviour: adapters that don't
+  // override return nothing. claude-code overrides with hook-script
+  // existence checks that use DIRECT `existsSync(join(pluginRoot,
+  // "hooks", scriptName))` — NO regex round-trip through extractHookScriptPath.
+  // Closes #548 root cause: doctor never parses hook commands, so
+  // ambiguous wire shapes can't yield false FAILs.
+  describe("getHealthChecks (Algo-D1)", () => {
+    let pluginRoot: string;
+
+    beforeEach(() => {
+      pluginRoot = mkdtempSync(join(tmpdir(), "plugin-root-healthcheck-"));
+      mkdirSync(join(pluginRoot, "hooks"), { recursive: true });
+    });
+
+    afterEach(() => {
+      rmSync(pluginRoot, { recursive: true, force: true });
+    });
+
+    it("returns one HealthCheck per HOOK_SCRIPTS entry (Algo-D1)", () => {
+      // All five hook scripts present on disk → all five checks PASS.
+      // The check iterates HOOK_SCRIPTS keys (the canonical list) so
+      // adding a new event auto-extends doctor coverage — no parallel
+      // hardcoded list to maintain.
+      const scripts = [
+        "pretooluse.mjs",
+        "posttooluse.mjs",
+        "precompact.mjs",
+        "sessionstart.mjs",
+        "userpromptsubmit.mjs",
+      ];
+      for (const s of scripts) writeFileSync(join(pluginRoot, "hooks", s), "");
+
+      const checks = adapter.getHealthChecks!(pluginRoot);
+      expect(checks.length).toBe(scripts.length);
+      for (const c of checks) {
+        const result = c.check();
+        expect(result.status).toBe("OK");
+      }
+    });
+
+    it("reports FAIL with missing path detail when a script is absent (Algo-D1)", () => {
+      // Only sessionstart.mjs present → 4 FAILs + 1 OK. The FAIL detail
+      // must reference the exact missing absolute path (not a regex
+      // capture artifact like ".../Services/AppData/...").
+      writeFileSync(join(pluginRoot, "hooks", "sessionstart.mjs"), "");
+
+      const checks = adapter.getHealthChecks!(pluginRoot);
+      const results = checks.map((c) => ({ name: c.name, ...c.check() }));
+      const failed = results.filter((r) => r.status === "FAIL");
+      const ok = results.filter((r) => r.status === "OK");
+      expect(ok.length).toBe(1);
+      expect(failed.length).toBe(4);
+      // Each FAIL detail names the absolute path that was checked,
+      // anchored under pluginRoot — proves the check used direct
+      // existsSync, not a regex on a hook command.
+      for (const r of failed) {
+        expect(r.detail).toContain(pluginRoot);
+        expect(r.detail!.endsWith(".mjs")).toBe(true);
+      }
+    });
+
+    // ── #548 reproduction — direct existsSync defeats regex round-trip ──
+    //
+    // jasonwujch's #548 settings.json had the bare-`node` unquoted wire
+    // shape `node C:/Users/High Ground Services/.../hooks/pretooluse.mjs`.
+    // Post-D2 strict, extractHookScriptPath returns null for that input,
+    // so any doctor path that depends on parsing a hook COMMAND can no
+    // longer surface a path. Algo-D1's getHealthChecks bypasses parsing
+    // entirely — it asks the adapter directly which scripts must exist
+    // and joins pluginRoot + scriptName itself. As long as the actual
+    // .mjs files are on disk, the check is OK regardless of what shape
+    // the user's settings.json happens to hold.
+    it("Algo-D1 returns OK even when settings.json holds the #548 ambiguous shape", () => {
+      const scripts = [
+        "pretooluse.mjs",
+        "posttooluse.mjs",
+        "precompact.mjs",
+        "sessionstart.mjs",
+        "userpromptsubmit.mjs",
+      ];
+      for (const s of scripts) writeFileSync(join(pluginRoot, "hooks", s), "");
+
+      // Even if jasonwujch's settings.json had the ambiguous shape, the
+      // health check does not look at settings.json — it joins
+      // pluginRoot + scriptName directly. So OK every time.
+      const checks = adapter.getHealthChecks!(pluginRoot);
+      const allOk = checks.every((c) => c.check().status === "OK");
+      expect(allOk).toBe(true);
+    });
+  });
+
   // ── parseSessionStartInput ────────────────────────────
 
   describe("parseSessionStartInput", () => {
