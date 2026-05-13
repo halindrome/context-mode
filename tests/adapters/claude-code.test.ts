@@ -786,25 +786,21 @@ describe("ClaudeCodeAdapter", () => {
       expect(PRE_TOOL_USE_MATCHERS).toContain(EXTERNAL_MCP_MATCHER_PATTERN);
     });
 
-    it("EXTERNAL_MCP_MATCHER_PATTERN regex matches external MCP tools but not context-mode's own (#529)", () => {
-      const re = new RegExp(EXTERNAL_MCP_MATCHER_PATTERN);
+    it("EXTERNAL_MCP_MATCHER_PATTERN is the literal `mcp__` substring (#529, #547 hotfix)", () => {
+      // v1.0.124 used `mcp__(?!plugin_context-mode_)` — the same hooks.json
+      // is bundled to Codex CLI whose Rust `regex` crate rejects look-around
+      // at boot. v1.0.125 drops the lookaround on both adapters; the hook
+      // BODY (`isExternalMcpTool()` in hooks/core/routing.mjs) filters
+      // context-mode's own MCP tools, so semantics are preserved.
+      expect(EXTERNAL_MCP_MATCHER_PATTERN).toBe("mcp__");
+      expect(EXTERNAL_MCP_MATCHER_PATTERN).toMatch(/^[A-Za-z0-9_|]+$/);
 
-      // External MCP namespaces — MUST match
-      expect(re.test("mcp__slack__list_channels")).toBe(true);
-      expect(re.test("mcp__plugin_telegram__list_messages")).toBe(true);
-      expect(re.test("mcp__claude_ai_Google_Drive__search")).toBe(true);
-      expect(re.test("mcp__notion__query_database")).toBe(true);
-      // Tool part mentions "context-mode" but server doesn't — still external
-      expect(re.test("mcp__notion__search_context-mode_notes")).toBe(true);
-
-      // context-mode's own MCP — MUST NOT match (negative lookahead)
-      expect(re.test("mcp__plugin_context-mode_context-mode__ctx_execute")).toBe(false);
-      expect(re.test("mcp__plugin_context-mode_context-mode__ctx_search")).toBe(false);
-      expect(re.test("mcp__plugin_context-mode_anything__foo")).toBe(false);
-
-      // Non-MCP tools — MUST NOT match
-      expect(re.test("Bash")).toBe(false);
-      expect(re.test("Read")).toBe(false);
+      // Substring semantics: every external MCP tool name starts with `mcp__`.
+      expect("mcp__slack__list_channels".startsWith(EXTERNAL_MCP_MATCHER_PATTERN)).toBe(true);
+      expect("mcp__plugin_telegram__list_messages".startsWith(EXTERNAL_MCP_MATCHER_PATTERN)).toBe(true);
+      // Bare non-MCP tool names do not contain the prefix.
+      expect("Bash".startsWith(EXTERNAL_MCP_MATCHER_PATTERN)).toBe(false);
+      expect("Read".startsWith(EXTERNAL_MCP_MATCHER_PATTERN)).toBe(false);
     });
 
     it("generateHookConfig includes the external MCP matcher entry (#529)", () => {
