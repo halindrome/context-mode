@@ -1062,6 +1062,98 @@ describe("start.mjs CLI self-heal", () => {
     expect(selfHealIdx).toBeGreaterThan(ensureDepsIdx);
     expect(selfHealIdx).toBeLessThan(serverImportIdx);
   });
+
+  // ── Algo-D4: plugin-cache integrity from package.json files[] ──
+  //
+  // #550: partial install (e.g. interrupted npm install, broken
+  // marketplace pull) leaves start.mjs spawnable but server.bundle.mjs
+  // missing. The MCP child then dies silently downstream — user sees
+  // "MCP server failed to start" with no actionable signal. D4 derives
+  // the expected sibling tree from package.json files[] (the npm publish
+  // source of truth) and exits 2 with a structured stderr block listing
+  // the missing files. Algorithmic: adding a new entry to files[] auto-
+  // extends the integrity check — no parallel hardcoded list to
+  // maintain.
+  test("scripts/plugin-cache-integrity.mjs derives expected files from package.json files[]", async () => {
+    const { derivePluginManifest } = await import(
+      "../../scripts/plugin-cache-integrity.mjs"
+    );
+    // Synthetic package.json: directories recurse; files are kept as-is.
+    const pkg = {
+      files: ["server.bundle.mjs", "cli.bundle.mjs", "hooks", "start.mjs"],
+    };
+    const helperRoot = mkdtempSync(join(tmpdir(), "ctx-mode-pcim-"));
+    try {
+      // Build a tree shaped like the npm tarball
+      writeFileSync(join(helperRoot, "server.bundle.mjs"), "");
+      writeFileSync(join(helperRoot, "cli.bundle.mjs"), "");
+      writeFileSync(join(helperRoot, "start.mjs"), "");
+      mkdirSync(join(helperRoot, "hooks"));
+      writeFileSync(join(helperRoot, "hooks", "pretooluse.mjs"), "");
+      writeFileSync(join(helperRoot, "hooks", "sessionstart.mjs"), "");
+
+      const manifest = derivePluginManifest({ pkg, pluginRoot: helperRoot });
+      // Files in files[] kept as-is; directories recurse to enumerate
+      // every file inside.
+      expect(manifest).toContain("server.bundle.mjs");
+      expect(manifest).toContain("cli.bundle.mjs");
+      expect(manifest).toContain("start.mjs");
+      expect(manifest).toContain(join("hooks", "pretooluse.mjs"));
+      expect(manifest).toContain(join("hooks", "sessionstart.mjs"));
+    } finally {
+      rmSync(helperRoot, { recursive: true, force: true });
+    }
+  });
+
+  test("scripts/plugin-cache-integrity.mjs returns OK when all expected siblings exist", async () => {
+    const { assertPluginCacheIntegrity } = await import(
+      "../../scripts/plugin-cache-integrity.mjs"
+    );
+    // The actual repo root has every entry from package.json files[]
+    // present (it's the source of truth that gets published). So a
+    // probe against ROOT must return ok=true.
+    const result = assertPluginCacheIntegrity({ pluginRoot: ROOT });
+    expect(result.ok).toBe(true);
+    expect(result.missing).toEqual([]);
+  });
+
+  test("scripts/plugin-cache-integrity.mjs flags missing files as not-ok", async () => {
+    const { assertPluginCacheIntegrity } = await import(
+      "../../scripts/plugin-cache-integrity.mjs"
+    );
+    // Empty pluginRoot → every required file is missing.
+    const emptyRoot = mkdtempSync(join(tmpdir(), "ctx-mode-pcim-empty-"));
+    try {
+      const result = assertPluginCacheIntegrity({ pluginRoot: emptyRoot });
+      expect(result.ok).toBe(false);
+      expect(result.missing.length).toBeGreaterThan(0);
+      // The check must surface the absolute path so users can see
+      // exactly where it looked — not a relative segment.
+      for (const m of result.missing) {
+        expect(m.startsWith(emptyRoot)).toBe(true);
+      }
+    } finally {
+      rmSync(emptyRoot, { recursive: true, force: true });
+    }
+  });
+
+  test("start.mjs invokes assertPluginCacheIntegrity with stderr + exit 2 on failure (Algo-D4)", () => {
+    // Wiring check on the bootstrapper itself: the start.mjs body must
+    // import the helper, call it, and on `!ok` write a structured stderr
+    // block (CONTEXT_MODE_PARTIAL_INSTALL) then process.exit(2). The
+    // structured marker lets external monitoring grep for the exact
+    // failure mode without parsing free-form text.
+    const src = readFileSync(resolve(ROOT, "start.mjs"), "utf-8");
+    expect(src).toContain("plugin-cache-integrity.mjs");
+    expect(src).toContain("assertPluginCacheIntegrity");
+    expect(src).toContain("CONTEXT_MODE_PARTIAL_INSTALL");
+    expect(src).toMatch(/process\.exit\(\s*2\s*\)/);
+  });
+
+  test("scripts/plugin-cache-integrity.mjs ships in npm tarball (package.json files[])", () => {
+    const pkg = JSON.parse(readFileSync(resolve(ROOT, "package.json"), "utf-8"));
+    expect(pkg.files).toContain("scripts/plugin-cache-integrity.mjs");
+  });
 });
 
 // ── session-loaders.mjs fallback ──────────────────────────────────────
