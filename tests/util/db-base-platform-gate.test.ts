@@ -170,10 +170,12 @@ describe("SQLiteBase lockfile + EXCLUSIVE locking (#560)", () => {
     expect(src).toMatch(/from\s+["']\.\/util\/db-lock\.js["']/);
     const ctorRegion = src.split("constructor(dbPath: string)")[1] ?? "";
     const ctorBody = ctorRegion.split("\n  protected ")[0] ?? "";
-    // Lock acquired BEFORE the `new Database(...)` call — the EXCLUSIVE
-    // pragma is the secondary defense, the lockfile is primary.
+    // Lock acquired BEFORE the `new Database(dbPath, ...)` call — the
+    // EXCLUSIVE pragma is the secondary defense, the lockfile is primary.
+    // Anchor on `new Database(dbPath` to avoid matching the literal
+    // `new Database(...)` that appears inside the comment text.
     const lockIdx = ctorBody.indexOf("acquireDbLock");
-    const dbOpenIdx = ctorBody.indexOf("new Database(");
+    const dbOpenIdx = ctorBody.indexOf("new Database(dbPath");
     expect(lockIdx).toBeGreaterThan(-1);
     expect(dbOpenIdx).toBeGreaterThan(-1);
     expect(lockIdx).toBeLessThan(dbOpenIdx);
@@ -182,13 +184,21 @@ describe("SQLiteBase lockfile + EXCLUSIVE locking (#560)", () => {
   it("SQLiteBase close + cleanup release the lockfile", () => {
     // close() and cleanup() must both call releaseDbLock so the
     // graceful exit path leaves a clean slate for the next opener.
-    const closeFn = src.split(/  close\(\):\s*void\s*\{/)[1] ?? "";
-    const closeBody = closeFn.split("\n  ")[0] ?? "";
-    expect(closeBody).toMatch(/releaseDbLock/);
+    // Scope to the SQLiteBase class body — there are unrelated close()
+    // methods on the BunSQLiteAdapter / NodeSQLiteAdapter wrappers.
+    const classIdx = src.indexOf("export abstract class SQLiteBase");
+    expect(classIdx).toBeGreaterThan(-1);
+    const classBody = src.slice(classIdx);
 
-    const cleanupFn = src.split(/  cleanup\(\):\s*void\s*\{/)[1] ?? "";
-    const cleanupBody = cleanupFn.split("\n  ")[0] ?? "";
-    expect(cleanupBody).toMatch(/releaseDbLock/);
+    const closeIdx = classBody.indexOf("close(): void");
+    expect(closeIdx).toBeGreaterThan(-1);
+    const closeRegion = classBody.slice(closeIdx, closeIdx + 600);
+    expect(closeRegion).toMatch(/releaseDbLock/);
+
+    const cleanupIdx = classBody.indexOf("cleanup(): void");
+    expect(cleanupIdx).toBeGreaterThan(-1);
+    const cleanupRegion = classBody.slice(cleanupIdx, cleanupIdx + 600);
+    expect(cleanupRegion).toMatch(/releaseDbLock/);
   });
 
   it("opening the same DB twice from the same process throws lockfile error", async () => {
@@ -196,11 +206,11 @@ describe("SQLiteBase lockfile + EXCLUSIVE locking (#560)", () => {
     // claims (tmpdir paths skip-gate by design — per-process DBs).
     const testDir = mkdtempSync(join(process.env.HOME || "/tmp", ".ctx-mode-twice-test-"));
     const dbPath = join(testDir, "twice.db");
-    const { ContentStore } = await import("../../src/store.js");
-    let first: InstanceType<typeof ContentStore> | null = null;
+    const { SessionDB } = await import("../../src/session/db.js");
+    let first: InstanceType<typeof SessionDB> | null = null;
     try {
-      first = new ContentStore(dbPath);
-      expect(() => new ContentStore(dbPath)).toThrow(/Another context-mode server is already running/);
+      first = new SessionDB({ dbPath });
+      expect(() => new SessionDB({ dbPath })).toThrow(/Another context-mode server is already running/);
     } finally {
       try { first?.cleanup(); } catch { /* best effort */ }
       try { rmSync(testDir, { recursive: true, force: true }); } catch { /* best effort */ }
@@ -220,21 +230,21 @@ describe("DB lock lifecycle composition (#559 + #560)", () => {
     const testDir = mkdtempSync(join(process.env.HOME || "/tmp", ".ctx-mode-lifecycle-"));
     const dbPath = join(testDir, "lifecycle.db");
     const lockPath = `${dbPath}.lock`;
-    const { ContentStore } = await import("../../src/store.js");
+    const { SessionDB } = await import("../../src/session/db.js");
     try {
       // Process A opens — lockfile claimed.
-      const a = new ContentStore(dbPath);
+      const a = new SessionDB({ dbPath });
       expect(existsSync(lockPath)).toBe(true);
 
       // Process B attempt while A holds it — must throw.
-      expect(() => new ContentStore(dbPath)).toThrow(/already running/);
+      expect(() => new SessionDB({ dbPath })).toThrow(/already running/);
 
       // Process A graceful close — lockfile released.
       a.close();
       expect(existsSync(lockPath)).toBe(false);
 
       // Process B retries — clean lockfile, opens successfully.
-      const b = new ContentStore(dbPath);
+      const b = new SessionDB({ dbPath });
       expect(existsSync(lockPath)).toBe(true);
       b.cleanup();
     } finally {

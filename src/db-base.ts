@@ -12,6 +12,12 @@ import { createRequire } from "node:module";
 import { existsSync, unlinkSync, renameSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+// v1.0.128 — Issue #560 single-writer enforcement.
+// Lockfile is the PRIMARY defense (clean UX with conflicting PID),
+// `locking_mode = EXCLUSIVE` (applied in applyWALPragmas below) is the
+// SECONDARY defense for the narrow race window between lockfile claim
+// and the actual `new Database(...)` open. Both skip-gate on tmpdir paths.
+import { acquireDbLock, releaseDbLock } from "./util/db-lock.js";
 
 // ─────────────────────────────────────────────────────────
 // Types
@@ -331,6 +337,15 @@ export function applyWALPragmas(db: DatabaseInstance): void {
   // the actual file size). Falls back gracefully on platforms where mmap
   // is unavailable or restricted.
   try { db.pragma("mmap_size = 268435456"); } catch { /* unsupported runtime */ }
+  // v1.0.128 — Issue #560 SECONDARY defense for single-writer enforcement.
+  // The .lock file (acquireDbLock in SQLiteBase ctor) is PRIMARY — it
+  // surfaces the conflicting PID with a clear UX message. EXCLUSIVE locking
+  // closes the narrow race window between lockfile claim + the actual
+  // `new Database(...)` open: a parallel process passing the lockfile
+  // check would still get SQLITE_BUSY from this pragma. Wrapped in
+  // try/catch identical to mmap_size — backends that don't expose
+  // locking_mode (or pragma at all) still get the lockfile floor.
+  try { db.pragma("locking_mode = EXCLUSIVE"); } catch { /* unsupported runtime */ }
 }
 
 // ─────────────────────────────────────────────────────────
@@ -480,14 +495,26 @@ export function renameCorruptDB(dbPath: string): void {
  * re-imports within the same fork process (ESM isolate mode clears
  * module-level state but globalThis persists).
  */
-const _kLiveDBs = Symbol.for("__context_mode_live_dbs__");
-const _liveDBs: Set<DatabaseInstance> = (() => {
-  const g = globalThis as Record<symbol, Set<DatabaseInstance> | undefined>;
+// v1.0.128 — symbol name versioned because the value type changed from
+// Set<DatabaseInstance> to Map<DatabaseInstance, string> (issue #560).
+// A persistent global slot from a pre-v128 module would deserialize as
+// the wrong shape and crash the exit hook iteration.
+const _kLiveDBs = Symbol.for("__context_mode_live_dbs_v2__");
+// v1.0.128 — issue #560: pair each DatabaseInstance with the dbPath that
+// owns its lockfile. The exit hook needs both — closeDB(db) handles the
+// WAL checkpoint, releaseDbLock(dbPath) drops the .lock file. We use a
+// Map keyed by DatabaseInstance to keep API call sites unchanged.
+const _liveDBs: Map<DatabaseInstance, string> = (() => {
+  const g = globalThis as Record<symbol, Map<DatabaseInstance, string> | undefined>;
   if (!g[_kLiveDBs]) {
-    g[_kLiveDBs] = new Set<DatabaseInstance>();
+    g[_kLiveDBs] = new Map<DatabaseInstance, string>();
     process.on("exit", () => {
-      for (const db of g[_kLiveDBs]!) {
+      for (const [db, dbPath] of g[_kLiveDBs]!) {
         closeDB(db);
+        // Release lock AFTER close so the WAL checkpoint inside closeDB
+        // runs while we still own the writer slot (no second-opener can
+        // race in mid-checkpoint).
+        releaseDbLock({ dbPath });
       }
       g[_kLiveDBs]!.clear();
     });
@@ -502,6 +529,13 @@ export abstract class SQLiteBase {
   constructor(dbPath: string) {
     const Database = loadDatabase();
     this.#dbPath = dbPath;
+    // v1.0.128 — Issue #560 PRIMARY single-writer guard. Must claim
+    // BEFORE `new Database(...)` so a contending opener gets the clean
+    // DatabaseLockedError UX (PID + verbatim message) instead of the
+    // SQLITE_BUSY surfaced by EXCLUSIVE locking. Skip-gate via
+    // tmpdir-prefix check inside the helper — defaultDBPath() output
+    // (per-process tmp DBs) does not contend, so it never claims a lock.
+    acquireDbLock({ dbPath });
     cleanOrphanedWALFiles(dbPath);
     let db: DatabaseInstance;
     try {
@@ -516,16 +550,20 @@ export abstract class SQLiteBase {
           db = new Database(dbPath, { timeout: 30000 });
           applyWALPragmas(db);
         } catch (retryErr) {
+          // Free the lock before bubbling — caller can never reach
+          // close()/cleanup() if the ctor throws.
+          releaseDbLock({ dbPath });
           throw new Error(
             `Failed to create fresh DB after renaming corrupt file: ${retryErr instanceof Error ? retryErr.message : String(retryErr)}`
           );
         }
       } else {
+        releaseDbLock({ dbPath });
         throw err;
       }
     }
     this.#db = db;
-    _liveDBs.add(this.#db);
+    _liveDBs.set(this.#db, dbPath);
     this.initSchema();
     this.prepareStatements();
   }
@@ -550,6 +588,10 @@ export abstract class SQLiteBase {
   close(): void {
     _liveDBs.delete(this.#db);
     closeDB(this.#db);
+    // v1.0.128 — Issue #560: drop the .lock file AFTER closeDB so the
+    // WAL checkpoint inside closeDB completes while we still own the
+    // writer slot. releaseDbLock is no-op for tmpdir paths (skip-gate).
+    releaseDbLock({ dbPath: this.#dbPath });
   }
 
   protected withRetry<T>(fn: () => T): T {
@@ -564,5 +606,9 @@ export abstract class SQLiteBase {
     _liveDBs.delete(this.#db);
     closeDB(this.#db);
     deleteDBFiles(this.#dbPath);
+    // v1.0.128 — Issue #560: also drop the lockfile during cleanup. Per-
+    // process tmp DBs (defaultDBPath()) skip-gate inside the helper, so
+    // this is only a side-effect for shared on-disk content stores.
+    releaseDbLock({ dbPath: this.#dbPath });
   }
 }
