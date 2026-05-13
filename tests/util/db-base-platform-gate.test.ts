@@ -16,9 +16,10 @@
  * Runtime guard: invokes the exported helper against synthetic Node
  * versions and asserts the expected boolean.
  */
-import { describe, it, expect } from "vitest";
-import { readFileSync } from "node:fs";
-import { resolve } from "node:path";
+import { describe, it, expect, afterEach, beforeEach } from "vitest";
+import { readFileSync, existsSync, writeFileSync, unlinkSync, mkdtempSync, rmSync } from "node:fs";
+import { resolve, join } from "node:path";
+import { tmpdir } from "node:os";
 
 describe("db-base platform gate (#551)", () => {
   const dbBasePath = resolve(__dirname, "..", "..", "src", "db-base.ts");
@@ -67,5 +68,177 @@ describe("db-base platform gate (#551)", () => {
     expect(
       hasModernSqlite({ ...process.versions, node: "20.10.0" }, undefined),
     ).toBe(false);
+  });
+});
+
+// ─────────────────────────────────────────────────────────
+// Slice 5 (#560): Per-DB lockfile primitive
+// One context-mode server may hold the DB at a time; second openers
+// fail loudly with the reporter's verbatim message instead of
+// silently corrupting the WAL.
+// ─────────────────────────────────────────────────────────
+describe("acquireDbLock / releaseDbLock (#560)", () => {
+  // Use a directory OUTSIDE tmpdir so the helper does NOT skip-gate
+  // away. The skip-gate (tmpdir-prefixed paths) is exercised below.
+  const homeOutsideTmp = mkdtempSync(join(process.env.HOME || "/tmp", ".ctx-mode-lock-test-"));
+  let testDb: string;
+  let lockPath: string;
+
+  beforeEach(() => {
+    testDb = join(homeOutsideTmp, `lock-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}.db`);
+    lockPath = `${testDb}.lock`;
+  });
+
+  afterEach(() => {
+    try { unlinkSync(lockPath); } catch { /* may not exist */ }
+  });
+
+  it("writes a lockfile containing the current PID via O_EXCL", async () => {
+    const { acquireDbLock, releaseDbLock } = await import("../../src/util/db-lock.js");
+    const result = acquireDbLock({ dbPath: testDb });
+    expect(result.skipped).toBe(false);
+    expect(existsSync(lockPath)).toBe(true);
+    expect(readFileSync(lockPath, "utf-8")).toBe(String(process.pid));
+    releaseDbLock({ dbPath: testDb });
+    expect(existsSync(lockPath)).toBe(false);
+  });
+
+  it("throws DatabaseLockedError when another live PID holds the lock", async () => {
+    const { acquireDbLock } = await import("../../src/util/db-lock.js");
+    // Use the test runner's own PID — guaranteed alive.
+    writeFileSync(lockPath, String(process.pid), { flag: "w" });
+    expect(() => acquireDbLock({ dbPath: testDb }))
+      .toThrow(/Another context-mode server is already running/);
+  });
+
+  it("claims a stale lockfile when the owning PID is dead", async () => {
+    const { acquireDbLock, releaseDbLock } = await import("../../src/util/db-lock.js");
+    // PID 99999999 is well beyond /proc/sys/kernel/pid_max (4194304 on
+    // Linux, much smaller on macOS). isProcessAlive returns false.
+    writeFileSync(lockPath, "99999999", { flag: "w" });
+    const result = acquireDbLock({ dbPath: testDb });
+    expect(result.skipped).toBe(false);
+    expect(readFileSync(lockPath, "utf-8")).toBe(String(process.pid));
+    releaseDbLock({ dbPath: testDb });
+  });
+
+  it("two simultaneous claims — only one succeeds (O_EXCL atomicity)", async () => {
+    const { acquireDbLock, releaseDbLock } = await import("../../src/util/db-lock.js");
+    // First claim wins.
+    acquireDbLock({ dbPath: testDb });
+    // Second claim from the same process must fail because the lock
+    // contains our own PID (which is alive). This proves atomicity:
+    // a second opener never silently reuses the lock.
+    expect(() => acquireDbLock({ dbPath: testDb })).toThrow(/already running/);
+    releaseDbLock({ dbPath: testDb });
+  });
+
+  it("skips when dbPath is under the OS tmpdir (per-process DBs)", async () => {
+    const { acquireDbLock, releaseDbLock } = await import("../../src/util/db-lock.js");
+    const tmpDb = join(tmpdir(), `context-mode-${process.pid}-skip.db`);
+    const result = acquireDbLock({ dbPath: tmpDb });
+    expect(result.skipped).toBe(true);
+    // No lockfile should have been created.
+    expect(existsSync(`${tmpDb}.lock`)).toBe(false);
+    // Release on a skipped path is a no-op (matches closeDB shape — never throws).
+    expect(() => releaseDbLock({ dbPath: tmpDb })).not.toThrow();
+  });
+
+  it("releaseDbLock swallows errors when the lockfile is already gone", async () => {
+    const { releaseDbLock } = await import("../../src/util/db-lock.js");
+    expect(() => releaseDbLock({ dbPath: testDb })).not.toThrow();
+  });
+});
+
+// ─────────────────────────────────────────────────────────
+// Slice 6 (#560): Wire lockfile + locking_mode=EXCLUSIVE into SQLiteBase
+// Source-level + runtime checks. SessionDB ctor must claim the
+// lockfile, and applyWALPragmas must set locking_mode=EXCLUSIVE on
+// best-effort (try/catch like the existing mmap_size line).
+// ─────────────────────────────────────────────────────────
+describe("SQLiteBase lockfile + EXCLUSIVE locking (#560)", () => {
+  const dbBasePath = resolve(__dirname, "..", "..", "src", "db-base.ts");
+  const src = readFileSync(dbBasePath, "utf8");
+
+  it("applyWALPragmas applies locking_mode=EXCLUSIVE (belt-and-braces)", () => {
+    const region = src.split("export function applyWALPragmas")[1] ?? "";
+    const upToNextExport = region.split("\nexport ")[0] ?? "";
+    expect(upToNextExport).toMatch(/locking_mode\s*=\s*EXCLUSIVE/i);
+  });
+
+  it("SQLiteBase ctor calls acquireDbLock before opening the database", () => {
+    expect(src).toMatch(/from\s+["']\.\/util\/db-lock\.js["']/);
+    const ctorRegion = src.split("constructor(dbPath: string)")[1] ?? "";
+    const ctorBody = ctorRegion.split("\n  protected ")[0] ?? "";
+    // Lock acquired BEFORE the `new Database(...)` call — the EXCLUSIVE
+    // pragma is the secondary defense, the lockfile is primary.
+    const lockIdx = ctorBody.indexOf("acquireDbLock");
+    const dbOpenIdx = ctorBody.indexOf("new Database(");
+    expect(lockIdx).toBeGreaterThan(-1);
+    expect(dbOpenIdx).toBeGreaterThan(-1);
+    expect(lockIdx).toBeLessThan(dbOpenIdx);
+  });
+
+  it("SQLiteBase close + cleanup release the lockfile", () => {
+    // close() and cleanup() must both call releaseDbLock so the
+    // graceful exit path leaves a clean slate for the next opener.
+    const closeFn = src.split(/  close\(\):\s*void\s*\{/)[1] ?? "";
+    const closeBody = closeFn.split("\n  ")[0] ?? "";
+    expect(closeBody).toMatch(/releaseDbLock/);
+
+    const cleanupFn = src.split(/  cleanup\(\):\s*void\s*\{/)[1] ?? "";
+    const cleanupBody = cleanupFn.split("\n  ")[0] ?? "";
+    expect(cleanupBody).toMatch(/releaseDbLock/);
+  });
+
+  it("opening the same DB twice from the same process throws lockfile error", async () => {
+    // Use a real on-disk path OUTSIDE tmpdir so the lockfile actually
+    // claims (tmpdir paths skip-gate by design — per-process DBs).
+    const testDir = mkdtempSync(join(process.env.HOME || "/tmp", ".ctx-mode-twice-test-"));
+    const dbPath = join(testDir, "twice.db");
+    const { ContentStore } = await import("../../src/store.js");
+    let first: InstanceType<typeof ContentStore> | null = null;
+    try {
+      first = new ContentStore(dbPath);
+      expect(() => new ContentStore(dbPath)).toThrow(/Another context-mode server is already running/);
+    } finally {
+      try { first?.cleanup(); } catch { /* best effort */ }
+      try { rmSync(testDir, { recursive: true, force: true }); } catch { /* best effort */ }
+    }
+  });
+});
+
+// ─────────────────────────────────────────────────────────
+// Slice 7 (#560): Lifecycle composition — kill old → release lock
+// Verifies SessionDB.close() releases the lockfile so a second opener
+// can claim it. Mirrors the real upgrade flow: process A holds the
+// lock, receives SIGTERM, gracefully closes, lockfile released,
+// process B claims successfully.
+// ─────────────────────────────────────────────────────────
+describe("DB lock lifecycle composition (#559 + #560)", () => {
+  it("close() releases the lockfile so the next opener succeeds", async () => {
+    const testDir = mkdtempSync(join(process.env.HOME || "/tmp", ".ctx-mode-lifecycle-"));
+    const dbPath = join(testDir, "lifecycle.db");
+    const lockPath = `${dbPath}.lock`;
+    const { ContentStore } = await import("../../src/store.js");
+    try {
+      // Process A opens — lockfile claimed.
+      const a = new ContentStore(dbPath);
+      expect(existsSync(lockPath)).toBe(true);
+
+      // Process B attempt while A holds it — must throw.
+      expect(() => new ContentStore(dbPath)).toThrow(/already running/);
+
+      // Process A graceful close — lockfile released.
+      a.close();
+      expect(existsSync(lockPath)).toBe(false);
+
+      // Process B retries — clean lockfile, opens successfully.
+      const b = new ContentStore(dbPath);
+      expect(existsSync(lockPath)).toBe(true);
+      b.cleanup();
+    } finally {
+      try { rmSync(testDir, { recursive: true, force: true }); } catch { /* best effort */ }
+    }
   });
 });
