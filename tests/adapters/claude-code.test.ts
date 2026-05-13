@@ -974,6 +974,56 @@ describe("ClaudeCodeAdapter", () => {
       }
     });
 
+    // ── Algo-D3.5: CI invariant — no raw `node "${...}.mjs"` in adapters ──
+    //
+    // Locks in D3 forever. Adapter #16 introducing a raw `node "${...`
+    // template literal fails CI at build time, not at runtime when a
+    // Windows user with spaces in their HOME path hits the #548 bug.
+    // Algorithmic equivalent of v1.0.125's `is_exact_matcher` drift-guard:
+    // one canonical primitive (buildNodeCommand) becomes the only allowed
+    // emit shape; future adapter authors are forced through it.
+    it("no adapter source file emits a raw `node \"${...}` template literal (Algo-D3.5)", async () => {
+      const { readdirSync, readFileSync, statSync } = await import("node:fs");
+      const { join, resolve } = await import("node:path");
+      const repoRoot = resolve(__dirname, "..", "..");
+      const adaptersDir = join(repoRoot, "src", "adapters");
+
+      function walk(dir: string): string[] {
+        const out: string[] = [];
+        for (const name of readdirSync(dir)) {
+          const full = join(dir, name);
+          const st = statSync(full);
+          if (st.isDirectory()) out.push(...walk(full));
+          else if (name.endsWith(".ts")) out.push(full);
+        }
+        return out;
+      }
+
+      // Match raw node template literals in either ` `${ ` (template) or
+      // string-interp form: `"node "` followed by `${`. Scans the actual
+      // source so adapter #16 inherits the lock automatically. Comment
+      // lines (// or *) are skipped so docstrings explaining the
+      // invariant don't trip it.
+      const violationRe = /["'`]\s*node\s+["'`]?\$\{/;
+      const isCommentLine = (line: string): boolean =>
+        /^\s*(?:\/\/|\*|\/\*)/.test(line);
+      const violations: string[] = [];
+      for (const file of walk(adaptersDir)) {
+        const src = readFileSync(file, "utf-8");
+        const lines = src.split("\n");
+        for (let i = 0; i < lines.length; i++) {
+          if (isCommentLine(lines[i])) continue;
+          if (violationRe.test(lines[i])) {
+            violations.push(`${file}:${i + 1}: ${lines[i].trim()}`);
+          }
+        }
+      }
+      expect(
+        violations,
+        `raw \`node "\${...}\` template literal found — use buildNodeCommand:\n${violations.join("\n")}`,
+      ).toEqual([]);
+    });
+
     it("hooks/hooks.json PreToolUse matchers match PRE_TOOL_USE_MATCHERS (#529 drift guard)", () => {
       const repoRoot = resolve(__dirname, "..", "..");
       const hooksJsonPath = join(repoRoot, "hooks", "hooks.json");
