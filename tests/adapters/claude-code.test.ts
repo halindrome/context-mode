@@ -817,12 +817,17 @@ describe("ClaudeCodeAdapter", () => {
 
     it("generateHookConfig quotes pluginRoot so paths with spaces round-trip through extractHookScriptPath", async () => {
       // Regression: on Windows the user folder commonly contains spaces
-      // (e.g. "C:\\Users\\High Ground Services\\..."). Without quotes around
-      // ${pluginRoot} the doctor's extractHookScriptPath regex falls to its
-      // \S+\.mjs branch and grabs only the path tail after the last space,
-      // producing a doubled-path FAIL when resolve(pluginRoot, tail) runs.
+      // (e.g. "C:\\Users\\High Ground Services\\..."). Pre-D3 we hand-rolled
+      // bare `node "${pluginRoot}/hooks/X.mjs"`; without quotes the doctor's
+      // extractHookScriptPath regex fell to its \S+\.mjs branch and grabbed
+      // only the path tail after the last space, producing a doubled-path
+      // FAIL. Post-D3 the adapter emits buildNodeCommand-shape which both
+      // double-quotes the script segment AND normalizes backslashes to
+      // forward slashes (#369, #372). Compare against the normalized
+      // pluginRoot so the assertion holds on Windows wire shapes too.
       const { extractHookScriptPath } = await import("../../src/util/hook-config.js");
       const pluginRoot = "C:\\Users\\High Ground Services\\AppData\\Roaming\\npm\\node_modules\\context-mode";
+      const normalizedRoot = pluginRoot.replace(/\\/g, "/");
       const config = adapter.generateHookConfig(pluginRoot) as Record<
         string,
         Array<{ hooks: Array<{ command: string }> }>
@@ -836,9 +841,9 @@ describe("ClaudeCodeAdapter", () => {
       for (const command of allCommands) {
         const extracted = extractHookScriptPath(command);
         // Extracted path must be the full absolute path (still inside
-        // pluginRoot) — never a relative tail like "Services\\AppData\\...".
+        // pluginRoot) — never a relative tail like "Services/AppData/...".
         expect(extracted, `command did not yield extractable path: ${command}`).toBeTruthy();
-        expect(extracted!.startsWith(pluginRoot)).toBe(true);
+        expect(extracted!.startsWith(normalizedRoot)).toBe(true);
         expect(extracted!.endsWith(".mjs")).toBe(true);
       }
     });
@@ -926,6 +931,47 @@ describe("ClaudeCodeAdapter", () => {
       const ambiguous =
         "node C:/Users/High Ground Services/AppData/Roaming/npm/node_modules/context-mode/hooks/pretooluse.mjs";
       expect(extractInHooks(ambiguous)).toBeNull();
+    });
+
+    // ── Algo-D3: claude-code uses buildNodeCommand for every event ──
+    //
+    // Pre-D3 the adapter emitted 5 raw `node "${pluginRoot}/hooks/X.mjs"`
+    // template literals (src/adapters/claude-code/index.ts:115,129,140,
+    // 151,162). Bare `node` made it the lone outlier among 14 adapters
+    // already on `buildNodeCommand` and reintroduced the #369/#372
+    // Windows MSYS PATH bug class on every hook spawn. Post-D3 every
+    // event flows through buildNodeCommand; combined with Algo-D2,
+    // every emit round-trips through every parse.
+    it("generateHookConfig uses buildNodeCommand shape for every event (Algo-D3)", async () => {
+      const { parseNodeCommand } = await import("../../src/adapters/types.js");
+      const pluginRoot = "/install/dir";
+      const config = adapter.generateHookConfig(pluginRoot) as Record<
+        string,
+        Array<{ hooks: Array<{ command: string }> }>
+      >;
+      const expectedScripts: Record<string, string> = {
+        PreToolUse: "pretooluse.mjs",
+        PostToolUse: "posttooluse.mjs",
+        PreCompact: "precompact.mjs",
+        UserPromptSubmit: "userpromptsubmit.mjs",
+        SessionStart: "sessionstart.mjs",
+      };
+      for (const [eventType, script] of Object.entries(expectedScripts)) {
+        const entries = config[eventType];
+        expect(entries, `missing entries for ${eventType}`).toBeDefined();
+        for (const entry of entries) {
+          for (const hook of entry.hooks) {
+            // Round-trip: buildNodeCommand emit → parseNodeCommand parse.
+            // No event may use a bare-`node` template literal anymore.
+            const parsed = parseNodeCommand(hook.command);
+            expect(
+              parsed,
+              `command for ${eventType} not buildNodeCommand-shaped: ${hook.command}`,
+            ).not.toBeNull();
+            expect(parsed!.scriptPath.endsWith(`/hooks/${script}`)).toBe(true);
+          }
+        }
+      }
     });
 
     it("hooks/hooks.json PreToolUse matchers match PRE_TOOL_USE_MATCHERS (#529 drift guard)", () => {
