@@ -335,6 +335,36 @@ export function buildNodeCommand(scriptPath: string): string {
   return `"${nodePath}" "${safePath}"`;
 }
 
+/**
+ * Strict inverse of `buildNodeCommand`.
+ *
+ * Returns `{ nodePath, scriptPath }` ONLY when `cmd` could have been
+ * produced by `buildNodeCommand` — i.e. exactly two double-quoted args
+ * separated by whitespace. Anything else (bare `node …`, single quotes,
+ * unquoted ambiguous input, CLI dispatcher entries) returns `null`.
+ *
+ * Why strict: the legacy `\S+\.mjs` fallback in
+ * `src/util/hook-config.ts:24` and the two-step regex in
+ * `src/adapters/claude-code/hooks.ts:178` silently grabbed the path tail
+ * after the last whitespace whenever the host wire-format dropped quotes,
+ * producing the #548 doubled-path FAIL when `pluginRoot` contained
+ * spaces (e.g. `C:\Users\High Ground Services\…`). A canonical inverse
+ * lets every emit (`buildNodeCommand`) round-trip through every parse
+ * (`parseNodeCommand`) without inventing fallbacks. Adapter #16 inherits
+ * the contract by importing one module.
+ */
+export function parseNodeCommand(
+  cmd: string,
+): { nodePath: string; scriptPath: string } | null {
+  if (typeof cmd !== "string" || cmd.length === 0) return null;
+  // Match `"<nodePath>" "<scriptPath>"` with arbitrary whitespace
+  // separator. Both segments must be non-empty and contain no embedded
+  // double quotes — buildNodeCommand never emits embedded quotes.
+  const m = cmd.match(/^"([^"]+)"\s+"([^"]+)"\s*$/);
+  if (!m) return null;
+  return { nodePath: m[1], scriptPath: m[2] };
+}
+
 /** Supported platform identifiers. */
 export type PlatformId =
   | "claude-code"

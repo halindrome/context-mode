@@ -843,6 +843,91 @@ describe("ClaudeCodeAdapter", () => {
       }
     });
 
+    // ── parseNodeCommand round-trip with buildNodeCommand (Algo-D2) ──
+    //
+    // buildNodeCommand emits `"<execPath>" "<scriptPath>"` (see
+    // src/adapters/types.ts:332). parseNodeCommand is its inverse: any
+    // string produced by buildNodeCommand round-trips back to the original
+    // scriptPath. Anything that could NOT have been produced by
+    // buildNodeCommand returns null — closes the #548 class where the
+    // free-form regex (`\S+\.mjs` fallback in src/util/hook-config.ts:24
+    // and the `node\s+"?([^"]+\.mjs)"?` fallback in
+    // src/adapters/claude-code/hooks.ts:178) silently grabbed the path
+    // tail after the last space and produced a doubled-path FAIL.
+    it("parseNodeCommand is the strict inverse of buildNodeCommand (Algo-D2)", async () => {
+      const { buildNodeCommand, parseNodeCommand } = await import(
+        "../../src/adapters/types.js"
+      );
+
+      const cases = [
+        "/usr/local/bin/context-mode/hooks/pretooluse.mjs",
+        "C:/Users/High Ground Services/AppData/Roaming/npm/node_modules/context-mode/hooks/sessionstart.mjs",
+        "/path with spaces/and-symbols!@#$%/hooks/posttooluse.mjs",
+      ];
+      for (const scriptPath of cases) {
+        const cmd = buildNodeCommand(scriptPath);
+        const parsed = parseNodeCommand(cmd);
+        expect(parsed, `round-trip failed for: ${scriptPath}`).not.toBeNull();
+        expect(parsed!.scriptPath).toBe(scriptPath);
+        expect(parsed!.nodePath.length).toBeGreaterThan(0);
+      }
+    });
+
+    it("parseNodeCommand returns null for the #548 ambiguous unquoted shape (Algo-D2)", async () => {
+      const { parseNodeCommand } = await import("../../src/adapters/types.js");
+      // jasonwujch's #548 wire shape — bare `node` + unquoted path with
+      // spaces. buildNodeCommand could NEVER produce this (it always
+      // double-quotes both args), so parseNodeCommand MUST refuse it.
+      const ambiguous =
+        "node C:/Users/High Ground Services/AppData/Roaming/npm/node_modules/context-mode/hooks/pretooluse.mjs";
+      expect(parseNodeCommand(ambiguous)).toBeNull();
+    });
+
+    it("parseNodeCommand returns null for non-node commands (Algo-D2)", async () => {
+      const { parseNodeCommand } = await import("../../src/adapters/types.js");
+      // CLI dispatcher entries are path-independent — parseNodeCommand
+      // is for buildNodeCommand-shaped strings only. Returning null lets
+      // callers fall through to dispatcher handling without false matches.
+      expect(parseNodeCommand("context-mode hook claude-code pretooluse")).toBeNull();
+      expect(parseNodeCommand("")).toBeNull();
+      expect(parseNodeCommand('"/usr/bin/node"')).toBeNull();
+    });
+
+    it("hook-config.extractHookScriptPath delegates to parseNodeCommand (twin collapse, Algo-D2)", async () => {
+      const { extractHookScriptPath } = await import(
+        "../../src/util/hook-config.js"
+      );
+      const { buildNodeCommand } = await import("../../src/adapters/types.js");
+
+      // Healthy buildNodeCommand-shaped input still extracts.
+      const cmd = buildNodeCommand("/install/dir/hooks/pretooluse.mjs");
+      expect(extractHookScriptPath(cmd)).toBe("/install/dir/hooks/pretooluse.mjs");
+
+      // The #548 ambiguous shape now returns null instead of grabbing
+      // the path tail after the last space (the silent doubled-path
+      // bug). null lets the doctor fall through to direct existsSync
+      // (Algo-D1) instead of trusting the regex.
+      const ambiguous =
+        "node C:/Users/High Ground Services/AppData/Roaming/npm/node_modules/context-mode/hooks/pretooluse.mjs";
+      expect(extractHookScriptPath(ambiguous)).toBeNull();
+    });
+
+    it("hooks.ts extractHookScriptPath delegates to parseNodeCommand (twin collapse, Algo-D2)", async () => {
+      const { extractHookScriptPath: extractInHooks } = await import(
+        "../../src/adapters/claude-code/hooks.js"
+      );
+      const { buildNodeCommand } = await import("../../src/adapters/types.js");
+
+      const cmd = buildNodeCommand("/install/dir/hooks/sessionstart.mjs");
+      expect(extractInHooks(cmd)).toBe("/install/dir/hooks/sessionstart.mjs");
+
+      // Same ambiguous shape — both twin definitions must agree post-D2
+      // so doctor + cleanup callers behave identically.
+      const ambiguous =
+        "node C:/Users/High Ground Services/AppData/Roaming/npm/node_modules/context-mode/hooks/pretooluse.mjs";
+      expect(extractInHooks(ambiguous)).toBeNull();
+    });
+
     it("hooks/hooks.json PreToolUse matchers match PRE_TOOL_USE_MATCHERS (#529 drift guard)", () => {
       const repoRoot = resolve(__dirname, "..", "..");
       const hooksJsonPath = join(repoRoot, "hooks", "hooks.json");
