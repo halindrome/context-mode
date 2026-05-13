@@ -454,7 +454,15 @@ describe("normalize-hooks — /ctx-upgrade post-cpSync sequence (issue #528)", (
 // ─────────────────────────────────────────────────────────────────────────
 
 describe("postinstall — global install, registry already healthy", () => {
-  it("emits 'no heal needed' and leaves registry bytes unchanged", () => {
+  // The vitest default test timeout is 30s; this test path runs the real
+  // `heal-better-sqlite3.mjs` (section 3 of postinstall.mjs) which alone
+  // can take 20-30s on cold CI runners. Sibling tests in this file
+  // (L163, L246) already use 90_000 for the same reason. CI run
+  // 25803559016 caught this gap — Ubuntu ran the whole file in 126s but
+  // macOS hit the default 30s budget for this `it()` and killed the test
+  // before spawn could return. 90s matches the precedent the rest of the
+  // file established; widening just this `it()` is the minimum diff.
+  it("emits 'no heal needed' and leaves registry bytes unchanged", { timeout: 90_000 }, () => {
     const fake = buildFakeHome({
       entryVersion: "1.0.114",
       cacheVersion: "1.0.114",
