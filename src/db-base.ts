@@ -337,15 +337,15 @@ export function applyWALPragmas(db: DatabaseInstance): void {
   // the actual file size). Falls back gracefully on platforms where mmap
   // is unavailable or restricted.
   try { db.pragma("mmap_size = 268435456"); } catch { /* unsupported runtime */ }
-  // v1.0.128 — Issue #560 SECONDARY defense for single-writer enforcement.
-  // The .lock file (acquireDbLock in SQLiteBase ctor) is PRIMARY — it
-  // surfaces the conflicting PID with a clear UX message. EXCLUSIVE locking
-  // closes the narrow race window between lockfile claim + the actual
-  // `new Database(...)` open: a parallel process passing the lockfile
-  // check would still get SQLITE_BUSY from this pragma. Wrapped in
-  // try/catch identical to mmap_size — backends that don't expose
-  // locking_mode (or pragma at all) still get the lockfile floor.
-  try { db.pragma("locking_mode = EXCLUSIVE"); } catch { /* unsupported runtime */ }
+  // NOTE: `locking_mode = EXCLUSIVE` is intentionally NOT applied here.
+  // Multi-writer scenarios are valid: `ContentStore` (FTS5 shared
+  // knowledge base) is opened concurrently from multiple sessions on the
+  // SAME db file by design — applying EXCLUSIVE here would deadlock the
+  // second instance and break documented `withRetry`-based BUSY handling.
+  // Single-writer enforcement (lockfile + EXCLUSIVE) lives in
+  // `SQLiteBase` ctor which is opted into by per-project DBs (SessionDB).
+  // Different DB paths from different worktrees/sessions ARE concurrent
+  // by design — the lockfile is per-dbPath, not per-process.
 }
 
 // ─────────────────────────────────────────────────────────
@@ -541,6 +541,17 @@ export abstract class SQLiteBase {
     try {
       db = new Database(dbPath, { timeout: 30000 });
       applyWALPragmas(db);
+      // v1.0.128 — Issue #560 SECONDARY defense for SQLiteBase callers (single-writer
+      // DBs like SessionDB). The .lock file (acquireDbLock above) is PRIMARY — it
+      // surfaces the conflicting PID with a clear UX message. EXCLUSIVE locking
+      // closes the narrow race window between lockfile claim + the actual
+      // `new Database(...)` open: a parallel process passing the lockfile
+      // check would still get SQLITE_BUSY from this pragma. Wrapped in try/catch —
+      // backends that don't expose locking_mode (or pragma at all) still get the
+      // lockfile floor. NOTE: NOT applied in `applyWALPragmas` because multi-writer
+      // callers (ContentStore — FTS5 shared knowledge base across sessions) rely
+      // on the default SHARED locking mode + withRetry to handle SQLITE_BUSY.
+      try { db.pragma("locking_mode = EXCLUSIVE"); } catch { /* unsupported runtime */ }
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       if (isSQLiteCorruptionError(msg)) {
@@ -549,6 +560,7 @@ export abstract class SQLiteBase {
         try {
           db = new Database(dbPath, { timeout: 30000 });
           applyWALPragmas(db);
+          try { db.pragma("locking_mode = EXCLUSIVE"); } catch { /* unsupported runtime */ }
         } catch (retryErr) {
           // Free the lock before bubbling — caller can never reach
           // close()/cleanup() if the ctor throws.

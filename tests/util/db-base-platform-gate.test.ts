@@ -160,10 +160,20 @@ describe("SQLiteBase lockfile + EXCLUSIVE locking (#560)", () => {
   const dbBasePath = resolve(__dirname, "..", "..", "src", "db-base.ts");
   const src = readFileSync(dbBasePath, "utf8");
 
-  it("applyWALPragmas applies locking_mode=EXCLUSIVE (belt-and-braces)", () => {
+  // v1.0.129 — Issue #560 hotfix. EXCLUSIVE pragma was moved OUT of
+  // applyWALPragmas because ContentStore (multi-writer FTS5 shared
+  // knowledge base) opens the SAME db file from multiple sessions by
+  // design — applying EXCLUSIVE in the shared helper deadlocked the
+  // second instance and broke the documented `withRetry`-based BUSY
+  // path. The pragma now lives ONLY in `SQLiteBase` ctor (see test
+  // below), so single-writer DBs (SessionDB) still get EXCLUSIVE while
+  // multi-writer DBs (ContentStore) keep the SHARED locking default.
+  it("applyWALPragmas does NOT apply locking_mode=EXCLUSIVE (multi-writer safe)", () => {
     const region = src.split("export function applyWALPragmas")[1] ?? "";
     const upToNextExport = region.split("\nexport ")[0] ?? "";
-    expect(upToNextExport).toMatch(/locking_mode\s*=\s*EXCLUSIVE/i);
+    // The line itself must be gone — the only mention left is the
+    // explanatory NOTE comment that points readers at SQLiteBase.
+    expect(upToNextExport).not.toMatch(/db\.pragma\s*\(\s*["']locking_mode\s*=\s*EXCLUSIVE/);
   });
 
   it("SQLiteBase ctor calls acquireDbLock before opening the database", () => {
