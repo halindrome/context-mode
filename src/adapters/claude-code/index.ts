@@ -27,6 +27,7 @@ import { homedir } from "node:os";
 
 import { ClaudeCodeBaseAdapter, type ClaudeCodeWireInput } from "../claude-code-base.js";
 import { resolveClaudeConfigDir } from "../../util/claude-config.js";
+import { checkPluginCacheIntegritySync } from "../../util/plugin-cache-integrity.js";
 
 import {
   buildNodeCommand,
@@ -241,7 +242,7 @@ export class ClaudeCodeAdapter extends ClaudeCodeBaseAdapter implements HookAdap
   }
 
   /**
-   * Adapter-defined health checks (Algo-D1).
+   * Adapter-defined health checks (Algo-D1 + Algo-D5).
    *
    * For each entry in HOOK_SCRIPTS (the canonical hookType → scriptName
    * map), emit a HealthCheck that joins `pluginRoot + "hooks" +
@@ -250,30 +251,46 @@ export class ClaudeCodeAdapter extends ClaudeCodeBaseAdapter implements HookAdap
    * hand, so the regex round-trip that produced the #548 doubled-path
    * FAIL is bypassed entirely.
    *
-   * The check derives from HOOK_SCRIPTS (single source of truth in
+   * The hook check derives from HOOK_SCRIPTS (single source of truth in
    * src/adapters/claude-code/hooks.ts), so adding a new hook event in
    * that map auto-extends doctor coverage — no parallel hardcoded list
    * to maintain.
+   *
+   * Algo-D5: appends a single "Plugin cache integrity" check that
+   * delegates to the same helper start.mjs uses at boot
+   * (scripts/plugin-cache-integrity.mjs::assertPluginCacheIntegrity).
+   * Same code, two callsites — boot fail-fast and doctor diagnostic
+   * agree byte-for-byte. Users hitting #550 get the actionable signal
+   * without restarting the MCP server.
    */
   getHealthChecks(pluginRoot: string): readonly HealthCheck[] {
-    return Object.entries(HOOK_SCRIPTS).map(([hookType, scriptName]) => {
-      const absolutePath = join(pluginRoot, "hooks", scriptName);
-      return {
-        name: `Hook script: ${hookType} (${scriptName})`,
-        check: () => {
-          // Direct existsSync — no hook-command parsing, no regex.
-          // pluginRoot is the value the doctor was invoked with;
-          // scriptName comes from the canonical HOOK_SCRIPTS map.
-          if (existsSync(absolutePath)) {
-            return { status: "OK" as const, detail: absolutePath };
-          }
-          return {
-            status: "FAIL" as const,
-            detail: `not found at ${absolutePath}`,
-          };
-        },
-      };
-    });
+    const hookChecks: HealthCheck[] = Object.entries(HOOK_SCRIPTS).map(
+      ([hookType, scriptName]) => {
+        const absolutePath = join(pluginRoot, "hooks", scriptName);
+        return {
+          name: `Hook script: ${hookType} (${scriptName})`,
+          check: () => {
+            // Direct existsSync — no hook-command parsing, no regex.
+            // pluginRoot is the value the doctor was invoked with;
+            // scriptName comes from the canonical HOOK_SCRIPTS map.
+            if (existsSync(absolutePath)) {
+              return { status: "OK" as const, detail: absolutePath };
+            }
+            return {
+              status: "FAIL" as const,
+              detail: `not found at ${absolutePath}`,
+            };
+          },
+        };
+      },
+    );
+
+    const integrityCheck: HealthCheck = {
+      name: "Plugin cache integrity",
+      check: () => checkPluginCacheIntegritySync(pluginRoot),
+    };
+
+    return [...hookChecks, integrityCheck];
   }
 
   /** Read plugin hooks from hooks/hooks.json or .claude-plugin/hooks/hooks.json */

@@ -1112,10 +1112,12 @@ describe("ClaudeCodeAdapter", () => {
     });
 
     it("returns one HealthCheck per HOOK_SCRIPTS entry (Algo-D1)", () => {
-      // All five hook scripts present on disk → all five checks PASS.
-      // The check iterates HOOK_SCRIPTS keys (the canonical list) so
-      // adding a new event auto-extends doctor coverage — no parallel
-      // hardcoded list to maintain.
+      // All five hook scripts present on disk → all five hook-script
+      // checks PASS. The check iterates HOOK_SCRIPTS keys (the canonical
+      // list) so adding a new event auto-extends doctor coverage — no
+      // parallel hardcoded list to maintain. Filter to hook-script
+      // checks only so this test is independent of Algo-D5's appended
+      // "Plugin cache integrity" entry.
       const scripts = [
         "pretooluse.mjs",
         "posttooluse.mjs",
@@ -1126,32 +1128,87 @@ describe("ClaudeCodeAdapter", () => {
       for (const s of scripts) writeFileSync(join(pluginRoot, "hooks", s), "");
 
       const checks = adapter.getHealthChecks!(pluginRoot);
-      expect(checks.length).toBe(scripts.length);
-      for (const c of checks) {
+      const hookChecks = checks.filter((c) => /^Hook script:/.test(c.name));
+      expect(hookChecks.length).toBe(scripts.length);
+      for (const c of hookChecks) {
         const result = c.check();
         expect(result.status).toBe("OK");
       }
     });
 
     it("reports FAIL with missing path detail when a script is absent (Algo-D1)", () => {
-      // Only sessionstart.mjs present → 4 FAILs + 1 OK. The FAIL detail
-      // must reference the exact missing absolute path (not a regex
-      // capture artifact like ".../Services/AppData/...").
+      // Only sessionstart.mjs present → 4 hook-script FAILs + 1 OK. The
+      // FAIL detail must reference the exact missing absolute path (not
+      // a regex capture artifact like ".../Services/AppData/...").
+      // Filter to hook-script checks so this test is independent of
+      // Algo-D5's "Plugin cache integrity" entry which can be either
+      // OK or FAIL depending on bundle siblings present in the temp
+      // dir at test time.
       writeFileSync(join(pluginRoot, "hooks", "sessionstart.mjs"), "");
 
       const checks = adapter.getHealthChecks!(pluginRoot);
-      const results = checks.map((c) => ({ name: c.name, ...c.check() }));
-      const failed = results.filter((r) => r.status === "FAIL");
-      const ok = results.filter((r) => r.status === "OK");
+      const hookResults = checks
+        .filter((c) => /^Hook script:/.test(c.name))
+        .map((c) => ({ name: c.name, ...c.check() }));
+      const failed = hookResults.filter((r) => r.status === "FAIL");
+      const ok = hookResults.filter((r) => r.status === "OK");
       expect(ok.length).toBe(1);
       expect(failed.length).toBe(4);
-      // Each FAIL detail names the absolute path that was checked,
-      // anchored under pluginRoot — proves the check used direct
-      // existsSync, not a regex on a hook command.
       for (const r of failed) {
         expect(r.detail).toContain(pluginRoot);
         expect(r.detail!.endsWith(".mjs")).toBe(true);
       }
+    });
+
+    // ── Algo-D5: doctor surfaces plugin-cache integrity ──
+    //
+    // The same helper start.mjs uses for fail-fast on partial installs
+    // (Algo-D4 → scripts/plugin-cache-integrity.mjs::assertPluginCacheIntegrity)
+    // is exposed via the doctor surface so users hitting #550 get the
+    // diagnostic without restarting the MCP server. Single source of
+    // truth → boot and doctor agree byte-for-byte.
+    it("getHealthChecks includes a Plugin cache integrity check (Algo-D5)", () => {
+      const checks = adapter.getHealthChecks!(pluginRoot);
+      const integrity = checks.find((c) =>
+        /Plugin cache integrity/i.test(c.name),
+      );
+      expect(integrity, "Plugin cache integrity check missing").toBeDefined();
+    });
+
+    it("Plugin cache integrity check FAILs when boot-critical siblings are missing (Algo-D5)", () => {
+      // pluginRoot is empty (only the hooks/ dir from beforeEach exists,
+      // and it is empty). The integrity check must FAIL with detail
+      // listing the missing files. This is the exact same answer
+      // start.mjs would give at boot — same helper, two callsites.
+      const checks = adapter.getHealthChecks!(pluginRoot);
+      const integrity = checks.find((c) =>
+        /Plugin cache integrity/i.test(c.name),
+      )!;
+      const result = integrity.check();
+      expect(result.status).toBe("FAIL");
+      // Detail must reference the missing files so users know what's
+      // broken without bouncing back to start.mjs's stderr block.
+      expect(result.detail).toMatch(/server\.bundle\.mjs|cli\.bundle\.mjs/);
+    });
+
+    it("Plugin cache integrity check OKs when every required sibling exists (Algo-D5)", () => {
+      // Build a tree shaped like a healthy install.
+      writeFileSync(join(pluginRoot, "server.bundle.mjs"), "");
+      writeFileSync(join(pluginRoot, "cli.bundle.mjs"), "");
+      const hooksDir = join(pluginRoot, "hooks");
+      // hooksDir already exists from beforeEach
+      writeFileSync(join(hooksDir, "pretooluse.mjs"), "");
+      writeFileSync(join(hooksDir, "posttooluse.mjs"), "");
+      writeFileSync(join(hooksDir, "precompact.mjs"), "");
+      writeFileSync(join(hooksDir, "sessionstart.mjs"), "");
+      writeFileSync(join(hooksDir, "userpromptsubmit.mjs"), "");
+
+      const checks = adapter.getHealthChecks!(pluginRoot);
+      const integrity = checks.find((c) =>
+        /Plugin cache integrity/i.test(c.name),
+      )!;
+      const result = integrity.check();
+      expect(result.status).toBe("OK");
     });
 
     // ── #548 reproduction — direct existsSync defeats regex round-trip ──
@@ -1177,10 +1234,15 @@ describe("ClaudeCodeAdapter", () => {
 
       // Even if jasonwujch's settings.json had the ambiguous shape, the
       // health check does not look at settings.json — it joins
-      // pluginRoot + scriptName directly. So OK every time.
+      // pluginRoot + scriptName directly. So all hook-script checks OK
+      // every time. Filter to hook-script checks so the assertion is
+      // independent of the integrity check (Algo-D5) which probes a
+      // different sibling tree.
       const checks = adapter.getHealthChecks!(pluginRoot);
-      const allOk = checks.every((c) => c.check().status === "OK");
-      expect(allOk).toBe(true);
+      const allHookOk = checks
+        .filter((c) => /^Hook script:/.test(c.name))
+        .every((c) => c.check().status === "OK");
+      expect(allHookOk).toBe(true);
     });
   });
 
