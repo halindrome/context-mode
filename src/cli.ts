@@ -436,22 +436,49 @@ async function doctor(): Promise<number> {
     }
   }
 
-  // Hook scripts exist
+  // Hook scripts exist — Algo-D1 protocol path takes precedence.
+  // Adapters that override `getHealthChecks` (claude-code today) get a
+  // direct `existsSync(join(pluginRoot, "hooks", scriptName))` per
+  // HOOK_SCRIPTS entry — no regex round-trip on a hook command, so the
+  // #548 doubled-path FAIL class can't surface. Adapters that don't
+  // override fall through to the legacy `getHookScriptPaths` flow which
+  // generates the hook config and parses each command via
+  // `extractHookScriptPath`. Post-D3 every adapter emits buildNodeCommand-
+  // shape, so the legacy flow is also safe — but the direct existsSync
+  // path is strictly preferable when the adapter offers it.
   p.log.step("Checking hook scripts...");
-  const hookScriptPaths = getHookScriptPaths(adapter, pluginRoot);
-  if (hookScriptPaths.length === 0) {
-    p.log.success(color.green("Hook scripts: PASS") + color.dim(" — no direct .mjs script paths to verify"));
-  } else {
-    for (const scriptPath of hookScriptPaths) {
-      const absolutePath = resolve(pluginRoot, scriptPath);
-      try {
-        accessSync(absolutePath, constants.R_OK);
-        p.log.success(color.green("Hook script exists: PASS") + color.dim(` — ${absolutePath}`));
-      } catch {
-        p.log.error(
-          color.red("Hook script exists: FAIL") +
-            color.dim(` — not found at ${absolutePath}`),
+  const adapterHealthChecks = adapter.getHealthChecks?.(pluginRoot) ?? [];
+  if (adapterHealthChecks.length > 0) {
+    for (const hc of adapterHealthChecks) {
+      const result = hc.check();
+      if (result.status === "OK") {
+        p.log.success(
+          color.green(`${hc.name}: PASS`) +
+            (result.detail ? color.dim(` — ${result.detail}`) : ""),
         );
+      } else {
+        p.log.error(
+          color.red(`${hc.name}: FAIL`) +
+            (result.detail ? color.dim(` — ${result.detail}`) : ""),
+        );
+      }
+    }
+  } else {
+    const hookScriptPaths = getHookScriptPaths(adapter, pluginRoot);
+    if (hookScriptPaths.length === 0) {
+      p.log.success(color.green("Hook scripts: PASS") + color.dim(" — no direct .mjs script paths to verify"));
+    } else {
+      for (const scriptPath of hookScriptPaths) {
+        const absolutePath = resolve(pluginRoot, scriptPath);
+        try {
+          accessSync(absolutePath, constants.R_OK);
+          p.log.success(color.green("Hook script exists: PASS") + color.dim(` — ${absolutePath}`));
+        } catch {
+          p.log.error(
+            color.red("Hook script exists: FAIL") +
+              color.dim(` — not found at ${absolutePath}`),
+          );
+        }
       }
     }
   }

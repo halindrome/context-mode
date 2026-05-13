@@ -27,13 +27,16 @@ import { homedir } from "node:os";
 
 import { ClaudeCodeBaseAdapter, type ClaudeCodeWireInput } from "../claude-code-base.js";
 import { resolveClaudeConfigDir } from "../../util/claude-config.js";
+import { checkPluginCacheIntegritySync } from "../../util/plugin-cache-integrity.js";
 
-import type {
-  HookAdapter,
-  HookParadigm,
-  PlatformCapabilities,
-  DiagnosticResult,
-  HookRegistration,
+import {
+  buildNodeCommand,
+  type HookAdapter,
+  type HookParadigm,
+  type PlatformCapabilities,
+  type DiagnosticResult,
+  type HookRegistration,
+  type HealthCheck,
 } from "../types.js";
 import {
   HOOK_TYPES,
@@ -106,13 +109,20 @@ export class ClaudeCodeAdapter extends ClaudeCodeBaseAdapter implements HookAdap
   }
 
   generateHookConfig(pluginRoot: string): HookRegistration {
-    // Paths must be double-quoted so that hosts (or our own diagnostic
-    // regex) parse them correctly when pluginRoot contains spaces — common
-    // on Windows where the user folder is e.g. "C:\Users\First Last\...".
-    // Without quotes, extractHookScriptPath's `\S+\.mjs` fallback grabs
-    // only the tail after the last space, producing a doubled-path FAIL
-    // in `ctx doctor`. Matches the quoting style used in hooks/hooks.json.
-    const preToolUseCommand = `node "${pluginRoot}/hooks/pretooluse.mjs"`;
+    // Algo-D3: every command flows through `buildNodeCommand` (defined in
+    // src/adapters/types.ts), which:
+    //   - quotes both nodePath and scriptPath (#548 — Windows pluginRoots
+    //     with spaces no longer fall through extractHookScriptPath's
+    //     ambiguous-tail fallback),
+    //   - swaps backslashes for forward slashes (#372 MSYS path mangling),
+    //   - uses `process.execPath` instead of bare `node` (#369 PATH
+    //     resolution on Git Bash).
+    // Pre-D3 we hand-rolled `node "${pluginRoot}/hooks/X.mjs"` for all
+    // five events; bare `node` made claude-code the lone outlier and
+    // dropping the execPath swap re-opened the Windows class. Algo-D3.5
+    // (CI invariant in tests/adapters/claude-code.test.ts) locks this in
+    // for adapter #16.
+    const preToolUseCommand = buildNodeCommand(`${pluginRoot}/hooks/pretooluse.mjs`);
     const preToolUseMatchers = [...PRE_TOOL_USE_MATCHERS];
 
     return {
@@ -126,7 +136,7 @@ export class ClaudeCodeAdapter extends ClaudeCodeBaseAdapter implements HookAdap
           hooks: [
             {
               type: "command",
-              command: `node "${pluginRoot}/hooks/posttooluse.mjs"`,
+              command: buildNodeCommand(`${pluginRoot}/hooks/posttooluse.mjs`),
             },
           ],
         },
@@ -137,7 +147,7 @@ export class ClaudeCodeAdapter extends ClaudeCodeBaseAdapter implements HookAdap
           hooks: [
             {
               type: "command",
-              command: `node "${pluginRoot}/hooks/precompact.mjs"`,
+              command: buildNodeCommand(`${pluginRoot}/hooks/precompact.mjs`),
             },
           ],
         },
@@ -148,7 +158,7 @@ export class ClaudeCodeAdapter extends ClaudeCodeBaseAdapter implements HookAdap
           hooks: [
             {
               type: "command",
-              command: `node "${pluginRoot}/hooks/userpromptsubmit.mjs"`,
+              command: buildNodeCommand(`${pluginRoot}/hooks/userpromptsubmit.mjs`),
             },
           ],
         },
@@ -159,7 +169,7 @@ export class ClaudeCodeAdapter extends ClaudeCodeBaseAdapter implements HookAdap
           hooks: [
             {
               type: "command",
-              command: `node "${pluginRoot}/hooks/sessionstart.mjs"`,
+              command: buildNodeCommand(`${pluginRoot}/hooks/sessionstart.mjs`),
             },
           ],
         },
@@ -229,6 +239,58 @@ export class ClaudeCodeAdapter extends ClaudeCodeBaseAdapter implements HookAdap
     });
 
     return results;
+  }
+
+  /**
+   * Adapter-defined health checks (Algo-D1 + Algo-D5).
+   *
+   * For each entry in HOOK_SCRIPTS (the canonical hookType → scriptName
+   * map), emit a HealthCheck that joins `pluginRoot + "hooks" +
+   * scriptName` and probes via `existsSync`. Crucially, this NEVER
+   * parses a hook command — pluginRoot and scriptName are both in our
+   * hand, so the regex round-trip that produced the #548 doubled-path
+   * FAIL is bypassed entirely.
+   *
+   * The hook check derives from HOOK_SCRIPTS (single source of truth in
+   * src/adapters/claude-code/hooks.ts), so adding a new hook event in
+   * that map auto-extends doctor coverage — no parallel hardcoded list
+   * to maintain.
+   *
+   * Algo-D5: appends a single "Plugin cache integrity" check that
+   * delegates to the same helper start.mjs uses at boot
+   * (scripts/plugin-cache-integrity.mjs::assertPluginCacheIntegrity).
+   * Same code, two callsites — boot fail-fast and doctor diagnostic
+   * agree byte-for-byte. Users hitting #550 get the actionable signal
+   * without restarting the MCP server.
+   */
+  getHealthChecks(pluginRoot: string): readonly HealthCheck[] {
+    const hookChecks: HealthCheck[] = Object.entries(HOOK_SCRIPTS).map(
+      ([hookType, scriptName]) => {
+        const absolutePath = join(pluginRoot, "hooks", scriptName);
+        return {
+          name: `Hook script: ${hookType} (${scriptName})`,
+          check: () => {
+            // Direct existsSync — no hook-command parsing, no regex.
+            // pluginRoot is the value the doctor was invoked with;
+            // scriptName comes from the canonical HOOK_SCRIPTS map.
+            if (existsSync(absolutePath)) {
+              return { status: "OK" as const, detail: absolutePath };
+            }
+            return {
+              status: "FAIL" as const,
+              detail: `not found at ${absolutePath}`,
+            };
+          },
+        };
+      },
+    );
+
+    const integrityCheck: HealthCheck = {
+      name: "Plugin cache integrity",
+      check: () => checkPluginCacheIntegritySync(pluginRoot),
+    };
+
+    return [...hookChecks, integrityCheck];
   }
 
   /** Read plugin hooks from hooks/hooks.json or .claude-plugin/hooks/hooks.json */

@@ -1,4 +1,4 @@
-import { buildNodeCommand } from "../types.js";
+import { buildNodeCommand, parseNodeCommand } from "../types.js";
 
 /**
  * adapters/claude-code/hooks — Claude Code hook definitions and matchers.
@@ -169,19 +169,28 @@ export function buildHookCommand(hookType: HookType, pluginRoot?: string): strin
 
 /**
  * Extract the hook script file path from a command string.
- * Returns the path if the command uses the `node "/path/to/hook.mjs"` format
- * or the new `"/path/to/node" "/path/to/hook.mjs"` format (#369, #372),
- * or null if it uses the CLI dispatcher format (which is path-independent).
  *
- * Handles both quoted and unquoted paths, and both forward/back slashes.
+ * Algo-D2 twin — same shape as `src/util/hook-config.ts::extractHookScriptPath`.
+ * Delegates to `parseNodeCommand` for canonical buildNodeCommand-shape;
+ * keeps narrow legacy fallbacks for pre-D3 settings.json entries
+ * (`node "X.mjs"` and `node X.mjs` with no internal whitespace).
+ *
+ * Pre-D2 this matched `node\s+"?([^"]+\.mjs)"?` — the unquoted fallback
+ * silently grabbed the tail after the last whitespace, producing the
+ * #548 doubled-path FAIL on Windows paths with spaces. The new shape
+ * refuses ambiguous input; doctor (Algo-D1) falls through to direct
+ * `existsSync` instead of trusting the regex.
  */
 export function extractHookScriptPath(command: string): string | null {
-  // New format: "nodePath" "scriptPath.mjs" (from buildNodeCommand)
-  const newFmt = command.match(/"[^"]+"\s+"([^"]+\.mjs)"/);
-  if (newFmt) return newFmt[1];
-  // Legacy format: node "/path/to/hooks/scriptname.mjs" or node /path/to/hooks/scriptname.mjs
-  const match = command.match(/node\s+"?([^"]+\.mjs)"?/);
-  return match?.[1] ?? null;
+  const parsed = parseNodeCommand(command);
+  if (parsed) {
+    return parsed.scriptPath.endsWith(".mjs") ? parsed.scriptPath : null;
+  }
+  const legacyQuoted = command.match(/^\s*node\s+"([^"]+\.mjs)"\s*$/);
+  if (legacyQuoted) return legacyQuoted[1];
+  const legacyBare = command.match(/^\s*node\s+(\S+\.mjs)\s*$/);
+  if (legacyBare) return legacyBare[1];
+  return null;
 }
 
 /**
