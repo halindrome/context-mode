@@ -176,6 +176,21 @@ describe("SQLiteBase lockfile + EXCLUSIVE locking (#560)", () => {
     expect(upToNextExport).not.toMatch(/db\.pragma\s*\(\s*["']locking_mode\s*=\s*EXCLUSIVE/);
   });
 
+  // v1.0.129 slice 2 — regression guard. After moving EXCLUSIVE out of
+  // applyWALPragmas, prove SQLiteBase ctor still applies it (both the
+  // main open path AND the corruption recovery path) so the v1.0.128
+  // #560 single-writer guarantee for SessionDB is preserved.
+  it("SQLiteBase ctor applies locking_mode=EXCLUSIVE on both open paths (regression guard for #560)", () => {
+    const classIdx = src.indexOf("export abstract class SQLiteBase");
+    expect(classIdx).toBeGreaterThan(-1);
+    const ctorRegion = src.slice(classIdx).split("constructor(dbPath: string)")[1] ?? "";
+    const ctorBody = ctorRegion.split("\n  protected ")[0] ?? "";
+    // Two `applyWALPragmas(db)` calls (main + corruption recovery) — each
+    // must be followed by an EXCLUSIVE pragma application.
+    const exclusiveMatches = ctorBody.match(/db\.pragma\s*\(\s*["']locking_mode\s*=\s*EXCLUSIVE["']\s*\)/g) ?? [];
+    expect(exclusiveMatches.length).toBeGreaterThanOrEqual(2);
+  });
+
   it("SQLiteBase ctor calls acquireDbLock before opening the database", () => {
     expect(src).toMatch(/from\s+["']\.\/util\/db-lock\.js["']/);
     const ctorRegion = src.split("constructor(dbPath: string)")[1] ?? "";
