@@ -500,6 +500,23 @@ export class PolyglotExecutor {
       "DOTNET_ROOT",                // arbitrary .NET runtime override
       "DOTNET_ROOT(x86)",           // 32-bit override
       "DOTNET_HOST_PATH",           // host binary substitution
+      // .NET / C# — profiler attach (loads arbitrary DLL into dotnet host)
+      // and IPC-based debugger/IL injection. PR #546 follow-up.
+      // learn.microsoft.com/en-us/dotnet/core/runtime-config/debugging-profiling
+      "CORECLR_PROFILER",                 // CLSID of profiler to attach
+      "CORECLR_PROFILER_PATH",            // path to profiler DLL
+      "CORECLR_PROFILER_PATH_32",         // 32-bit specific profiler DLL
+      "CORECLR_PROFILER_PATH_64",         // 64-bit specific profiler DLL
+      "CORECLR_PROFILER_PATH_ARM32",      // ARM32 specific profiler DLL
+      "CORECLR_PROFILER_PATH_ARM64",      // ARM64 specific profiler DLL
+      "CORECLR_ENABLE_PROFILING",         // gates profiler load
+      "DOTNET_PROFILER_PATH",             // cross-platform alias
+      "DOTNET_PROFILER_PATH_32",
+      "DOTNET_PROFILER_PATH_64",
+      "DOTNET_PROFILER_PATH_ARM32",
+      "DOTNET_PROFILER_PATH_ARM64",
+      "DOTNET_DiagnosticPorts",           // peer attach via diagnostic IPC
+      "DOTNET_BUNDLE_EXTRACT_BASE_DIR",   // single-file extraction hijack
       // Dynamic linker — shared library injection
       "LD_PRELOAD",           // loads .so before all others (Linux)
       "DYLD_INSERT_LIBRARIES", // macOS equivalent of LD_PRELOAD
@@ -520,10 +537,19 @@ export class PolyglotExecutor {
       "GIT_ASKPASS",          // arbitrary credential command
     ]);
 
-    // Start with parent env, then strip dangerous vars and apply overrides
+    // Start with parent env, then strip dangerous vars and apply overrides.
+    // The `COMPlus_` prefix sweep covers every COMPlus_* synonym of the
+    // DOTNET_* runtime knobs (.NET back-compat alias — case-insensitive).
+    // PR #546 follow-up: closes the alias bypass for the explicit denylist
+    // entries above.
     const env: Record<string, string> = {};
     for (const [key, val] of Object.entries(process.env)) {
-      if (val !== undefined && !DENIED.has(key) && !key.startsWith("BASH_FUNC_")) {
+      if (
+        val !== undefined &&
+        !DENIED.has(key) &&
+        !key.startsWith("BASH_FUNC_") &&
+        !/^COMPlus_/i.test(key)
+      ) {
         env[key] = val;
       }
     }
