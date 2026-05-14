@@ -269,7 +269,7 @@ Subagents automatically receive context-mode tool routing via a PreToolUse hook.
 - Using `cat large-file.json` via Bash → entire file in context. Use `ctx_execute_file` instead.
 - Using `gh pr list` via Bash → raw JSON in context. Use `ctx_execute` with `--jq` filter instead.
 - Piping Bash output through `| head -20` → you lose the rest. Use `ctx_execute` to analyze ALL data and print summary.
-- Using `head`/`tail` **inside** `ctx_execute` shell code (e.g., `grep ERROR log.txt | head -50`) → output is sandboxed, not context. Truncating inside the sandbox discards data *before* FTS5 indexing — the rest is permanently gone. Write programmatic analysis instead: filter, count, extract, then `console.log()` only the findings.
+- Using output-truncation primitives (`head -N`, `tail -N`, `sed -n '1,Np'`, `grep -m N`, `awk 'NR<=N'`) **inside** `ctx_execute`, `ctx_execute_file`, or `ctx_batch_execute` shell code (e.g., `grep ERROR log.txt | head -50`) → output is sandboxed, not context. Truncating inside the sandbox discards data *before* FTS5 indexing — the rest is permanently gone. Exception: bare short reads of small files (`head file`, `tail -N file`) are fine; only the `cmd | head -N` pipe-to-truncate pattern is the anti-pattern. Write programmatic analysis instead: filter, count, extract, then `console.log()` only the findings.
 - Running `npm test` via Bash → full test output in context. Use `ctx_execute` to capture and summarize.
 - Calling `browser_snapshot()` WITHOUT `filename` parameter → 135K tokens flood context. **Always** use `browser_snapshot(filename: "/tmp/snap.md")`.
 - Calling `browser_console_messages()` or `browser_network_requests()` WITHOUT `filename` → entire output floods context. **Always** use the `filename` parameter.

@@ -244,9 +244,9 @@ GOOD — specific and actionable:
 
 ---
 
-## 8. Using head/tail Inside ctx_execute to Limit Output
+## 8. Using Output-Truncation Primitives Inside Sandbox Tools to Limit Output
 
-**Problem:** Using `head` or `tail` inside a `ctx_execute` shell script to cap output volume. This looks safe because you're already inside the sandbox, but it silently discards data *before* it reaches the FTS5 index — so the truncated portion is permanently lost and unsearchable.
+**Problem:** Using `head`, `tail`, `sed -n '1,Np'`, `grep -m N`, or `awk 'NR<=N'` inside a `ctx_execute`, `ctx_execute_file`, or `ctx_batch_execute` payload to cap output volume. This looks safe because you're already inside the sandbox, but it silently discards data *before* it reaches the FTS5 index — so the truncated portion is permanently lost and unsearchable.
 
 ```shell
 # BAD — truncates before indexing; errors at line 51+ are gone:
@@ -254,9 +254,16 @@ grep ERROR app.log | head -50
 
 # BAD — only sees the last 20 lines; misses earlier failures:
 npm test 2>&1 | tail -20
+
+# BAD — same problem with other truncation primitives:
+grep ERROR app.log | sed -n '1,50p'
+grep -m 50 ERROR app.log
+awk 'NR<=50' app.log
 ```
 
-The mental model trap: inside `ctx_execute` the sandbox is NOT the context window. All stdout is captured for indexing. There is no output-size penalty for letting the command run fully — only for printing it back to context. So truncation gives you the worst of both worlds: you don't save context space (the index is internal), and you lose data.
+The mental model trap: inside these sandbox tools the sandbox is NOT the context window. All stdout is captured for indexing. There is no output-size penalty for letting the command run fully — only for printing it back to context. So truncation gives you the worst of both worlds: you don't save context space (the index is internal), and you lose data.
+
+**Exception:** Bare short reads of small files are fine — `head somefile`, `tail -20 somefile`, `wc -l somefile`. The anti-pattern is specifically piping a large-output command through a truncation primitive (`cmd | head -N`), not reading a small file directly.
 
 ```shell
 # GOOD — capture everything, extract only what matters:
@@ -274,7 +281,7 @@ errors.forEach(l => { const m = l.match(/ERROR \w+/); if (m) byType[m[0]] = (byT
 console.log(JSON.stringify(byType, null, 2));
 ```
 
-**Rule:** Never use `head` or `tail` inside a `ctx_execute` script to manage volume. The sandbox has no output limit. Write programmatic analysis — filter, count, aggregate — then `console.log()` only the findings. If you want the last N entries for a specific reason (e.g., "the 5 most recent errors"), express that as a deliberate data selection, not a truncation safety net.
+**Rule:** Never pipe large command output through truncation primitives inside `ctx_execute`, `ctx_execute_file`, or `ctx_batch_execute`. The sandbox has no output limit. Write programmatic analysis — filter, count, aggregate — then `console.log()` only the findings. If you want the last N entries for a specific reason (e.g., "the 5 most recent errors"), express that as a deliberate data selection in code, not a truncation safety net.
 
 ---
 
