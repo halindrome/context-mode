@@ -12,12 +12,12 @@ import { createRequire } from "node:module";
 import { existsSync, unlinkSync, renameSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-// v1.0.128 — Issue #560 single-writer enforcement.
-// Lockfile is the PRIMARY defense (clean UX with conflicting PID),
-// `locking_mode = EXCLUSIVE` (applied in applyWALPragmas below) is the
-// SECONDARY defense for the narrow race window between lockfile claim
-// and the actual `new Database(...)` open. Both skip-gate on tmpdir paths.
-import { acquireDbLock, releaseDbLock } from "./util/db-lock.js";
+// v1.0.130 — `acquireDbLock` + `locking_mode = EXCLUSIVE` were REMOVED.
+// See docs/adr/0001-sessiondb-multi-writer.md for the architectural
+// rationale. The short version: SessionDB is multi-writer-safe and the
+// process-identity invariants the lockfile tried to enforce belong in
+// the process layer (sibling-mcp), not the DB layer. WAL + busy_timeout
+// + withRetry handle the actual concurrency safely.
 
 // ─────────────────────────────────────────────────────────
 // Types
@@ -338,14 +338,12 @@ export function applyWALPragmas(db: DatabaseInstance): void {
   // is unavailable or restricted.
   try { db.pragma("mmap_size = 268435456"); } catch { /* unsupported runtime */ }
   // NOTE: `locking_mode = EXCLUSIVE` is intentionally NOT applied here.
-  // Multi-writer scenarios are valid: `ContentStore` (FTS5 shared
-  // knowledge base) is opened concurrently from multiple sessions on the
-  // SAME db file by design — applying EXCLUSIVE here would deadlock the
-  // second instance and break documented `withRetry`-based BUSY handling.
-  // Single-writer enforcement (lockfile + EXCLUSIVE) lives in
-  // `SQLiteBase` ctor which is opted into by per-project DBs (SessionDB).
-  // Different DB paths from different worktrees/sessions ARE concurrent
-  // by design — the lockfile is per-dbPath, not per-process.
+  // ALL DBs built on this helper — ContentStore (FTS5 shared knowledge
+  // base) AND SessionDB (per-project events) — are multi-writer-safe by
+  // contract. WAL + busy_timeout + the withRetry() wrapper below handle
+  // SQLITE_BUSY natively. EXCLUSIVE locking is opt-out, never opt-in
+  // from a base class shared by multi-writer consumers.
+  // See docs/adr/0001-sessiondb-multi-writer.md for the v1.0.130 ADR.
 }
 
 // ─────────────────────────────────────────────────────────
@@ -495,26 +493,19 @@ export function renameCorruptDB(dbPath: string): void {
  * re-imports within the same fork process (ESM isolate mode clears
  * module-level state but globalThis persists).
  */
-// v1.0.128 — symbol name versioned because the value type changed from
-// Set<DatabaseInstance> to Map<DatabaseInstance, string> (issue #560).
-// A persistent global slot from a pre-v128 module would deserialize as
-// the wrong shape and crash the exit hook iteration.
-const _kLiveDBs = Symbol.for("__context_mode_live_dbs_v2__");
-// v1.0.128 — issue #560: pair each DatabaseInstance with the dbPath that
-// owns its lockfile. The exit hook needs both — closeDB(db) handles the
-// WAL checkpoint, releaseDbLock(dbPath) drops the .lock file. We use a
-// Map keyed by DatabaseInstance to keep API call sites unchanged.
-const _liveDBs: Map<DatabaseInstance, string> = (() => {
-  const g = globalThis as Record<symbol, Map<DatabaseInstance, string> | undefined>;
+// v1.0.130 — symbol name bumped because the value type reverted from
+// Map<DatabaseInstance, string> (v1.0.128 lockfile pairing) back to
+// Set<DatabaseInstance>. A persistent global slot from a v1.0.128 or
+// v1.0.129 module would deserialize as the wrong shape and crash the
+// exit hook iteration.
+const _kLiveDBs = Symbol.for("__context_mode_live_dbs_v3__");
+const _liveDBs: Set<DatabaseInstance> = (() => {
+  const g = globalThis as Record<symbol, Set<DatabaseInstance> | undefined>;
   if (!g[_kLiveDBs]) {
-    g[_kLiveDBs] = new Map<DatabaseInstance, string>();
+    g[_kLiveDBs] = new Set<DatabaseInstance>();
     process.on("exit", () => {
-      for (const [db, dbPath] of g[_kLiveDBs]!) {
+      for (const db of g[_kLiveDBs]!) {
         closeDB(db);
-        // Release lock AFTER close so the WAL checkpoint inside closeDB
-        // runs while we still own the writer slot (no second-opener can
-        // race in mid-checkpoint).
-        releaseDbLock({ dbPath });
       }
       g[_kLiveDBs]!.clear();
     });
@@ -526,42 +517,35 @@ export abstract class SQLiteBase {
   readonly #dbPath: string;
   readonly #db: DatabaseInstance;
 
+  /**
+   * Open (or create) a SQLite DB at `dbPath`.
+   *
+   * v1.0.130 — multi-writer is the contract. ALL SQLiteBase consumers
+   * (SessionDB, ContentStore) may open the same on-disk dbPath from
+   * multiple processes simultaneously — that is the legitimate multi-
+   * window UX shape and the WAL handles it natively. SQLITE_BUSY on
+   * write contention is absorbed by `withRetry()` below (busy_timeout
+   * = 30000ms inside `new Database(...)`).
+   *
+   * v1.0.128 introduced a `acquireDbLock` lockfile + `locking_mode =
+   * EXCLUSIVE` pragma here as a defense against #560. That defense was
+   * an over-correction — the actual root causes of #560 were #559
+   * (zombie MCP child accumulation) and #561 (Pi misdetection writing
+   * to the wrong DB path), both fixed in v1.0.128 + v1.0.129. The
+   * lockfile broke legitimate multi-window users with the
+   * "Another context-mode server is already running" error. v1.0.130
+   * rolls it out. See docs/adr/0001-sessiondb-multi-writer.md and
+   * tests/util/db-base-platform-gate.test.ts (the v1.0.130 INVARIANT
+   * block) for the regression-proof anchor.
+   */
   constructor(dbPath: string) {
     const Database = loadDatabase();
     this.#dbPath = dbPath;
-    // v1.0.128 — Issue #560 PRIMARY single-writer guard. Must claim
-    // BEFORE `new Database(...)` so a contending opener gets the clean
-    // DatabaseLockedError UX (PID + verbatim message) instead of the
-    // SQLITE_BUSY surfaced by EXCLUSIVE locking. Skip-gate via
-    // tmpdir-prefix check inside the helper — defaultDBPath() output
-    // (per-process tmp DBs) does not contend, so it never claims a lock.
-    acquireDbLock({ dbPath });
-    // v1.0.129 — single source of truth for skip decision. Both lockfile
-    // (above) and EXCLUSIVE pragma (below) MUST share the same skip-gate:
-    // tests open SessionDB twice on the same tmpdir path to exercise
-    // multi-writer scenarios; if EXCLUSIVE fires here when lockfile didn't,
-    // the second open hits SQLITE_BUSY on its FIRST pragma call inside
-    // applyWALPragmas — caused 82 test failures during v1.0.128 verification.
-    const skipExclusive = dbPath.startsWith(tmpdir());
     cleanOrphanedWALFiles(dbPath);
     let db: DatabaseInstance;
     try {
       db = new Database(dbPath, { timeout: 30000 });
       applyWALPragmas(db);
-      // v1.0.128 — Issue #560 SECONDARY defense for SQLiteBase callers (single-writer
-      // DBs like SessionDB). The .lock file (acquireDbLock above) is PRIMARY — it
-      // surfaces the conflicting PID with a clear UX message. EXCLUSIVE locking
-      // closes the narrow race window between lockfile claim + the actual
-      // `new Database(...)` open: a parallel process passing the lockfile
-      // check would still get SQLITE_BUSY from this pragma. Wrapped in try/catch —
-      // backends that don't expose locking_mode (or pragma at all) still get the
-      // lockfile floor. NOTE: NOT applied in `applyWALPragmas` because multi-writer
-      // callers (ContentStore — FTS5 shared knowledge base across sessions) rely
-      // on the default SHARED locking mode + withRetry to handle SQLITE_BUSY.
-      // Skip on tmpdir paths to match acquireDbLock's skip-gate.
-      if (!skipExclusive) {
-        try { db.pragma("locking_mode = EXCLUSIVE"); } catch { /* unsupported runtime */ }
-      }
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       if (isSQLiteCorruptionError(msg)) {
@@ -570,24 +554,17 @@ export abstract class SQLiteBase {
         try {
           db = new Database(dbPath, { timeout: 30000 });
           applyWALPragmas(db);
-          if (!skipExclusive) {
-            try { db.pragma("locking_mode = EXCLUSIVE"); } catch { /* unsupported runtime */ }
-          }
         } catch (retryErr) {
-          // Free the lock before bubbling — caller can never reach
-          // close()/cleanup() if the ctor throws.
-          releaseDbLock({ dbPath });
           throw new Error(
             `Failed to create fresh DB after renaming corrupt file: ${retryErr instanceof Error ? retryErr.message : String(retryErr)}`
           );
         }
       } else {
-        releaseDbLock({ dbPath });
         throw err;
       }
     }
     this.#db = db;
-    _liveDBs.set(this.#db, dbPath);
+    _liveDBs.add(this.#db);
     this.initSchema();
     this.prepareStatements();
   }
@@ -612,10 +589,6 @@ export abstract class SQLiteBase {
   close(): void {
     _liveDBs.delete(this.#db);
     closeDB(this.#db);
-    // v1.0.128 — Issue #560: drop the .lock file AFTER closeDB so the
-    // WAL checkpoint inside closeDB completes while we still own the
-    // writer slot. releaseDbLock is no-op for tmpdir paths (skip-gate).
-    releaseDbLock({ dbPath: this.#dbPath });
   }
 
   protected withRetry<T>(fn: () => T): T {
@@ -630,9 +603,5 @@ export abstract class SQLiteBase {
     _liveDBs.delete(this.#db);
     closeDB(this.#db);
     deleteDBFiles(this.#dbPath);
-    // v1.0.128 — Issue #560: also drop the lockfile during cleanup. Per-
-    // process tmp DBs (defaultDBPath()) skip-gate inside the helper, so
-    // this is only a side-effect for shared on-disk content stores.
-    releaseDbLock({ dbPath: this.#dbPath });
   }
 }
