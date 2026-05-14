@@ -96,6 +96,30 @@ describe("db-base platform gate (#551)", () => {
 // See: docs/adr/0001-sessiondb-multi-writer.md
 // ─────────────────────────────────────────────────────────
 describe("v1.0.130 INVARIANT — SQLiteBase multi-writer default", () => {
+  // Source-pin invariant. The behavioural test above proves the contract
+  // holds today. This source-level invariant catches the FUTURE regression
+  // shape: a contributor pulling acquireDbLock or locking_mode=EXCLUSIVE
+  // back into the SQLiteBase ctor. Even if their behavioural tests pass
+  // (e.g. they claim to skip-gate via tmpdir), the rollback contract says
+  // these primitives MUST NOT exist in the SQLiteBase ctor at all.
+  it("INVARIANT: SQLiteBase ctor must NOT contain acquireDbLock or locking_mode=EXCLUSIVE", () => {
+    const dbBasePath = resolve(__dirname, "..", "..", "src", "db-base.ts");
+    const src = readFileSync(dbBasePath, "utf8");
+    const classIdx = src.indexOf("export abstract class SQLiteBase");
+    expect(classIdx).toBeGreaterThan(-1);
+    // Bound the class body at the next top-level export so we don't
+    // accidentally match unrelated code below the class.
+    const classBody = src.slice(classIdx).split(/\nexport (?:function|abstract|class|const|let|var) /)[0] ?? "";
+
+    // Lockfile primitive — banned. Anchor on identifier names so a
+    // future renamed variant (`acquireDBLock`, `acquireDbLockSync`, etc.)
+    // still trips the check.
+    expect(classBody).not.toMatch(/acquireDbLock/i);
+    expect(classBody).not.toMatch(/releaseDbLock/i);
+    // EXCLUSIVE locking_mode — banned. Whitespace-tolerant.
+    expect(classBody).not.toMatch(/locking_mode\s*=\s*EXCLUSIVE/i);
+  });
+
   it("INVARIANT: two SQLiteBase instances on the same tmpdir path can both open and write (multi-writer default)", async () => {
     // Use a real on-disk path OUTSIDE tmpdir. The v1.0.128 + v1.0.129
     // skip-gate excused tmpdir paths from the lockfile + EXCLUSIVE

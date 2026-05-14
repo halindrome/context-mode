@@ -527,16 +527,15 @@ export abstract class SQLiteBase {
    * write contention is absorbed by `withRetry()` below (busy_timeout
    * = 30000ms inside `new Database(...)`).
    *
-   * v1.0.128 introduced a `acquireDbLock` lockfile + `locking_mode =
-   * EXCLUSIVE` pragma here as a defense against #560. That defense was
-   * an over-correction — the actual root causes of #560 were #559
-   * (zombie MCP child accumulation) and #561 (Pi misdetection writing
-   * to the wrong DB path), both fixed in v1.0.128 + v1.0.129. The
-   * lockfile broke legitimate multi-window users with the
-   * "Another context-mode server is already running" error. v1.0.130
-   * rolls it out. See docs/adr/0001-sessiondb-multi-writer.md and
-   * tests/util/db-base-platform-gate.test.ts (the v1.0.130 INVARIANT
-   * block) for the regression-proof anchor.
+   * v1.0.128 introduced a single-writer guard here as a defense against
+   * #560. That defense was an over-correction — the actual root causes
+   * of #560 were #559 (zombie MCP child accumulation) and #561 (Pi
+   * misdetection writing to the wrong DB path), both fixed in v1.0.128
+   * + v1.0.129. The single-writer guard broke legitimate multi-window
+   * users; v1.0.130 rolls it out. See
+   * docs/adr/0001-sessiondb-multi-writer.md and the v1.0.130 INVARIANT
+   * block in tests/util/db-base-platform-gate.test.ts for the
+   * regression-proof anchor (source-pin + behavioural).
    */
   constructor(dbPath: string) {
     const Database = loadDatabase();
