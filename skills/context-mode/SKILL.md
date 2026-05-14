@@ -1,20 +1,6 @@
 ---
 name: context-mode
-description: |
-  Use context-mode tools (ctx_execute, ctx_execute_file) instead of Bash/cat when processing
-  large outputs. Triggers: "analyze logs", "summarize output", "process data",
-  "parse JSON", "filter results", "extract errors", "check build output",
-  "analyze dependencies", "process API response", "large file analysis",
-  "page snapshot", "browser snapshot", "DOM structure", "inspect page",
-  "accessibility tree", "Playwright snapshot",
-  "run tests", "test output", "coverage report", "git log", "recent commits",
-  "diff between branches", "list containers", "pod status", "disk usage",
-  "fetch docs", "API reference", "index documentation",
-  "call API", "check response", "query results",
-  "find TODOs", "count lines", "codebase statistics", "security audit",
-  "outdated packages", "dependency tree", "cloud resources", "CI/CD output".
-  Also triggers on ANY MCP tool output that may exceed 20 lines.
-  Subagent routing is handled automatically via PreToolUse hook.
+description: "Use context-mode tools (ctx_execute, ctx_execute_file) instead of Bash/cat when processing large outputs. Triggers: analyze logs, summarize output, process data, parse JSON, filter results, extract errors, check build output, analyze dependencies, process API response, large file analysis, page snapshot, browser snapshot, DOM structure, inspect page, accessibility tree, Playwright snapshot, run tests, test output, coverage report, git log, recent commits, diff between branches, list containers, pod status, disk usage, fetch docs, API reference, index documentation, call API, check response, query results, find TODOs, count lines, codebase statistics, security audit, outdated packages, dependency tree, cloud resources, CI/CD output. Also triggers on ANY MCP tool output that may exceed 20 lines. Subagent routing is handled automatically via PreToolUse hook."
 ---
 
 # Context Mode: Default for All Large Output
@@ -283,6 +269,7 @@ Subagents automatically receive context-mode tool routing via a PreToolUse hook.
 - Using `cat large-file.json` via Bash → entire file in context. Use `ctx_execute_file` instead.
 - Using `gh pr list` via Bash → raw JSON in context. Use `ctx_execute` with `--jq` filter instead.
 - Piping Bash output through `| head -20` → you lose the rest. Use `ctx_execute` to analyze ALL data and print summary.
+- Using `head`/`tail` **inside** `ctx_execute` shell code (e.g., `grep ERROR log.txt | head -50`) → output is sandboxed, not context. Truncating inside the sandbox discards data *before* FTS5 indexing — the rest is permanently gone. Write programmatic analysis instead: filter, count, extract, then `console.log()` only the findings.
 - Running `npm test` via Bash → full test output in context. Use `ctx_execute` to capture and summarize.
 - Calling `browser_snapshot()` WITHOUT `filename` parameter → 135K tokens flood context. **Always** use `browser_snapshot(filename: "/tmp/snap.md")`.
 - Calling `browser_console_messages()` or `browser_network_requests()` WITHOUT `filename` → entire output floods context. **Always** use the `filename` parameter.

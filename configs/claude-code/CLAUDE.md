@@ -6,6 +6,8 @@ context-mode MCP tools available. Rules protect context window from flooding. On
 
 Analyze/count/filter/compare/search/parse/transform data: **write code** via `ctx_execute(language, code)`, `console.log()` only the answer. Do NOT read raw data into context. PROGRAM the analysis, not COMPUTE it. Pure JavaScript — Node.js built-ins only (`fs`, `path`, `child_process`). `try/catch`, handle `null`/`undefined`. One script replaces ten tool calls.
 
+**Inside `ctx_execute`, never use `head`/`tail` to limit output.** The sandbox has no size penalty — all stdout is indexed for FTS5 search. Truncating inside the sandbox discards data before indexing. Write programmatic analysis: filter, count, extract; print only findings.
+
 ## BLOCKED — do NOT attempt
 
 ### curl / wget — BLOCKED

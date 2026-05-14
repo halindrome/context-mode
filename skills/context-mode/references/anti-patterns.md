@@ -244,6 +244,40 @@ GOOD — specific and actionable:
 
 ---
 
+## 8. Using head/tail Inside ctx_execute to Limit Output
+
+**Problem:** Using `head` or `tail` inside a `ctx_execute` shell script to cap output volume. This looks safe because you're already inside the sandbox, but it silently discards data *before* it reaches the FTS5 index — so the truncated portion is permanently lost and unsearchable.
+
+```shell
+# BAD — truncates before indexing; errors at line 51+ are gone:
+grep ERROR app.log | head -50
+
+# BAD — only sees the last 20 lines; misses earlier failures:
+npm test 2>&1 | tail -20
+```
+
+The mental model trap: inside `ctx_execute` the sandbox is NOT the context window. All stdout is captured for indexing. There is no output-size penalty for letting the command run fully — only for printing it back to context. So truncation gives you the worst of both worlds: you don't save context space (the index is internal), and you lose data.
+
+```shell
+# GOOD — capture everything, extract only what matters:
+grep -c ERROR app.log                         # count first
+grep ERROR app.log | sort | uniq -c | sort -rn  # then summarize
+```
+
+```javascript
+// GOOD — read the full file in JS, print only the findings:
+const lines = require('fs').readFileSync('app.log', 'utf8').split('\n');
+const errors = lines.filter(l => l.includes('ERROR'));
+console.log(`Total errors: ${errors.length}`);
+const byType = {};
+errors.forEach(l => { const m = l.match(/ERROR \w+/); if (m) byType[m[0]] = (byType[m[0]] || 0) + 1; });
+console.log(JSON.stringify(byType, null, 2));
+```
+
+**Rule:** Never use `head` or `tail` inside a `ctx_execute` script to manage volume. The sandbox has no output limit. Write programmatic analysis — filter, count, aggregate — then `console.log()` only the findings. If you want the last N entries for a specific reason (e.g., "the 5 most recent errors"), express that as a deliberate data selection, not a truncation safety net.
+
+---
+
 ## Summary Checklist
 
 Before using `execute`, verify:
