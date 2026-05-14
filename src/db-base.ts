@@ -536,6 +536,13 @@ export abstract class SQLiteBase {
     // tmpdir-prefix check inside the helper — defaultDBPath() output
     // (per-process tmp DBs) does not contend, so it never claims a lock.
     acquireDbLock({ dbPath });
+    // v1.0.129 — single source of truth for skip decision. Both lockfile
+    // (above) and EXCLUSIVE pragma (below) MUST share the same skip-gate:
+    // tests open SessionDB twice on the same tmpdir path to exercise
+    // multi-writer scenarios; if EXCLUSIVE fires here when lockfile didn't,
+    // the second open hits SQLITE_BUSY on its FIRST pragma call inside
+    // applyWALPragmas — caused 82 test failures during v1.0.128 verification.
+    const skipExclusive = dbPath.startsWith(tmpdir());
     cleanOrphanedWALFiles(dbPath);
     let db: DatabaseInstance;
     try {
@@ -551,7 +558,10 @@ export abstract class SQLiteBase {
       // lockfile floor. NOTE: NOT applied in `applyWALPragmas` because multi-writer
       // callers (ContentStore — FTS5 shared knowledge base across sessions) rely
       // on the default SHARED locking mode + withRetry to handle SQLITE_BUSY.
-      try { db.pragma("locking_mode = EXCLUSIVE"); } catch { /* unsupported runtime */ }
+      // Skip on tmpdir paths to match acquireDbLock's skip-gate.
+      if (!skipExclusive) {
+        try { db.pragma("locking_mode = EXCLUSIVE"); } catch { /* unsupported runtime */ }
+      }
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       if (isSQLiteCorruptionError(msg)) {
@@ -560,7 +570,9 @@ export abstract class SQLiteBase {
         try {
           db = new Database(dbPath, { timeout: 30000 });
           applyWALPragmas(db);
-          try { db.pragma("locking_mode = EXCLUSIVE"); } catch { /* unsupported runtime */ }
+          if (!skipExclusive) {
+            try { db.pragma("locking_mode = EXCLUSIVE"); } catch { /* unsupported runtime */ }
+          }
         } catch (retryErr) {
           // Free the lock before bubbling — caller can never reach
           // close()/cleanup() if the ctor throws.
