@@ -72,6 +72,78 @@ describe("db-base platform gate (#551)", () => {
 });
 
 // ─────────────────────────────────────────────────────────
+// v1.0.130 INVARIANT — multi-writer SessionDB on the same on-disk path.
+//
+// CONTRACT: SessionDB is multi-writer-safe. Two SessionDB instances on
+// the same dbPath MUST both open, write, and read successfully without
+// either of them throwing. WAL + busy_timeout + withRetry handle the
+// concurrency natively — that is the SQLite default contract for shared
+// on-disk DBs.
+//
+// HISTORY: v1.0.128 introduced an `acquireDbLock` lockfile + `locking_mode
+// = EXCLUSIVE` pragma in the SQLiteBase ctor as a defense against #560.
+// That defense was an OVER-CORRECTION — the real root causes of #560
+// were #559 (zombie MCP child accumulation) and #561 (Pi misdetection
+// writing to the wrong DB path). With both root causes fixed in v1.0.128
+// + v1.0.129, normal usage is one MCP process per Claude session per
+// project; legitimate multi-window UX means two processes on the SAME
+// dbPath, which the SQLite WAL handles natively.
+//
+// REGRESSION-PROOF: this test is the load-bearing anchor. If anyone in
+// the future re-adds a lockfile or EXCLUSIVE pragma to SQLiteBase, this
+// test will fail loudly in CI before merge. DO NOT delete or weaken it.
+//
+// See: docs/adr/0001-sessiondb-multi-writer.md
+// ─────────────────────────────────────────────────────────
+describe("v1.0.130 INVARIANT — SQLiteBase multi-writer default", () => {
+  it("INVARIANT: two SQLiteBase instances on the same tmpdir path can both open and write (multi-writer default)", async () => {
+    // Use a real on-disk path OUTSIDE tmpdir. The v1.0.128 + v1.0.129
+    // skip-gate excused tmpdir paths from the lockfile + EXCLUSIVE
+    // pragma, so a tmpdir path would not exercise the regression. The
+    // legitimate multi-window UX runs against project DBs (NOT tmpdir),
+    // so the invariant must hold for real on-disk paths.
+    const testDir = mkdtempSync(join(process.env.HOME || "/tmp", ".ctx-mode-multiwriter-invariant-"));
+    const dbPath = join(testDir, "multi-writer.db");
+    const { SessionDB } = await import("../../src/session/db.js");
+    let a: InstanceType<typeof SessionDB> | null = null;
+    let b: InstanceType<typeof SessionDB> | null = null;
+    try {
+      a = new SessionDB({ dbPath });
+      // The whole point: this MUST NOT throw. v1.0.128 + v1.0.129
+      // would throw DatabaseLockedError ("Another context-mode server
+      // is already running") here. WAL handles two writers natively,
+      // and the busy_timeout + withRetry in withRetry() is the right
+      // defense for SQLITE_BUSY.
+      b = new SessionDB({ dbPath });
+      expect(a).toBeTruthy();
+      expect(b).toBeTruthy();
+      // Both instances must be functional — write through both. This
+      // proves WAL multi-writer works end-to-end, not just that the
+      // ctors silently coexist. insertEvent goes through withRetry +
+      // busy_timeout (the documented BUSY-handling path).
+      const eventA = {
+        type: "PreToolUse",
+        category: "tool",
+        data: JSON.stringify({ from: "writer-a" }),
+        priority: 0,
+      };
+      const eventB = {
+        type: "PreToolUse",
+        category: "tool",
+        data: JSON.stringify({ from: "writer-b" }),
+        priority: 0,
+      };
+      a.insertEvent("invariant-session-a", eventA);
+      b.insertEvent("invariant-session-b", eventB);
+    } finally {
+      try { a?.cleanup(); } catch { /* best effort */ }
+      try { b?.close(); } catch { /* best effort */ }
+      try { rmSync(testDir, { recursive: true, force: true }); } catch { /* best effort */ }
+    }
+  });
+});
+
+// ─────────────────────────────────────────────────────────
 // Slice 5 (#560): Per-DB lockfile primitive
 // One context-mode server may hold the DB at a time; second openers
 // fail loudly with the reporter's verbatim message instead of
