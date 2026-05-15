@@ -182,9 +182,9 @@ describe("MCPStdioClient — respawns after idle self-shutdown (#583)", () => {
     writeFileSync(
       fakePath,
       `
-      const fs = require("node:fs");
+      import { existsSync, writeFileSync } from "node:fs";
       const MARKER = ${JSON.stringify(markerPath)};
-      const isFirst = !fs.existsSync(MARKER);
+      const isFirst = !existsSync(MARKER);
       let line = "";
       let callCount = 0;
       process.stdin.on("data", (chunk) => {
@@ -205,7 +205,7 @@ describe("MCPStdioClient — respawns after idle self-shutdown (#583)", () => {
             process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: msg.id, result: { content: [{ type: "text", text: "pong-pid-" + process.pid }] } }) + "\\n");
             // First incarnation: mimic idle self-shutdown after one call.
             if (isFirst && callCount === 1) {
-              fs.writeFileSync(MARKER, "1");
+              writeFileSync(MARKER, "1");
               setTimeout(() => process.exit(0), 10);
             }
           }
