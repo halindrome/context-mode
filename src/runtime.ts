@@ -13,12 +13,16 @@ import { existsSync } from "node:fs";
  * Match is case-insensitive; `.exe` extension tolerated for Windows binaries.
  */
 const ALLOWED_SHELL_BASENAMES = /^(bash|sh|zsh|dash|pwsh|powershell|cmd)(\.exe)?$/i;
+const BUN_BASENAME = /^bun(\.exe)?$/i;
+
+function runtimeBasename(runtimePath: string): string {
+  const segments = runtimePath.split(/[\\/]/);
+  return segments[segments.length - 1] ?? runtimePath;
+}
 
 export function isAllowlistedShell(shellPath: string): boolean {
   // Cross-OS basename: split on either separator, take the last segment.
-  const segments = shellPath.split(/[\\/]/);
-  const base = segments[segments.length - 1];
-  return ALLOWED_SHELL_BASENAMES.test(base);
+  return ALLOWED_SHELL_BASENAMES.test(runtimeBasename(shellPath));
 }
 
 export type Language =
@@ -32,7 +36,8 @@ export type Language =
   | "php"
   | "perl"
   | "r"
-  | "elixir";
+  | "elixir"
+  | "csharp";
 
 export interface RuntimeInfo {
   command: string;
@@ -53,6 +58,7 @@ export interface RuntimeMap {
   perl: string | null;
   r: string | null;
   elixir: string | null;
+  csharp: string | null;
 }
 
 const isWindows = process.platform === "win32";
@@ -264,6 +270,7 @@ export function detectRuntimes(): RuntimeMap {
         ? "r"
         : null,
     elixir: commandExists("elixir") ? "elixir" : null,
+    csharp: commandExists("dotnet-script") ? "dotnet-script" : null,
   };
 }
 
@@ -326,6 +333,10 @@ export function getRuntimeSummary(runtimes: RuntimeMap): string {
     lines.push(
       `  Elixir:     ${runtimes.elixir} (${getVersion(runtimes.elixir)})`,
     );
+  if (runtimes.csharp)
+    lines.push(
+      `  C#:         ${runtimes.csharp} (${getVersion(runtimes.csharp)})`,
+    );
 
   if (!bunPreferred) {
     lines.push("");
@@ -348,6 +359,7 @@ export function getAvailableLanguages(runtimes: RuntimeMap): Language[] {
   if (runtimes.perl) langs.push("perl");
   if (runtimes.r) langs.push("r");
   if (runtimes.elixir) langs.push("elixir");
+  if (runtimes.csharp) langs.push("csharp");
   return langs;
 }
 
@@ -358,7 +370,7 @@ export function buildCommand(
 ): string[] {
   switch (language) {
     case "javascript":
-      return runtimes.javascript.endsWith("bun")
+      return BUN_BASENAME.test(runtimeBasename(runtimes.javascript))
         ? [runtimes.javascript, "run", filePath]
         : [runtimes.javascript, filePath];
 
@@ -368,7 +380,7 @@ export function buildCommand(
           "No TypeScript runtime available. Install one of: bun (recommended), tsx (npm i -g tsx), or ts-node.",
         );
       }
-      if (runtimes.typescript?.endsWith("bun")) return [runtimes.typescript, "run", filePath];
+      if (BUN_BASENAME.test(runtimeBasename(runtimes.typescript))) return [runtimes.typescript, "run", filePath];
       if (runtimes.typescript === "tsx") return ["tsx", filePath];
       return ["ts-node", filePath];
 
@@ -448,5 +460,13 @@ export function buildCommand(
         throw new Error( "Elixir not available. Install elixir.");
       }
       return ["elixir", filePath];
+
+    case "csharp":
+      if (!runtimes.csharp) {
+        throw new Error(
+          "C# not available. Install dotnet-script via `dotnet tool install -g dotnet-script`.",
+        );
+      }
+      return [runtimes.csharp, filePath];
   }
 }

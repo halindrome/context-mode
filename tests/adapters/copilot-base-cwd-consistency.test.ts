@@ -22,6 +22,7 @@
 
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { resolve } from "node:path";
+import { homedir, tmpdir } from "node:os";
 import { VSCodeCopilotAdapter } from "../../src/adapters/vscode-copilot/index.js";
 
 describe("copilot-base — getSettingsPath() CWD consistency (issue #539)", () => {
@@ -38,16 +39,21 @@ describe("copilot-base — getSettingsPath() CWD consistency (issue #539)", () =
   });
 
   it("returns the SAME path regardless of process.cwd() when projectDir is passed", () => {
-    const projectDir = "/Users/me/some-repo";
+    const projectDir = resolve(homedir(), "some-repo");
 
-    process.chdir("/");
-    const fromRoot = adapter.getSettingsPath(projectDir);
+    // Use cross-platform dirs that exist on every CI runner. Earlier the
+    // test chdir'd to "/tmp" which is POSIX-only — Windows runners hit
+    // ENOENT (CI run 25740169321). homedir() + tmpdir() are guaranteed-
+    // present, drive-aware, and distinct on every platform — which is all
+    // we need to exercise the CWD-invariance contract.
+    process.chdir(homedir());
+    const fromHome = adapter.getSettingsPath(projectDir);
 
-    process.chdir("/tmp");
+    process.chdir(tmpdir());
     const fromTmp = adapter.getSettingsPath(projectDir);
 
-    expect(fromRoot).toBe(fromTmp);
-    expect(fromRoot).toBe(resolve(projectDir, ".github", "hooks", "context-mode.json"));
+    expect(fromHome).toBe(fromTmp);
+    expect(fromHome).toBe(resolve(projectDir, ".github", "hooks", "context-mode.json"));
   });
 
   it("falls back to process.cwd() when no projectDir is passed (backwards compatible)", () => {

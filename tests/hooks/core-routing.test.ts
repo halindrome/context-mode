@@ -24,6 +24,8 @@ let routePreToolUse: (
   toolName: string,
   toolInput: Record<string, unknown>,
   projectDir?: string,
+  platform?: string,
+  sessionId?: string,
 ) => {
   action: string;
   reason?: string;
@@ -86,8 +88,24 @@ describe("routePreToolUse", () => {
       expect(result).not.toBeNull();
       expect(result!.action).toBe("modify");
       expect(result!.updatedInput).toBeDefined();
+      const cmd = (result!.updatedInput as Record<string, string>).command;
+      expect(cmd).toContain("curl/wget redirected");
+      expect(cmd).not.toContain("curl/wget blocked");
+      expect(cmd).toMatch(/retry/i);
+    });
+
+    it("denies Codex exec_command cmd payloads like Bash command payloads", () => {
+      const result = routePreToolUse(
+        "exec_command",
+        { cmd: "curl https://example.com" },
+        undefined,
+        "codex",
+        "codex-cmd-curl",
+      );
+      expect(result).not.toBeNull();
+      expect(result!.action).toBe("modify");
       expect((result!.updatedInput as Record<string, string>).command).toContain(
-        "curl/wget blocked",
+        "curl/wget redirected",
       );
     });
 
@@ -98,7 +116,7 @@ describe("routePreToolUse", () => {
       expect(result).not.toBeNull();
       expect(result!.action).toBe("modify");
       expect((result!.updatedInput as Record<string, string>).command).toContain(
-        "curl/wget blocked",
+        "curl/wget redirected",
       );
     });
 
@@ -177,9 +195,10 @@ describe("routePreToolUse", () => {
       });
       expect(result).not.toBeNull();
       expect(result!.action).toBe("modify");
-      expect((result!.updatedInput as Record<string, string>).command).toContain(
-        "Inline HTTP blocked",
-      );
+      const cmd = (result!.updatedInput as Record<string, string>).command;
+      expect(cmd).toContain("Inline HTTP redirected");
+      expect(cmd).not.toContain("Inline HTTP blocked");
+      expect(cmd).toMatch(/retry/i);
     });
 
     it("denies requests.get() with modify action", () => {
@@ -189,7 +208,7 @@ describe("routePreToolUse", () => {
       expect(result).not.toBeNull();
       expect(result!.action).toBe("modify");
       expect((result!.updatedInput as Record<string, string>).command).toContain(
-        "Inline HTTP blocked",
+        "Inline HTTP redirected",
       );
     });
 
@@ -329,8 +348,13 @@ describe("routePreToolUse", () => {
       });
       expect(result).not.toBeNull();
       expect(result!.action).toBe("deny");
-      expect(result!.reason).toContain("WebFetch blocked");
+      // PR #654 substitute: imperative-positive framing, no "blocked" wording,
+      // explicit retry hint to keep Haiku-tier agents from capitulating to
+      // training data on transient DNS errors (audit Probe 3).
+      expect(result!.reason).toContain("WebFetch redirected");
+      expect(result!.reason).not.toContain("WebFetch blocked");
       expect(result!.reason).toContain("fetch_and_index");
+      expect(result!.reason).toMatch(/retry/i);
     });
 
     it("includes the URL in deny reason", () => {
@@ -345,7 +369,7 @@ describe("routePreToolUse", () => {
       const result = routePreToolUse("mcp_web_fetch", { url });
       expect(result).not.toBeNull();
       expect(result!.action).toBe("deny");
-      expect(result!.reason).toContain("WebFetch blocked");
+      expect(result!.reason).toContain("WebFetch redirected");
       expect(result!.reason).toContain("fetch_and_index");
       expect(result!.reason).toContain("ctx_search");
     });
@@ -355,7 +379,7 @@ describe("routePreToolUse", () => {
       const result = routePreToolUse("mcp_fetch_tool", { url });
       expect(result).not.toBeNull();
       expect(result!.action).toBe("deny");
-      expect(result!.reason).toContain("WebFetch blocked");
+      expect(result!.reason).toContain("WebFetch redirected");
       expect(result!.reason).toContain("fetch_and_index");
       expect(result!.reason).toContain("ctx_search");
     });
@@ -527,29 +551,96 @@ describe("routePreToolUse", () => {
     });
   });
 
+  describe("Codex exec_command security policy", () => {
+    let projectDir: string;
+    let homeDir: string;
+    let codexDir: string;
+    let previousHome: string | undefined;
+    let previousCodexHome: string | undefined;
+    let previousPlatform: string | undefined;
+
+    beforeAll(async () => {
+      await initSecurity(resolve(process.cwd(), "build"));
+    });
+
+    beforeEach(() => {
+      projectDir = mkdtempSync(join(tmpdir(), "ctx-codex-exec-project-"));
+      homeDir = mkdtempSync(join(tmpdir(), "ctx-codex-home-"));
+      codexDir = join(homeDir, ".codex");
+      mkdirSync(codexDir, { recursive: true });
+      writeFileSync(
+        join(codexDir, "settings.json"),
+        JSON.stringify({ permissions: { deny: ["Bash(echo blocked)"] } }),
+        "utf-8",
+      );
+      previousHome = process.env.HOME;
+      previousCodexHome = process.env.CODEX_HOME;
+      previousPlatform = process.env.CONTEXT_MODE_PLATFORM;
+      process.env.HOME = homeDir;
+      process.env.CODEX_HOME = codexDir;
+      process.env.CONTEXT_MODE_PLATFORM = "codex";
+    });
+
+    afterEach(() => {
+      if (previousHome === undefined) delete process.env.HOME;
+      else process.env.HOME = previousHome;
+      if (previousCodexHome === undefined) delete process.env.CODEX_HOME;
+      else process.env.CODEX_HOME = previousCodexHome;
+      if (previousPlatform === undefined) delete process.env.CONTEXT_MODE_PLATFORM;
+      else process.env.CONTEXT_MODE_PLATFORM = previousPlatform;
+      try { rmSync(projectDir, { recursive: true, force: true }); } catch {}
+      try { rmSync(homeDir, { recursive: true, force: true }); } catch {}
+    });
+
+    it("denies Codex exec_command cmd payloads from .codex settings", () => {
+      const result = routePreToolUse(
+        "exec_command",
+        { cmd: "echo blocked" },
+        projectDir,
+        "codex",
+        "codex-cmd-policy",
+      );
+      expect(result?.action).toBe("deny");
+      expect(result?.reason).toContain("deny pattern");
+    });
+  });
+
   // ─── Routing block content ──────────────────────────────
 
   describe("routing block content", () => {
-    it("contains file_writing_policy forbidding ctx_execute for file writes", () => {
+    // Wording rewritten per ADR-0002 (PR #683 follow-up): the original tests
+    // asserted negative framings (`NEVER use`, `NO …`, `NEVER inline`) that
+    // failed the cross-LLM safety-bias rubric (#9) and the prompt-surface
+    // forbidden-token contract in tests/core/server.test.ts. The new
+    // assertions cover the same semantic intent expressed positively:
+    //   - file writes go through the native Write/Edit tool
+    //   - ctx_execute / ctx_execute_file / Bash subprocesses do not persist edits
+    //   - artifacts get written to files (path + 1-line description returned)
+    it("file_writing_policy points file writes at native Write/Edit tools", () => {
       expect(ROUTING_BLOCK).toContain("<file_writing_policy>");
-      expect(ROUTING_BLOCK).toContain("NEVER use");
+      expect(ROUTING_BLOCK).toContain("File writes use the native Write or Edit tool");
+      // semantic intent: ctx_execute family must not be used for file writes —
+      // expressed positively as "do not persist edits to the host filesystem"
       expect(ROUTING_BLOCK).toContain("ctx_execute");
-      expect(ROUTING_BLOCK).toContain("native Write/Edit tools");
+      expect(ROUTING_BLOCK).toContain("do not persist edits");
     });
 
-    it("forbidden_actions blocks ctx_execute for file creation", () => {
-      expect(ROUTING_BLOCK).toContain(
-        "NO",
-      );
-      expect(ROUTING_BLOCK).toContain(
-        "for file creation/modification",
-      );
+    it("when_not_to_use redirects ctx_execute away from file creation", () => {
+      // Replaces the old `<forbidden_actions>` container; same semantic intent
+      // (do not pick ctx_execute for file creation) expressed via WHEN NOT.
+      expect(ROUTING_BLOCK).toContain("<when_not_to_use>");
+      expect(ROUTING_BLOCK).toContain("for file writes");
+      expect(ROUTING_BLOCK).toContain("analysis, processing, and computation only");
     });
 
-    it("artifact_policy specifies native Write tool", () => {
+    it("artifact_policy points artifacts at files with file-path return shape", () => {
+      // Replaces the old "Write artifacts ... NEVER inline" wording.
+      // The semantic intent — write artifacts to files, return only the path
+      // plus a 1-line description — is asserted via the positive surface.
       expect(ROUTING_BLOCK).toContain(
-        "Write artifacts (code, configs, PRDs) to FILES. NEVER inline.",
+        "Write artifacts (code, configs, PRDs) to files",
       );
+      expect(ROUTING_BLOCK).toContain("file path + 1-line description");
     });
   });
 
@@ -636,14 +727,68 @@ describe("routePreToolUse", () => {
       }
     });
 
-    it("respects the once-per-session guidance throttle", () => {
-      const first = routePreToolUse("mcp__slack__post_message", {});
-      expect(first).not.toBeNull();
-      expect(first!.action).toBe("context");
+    // #567 follow-up — the external-MCP nudge is intentionally periodic, not
+    // one-shot. A single nudge gets lost in MCP-heavy sessions (50+ Jira
+    // calls) once context compaction kicks in, so we re-fire every N calls to
+    // keep the guidance in the model's recent window.
+    it("re-fires guidance every N calls (default cadence = 10)", () => {
+      const calls = Array.from({ length: 22 }, (_, i) =>
+        routePreToolUse(`mcp__slack__tool_${i}`, {}),
+      );
 
-      // Second call in the same session — guidanceOnce should suppress it.
+      // Fires on the 1st, 11th, 21st calls — null in between.
+      const fired = calls.map((c) => c?.action === "context");
+      const expected = calls.map((_, i) => i % 10 === 0);
+      expect(fired).toEqual(expected);
+    });
+
+    it("honors CONTEXT_MODE_EXTERNAL_MCP_NUDGE_EVERY to tune cadence", () => {
+      const prev = process.env.CONTEXT_MODE_EXTERNAL_MCP_NUDGE_EVERY;
+      try {
+        process.env.CONTEXT_MODE_EXTERNAL_MCP_NUDGE_EVERY = "3";
+        const calls = Array.from({ length: 7 }, (_, i) =>
+          routePreToolUse(`mcp__notion__tool_${i}`, {}),
+        );
+        const fired = calls.map((c) => c?.action === "context");
+        // period=3 → fires on calls 1, 4, 7 (indices 0, 3, 6).
+        expect(fired).toEqual([true, false, false, true, false, false, true]);
+      } finally {
+        if (prev === undefined) delete process.env.CONTEXT_MODE_EXTERNAL_MCP_NUDGE_EVERY;
+        else process.env.CONTEXT_MODE_EXTERNAL_MCP_NUDGE_EVERY = prev;
+      }
+    });
+
+    it("falls back to default cadence on invalid env values", () => {
+      const prev = process.env.CONTEXT_MODE_EXTERNAL_MCP_NUDGE_EVERY;
+      try {
+        // Out-of-range, NaN, negative — all coerce to the default (10).
+        for (const v of ["0", "-1", "9999", "not-a-number", ""]) {
+          process.env.CONTEXT_MODE_EXTERNAL_MCP_NUDGE_EVERY = v;
+          resetGuidanceThrottle();
+          const first = routePreToolUse("mcp__slack__a", {});
+          const second = routePreToolUse("mcp__slack__b", {});
+          expect(first?.action, `value=${JSON.stringify(v)}`).toBe("context");
+          // With default=10, the 2nd call must NOT fire.
+          expect(second, `value=${JSON.stringify(v)}`).toBeNull();
+        }
+      } finally {
+        if (prev === undefined) delete process.env.CONTEXT_MODE_EXTERNAL_MCP_NUDGE_EVERY;
+        else process.env.CONTEXT_MODE_EXTERNAL_MCP_NUDGE_EVERY = prev;
+      }
+    });
+
+    it("resetGuidanceThrottle resets the periodic counter", () => {
+      // Burn one call to advance the counter.
+      const first = routePreToolUse("mcp__slack__post_message", {});
+      expect(first?.action).toBe("context");
       const second = routePreToolUse("mcp__slack__list_users", {});
       expect(second).toBeNull();
+
+      // Reset clears both the in-memory throttle and the periodic counter so
+      // the next call re-fires from tick 1 (e.g. start of a fresh session).
+      resetGuidanceThrottle();
+      const afterReset = routePreToolUse("mcp__slack__list_users", {});
+      expect(afterReset?.action).toBe("context");
     });
 
     it("does NOT match plain Bash/Read/etc as external MCP", () => {
@@ -856,3 +1001,113 @@ describe("mcp-ready: PPID-independence (regression for #347)", () => {
     }
   });
 });
+
+// ─────────────────────────────────────────────────────────
+// Slice 4 — additionalContext surfacing on security init fail (#558)
+// ─────────────────────────────────────────────────────────
+//
+// The pre-558 silent-fail UX gap: when initSecurity() fails to load the
+// security module (marketplace install missing build/security.js AND
+// hooks/security.bundle.mjs), the only signal is a stderr WARNING line
+// that adapters typically suppress / discard. The user has no in-band
+// signal that permissions.deny is fail-open.
+//
+// Fix: routing.mjs exposes `buildSecurityWarningContext()` — a pure
+// helper that returns a structured agent-facing block when
+// isSecurityInitFailed() is true, and null otherwise. SessionStart
+// hooks call initSecurity() and append the block to their
+// additionalContext, so the agent sees the warning in-context (not
+// just in suppressed stderr).
+
+describe("buildSecurityWarningContext — agent-facing security warning (#558)", () => {
+  it("returns null when security init has not failed (default state)", async () => {
+    // Use a subprocess so the module-scoped securityInitFailed flag
+    // is in its initial false state — the in-process module from
+    // beforeAll() above may have been touched by other tests.
+    const r = await spawnRoutingProbe(`
+      import { buildSecurityWarningContext, isSecurityInitFailed } from ${routingUrl()};
+      process.stdout.write(JSON.stringify({
+        failed: isSecurityInitFailed(),
+        warning: buildSecurityWarningContext(),
+      }));
+    `);
+    expect(r.parsed.failed).toBe(false);
+    expect(r.parsed.warning).toBeNull();
+  });
+
+  it("returns a structured warning string when security init has failed", async () => {
+    const missingBundle = join(tmpdir(), `ctx-slice4-no-bundle-${Date.now()}.bundle.mjs`);
+    const missingBuild = join(tmpdir(), `ctx-slice4-no-build-${Date.now()}`);
+    const r = await spawnRoutingProbe(
+      `
+      import { initSecurity, buildSecurityWarningContext, isSecurityInitFailed } from ${routingUrl()};
+      await initSecurity(${JSON.stringify(missingBuild)});
+      process.stdout.write(JSON.stringify({
+        failed: isSecurityInitFailed(),
+        warning: buildSecurityWarningContext(),
+      }));
+      `,
+      {
+        CONTEXT_MODE_SUPPRESS_SECURITY_WARNING: "1",
+        CONTEXT_MODE_SECURITY_BUNDLE_PATH: missingBundle,
+      },
+    );
+    expect(r.parsed.failed).toBe(true);
+    expect(r.parsed.warning).toBeTruthy();
+    expect(typeof r.parsed.warning).toBe("string");
+    // Must mention the security gap and the remediation, AND must use
+    // a recognizable XML-ish wrapper so the agent can parse / scope it.
+    expect(r.parsed.warning).toMatch(/security/i);
+    expect(r.parsed.warning).toMatch(/permissions\.deny|deny pattern/i);
+    expect(r.parsed.warning).toMatch(/<context_mode_security_warning>|security_warning/);
+    // Must point users at the actionable fix.
+    expect(r.parsed.warning).toMatch(/npm run bundle|security\.bundle\.mjs|reinstall/i);
+  });
+
+  it("hooks/sessionstart.mjs wires initSecurity + buildSecurityWarningContext into the SessionStart additionalContext", () => {
+    // Static-source check — the wiring must be present in the
+    // top-level Claude Code SessionStart hook so users see the
+    // warning in-band on first session of a broken install.
+    const src = readFileSync(resolve(SLICE4_DIRNAME, "..", "..", "hooks", "sessionstart.mjs"), "utf-8");
+    expect(src).toContain("initSecurity");
+    expect(src).toContain("buildSecurityWarningContext");
+    expect(src).toContain("isSecurityInitFailed");
+  });
+});
+
+/**
+ * Helper — spawn a fresh node subprocess and run a small ESM snippet
+ * against routing.mjs. Returns parsed stdout JSON. Each call is
+ * isolated (no shared module state) so the global securityInitFailed
+ * flag starts false in every test.
+ */
+const SLICE4_DIRNAME = (() => {
+  // ESM-safe __dirname for the slice 4 helpers (vitest's main file
+  // doesn't have one). Lazily evaluated to avoid touching top-level state.
+  const { fileURLToPath } = require("node:url");
+  const { dirname } = require("node:path");
+  return dirname(fileURLToPath(import.meta.url));
+})();
+
+function routingUrl(): string {
+  const path = resolve(SLICE4_DIRNAME, "..", "..", "hooks", "core", "routing.mjs");
+  // pathToFileURL handles Windows drive letters correctly.
+  const { pathToFileURL } = require("node:url");
+  return JSON.stringify(pathToFileURL(path).href);
+}
+
+async function spawnRoutingProbe(
+  code: string,
+  env: Record<string, string> = {},
+): Promise<{ status: number | null; stdout: string; parsed: any }> {
+  const { spawnSync } = await import("node:child_process");
+  const r = spawnSync("node", ["--input-type=module", "-e", code], {
+    encoding: "utf-8",
+    timeout: 15_000,
+    env: { ...process.env, ...env },
+  });
+  const stdout = (r.stdout ?? "").trim();
+  let parsed: any = null;
+  try { parsed = JSON.parse(stdout); } catch { /* surface raw */ }
+  return { status: r.status, stdout, parsed };
+}

@@ -4,7 +4,7 @@ import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { CodexAdapter } from "../../src/adapters/codex/index.js";
+import { CodexAdapter, probeCodexCliVersion } from "../../src/adapters/codex/index.js";
 import { resolveSessionDbPath, SessionDB } from "../../src/session/db.js";
 
 describe("CodexAdapter", () => {
@@ -284,6 +284,29 @@ describe("CodexAdapter", () => {
     });
   });
 
+  // ── Version diagnostics ───────────────────────────────
+
+  describe("version diagnostics", () => {
+    it("reports standalone MCP mode instead of a missing platform plugin", () => {
+      expect(adapter.getInstalledVersion()).toBe("standalone");
+    });
+
+    it("trims Codex CLI version probe output", () => {
+      expect(probeCodexCliVersion(() => "codex-cli 0.132.0\n")).toBe("codex-cli 0.132.0");
+    });
+
+    it("returns null when the Codex CLI version probe fails", () => {
+      expect(probeCodexCliVersion(() => {
+        throw new Error("ENOENT");
+      })).toBeNull();
+    });
+
+    it("surfaces Codex CLI binary availability in diagnostics", () => {
+      const checks = adapter.validateHooks("");
+      expect(checks.some((result) => result.check === "Codex CLI binary")).toBe(true);
+    });
+  });
+
   // ── generateHookConfig ────────────────────────────────
 
   describe("generateHookConfig", () => {
@@ -298,8 +321,12 @@ describe("CodexAdapter", () => {
       expect(config.PreToolUse[0]?.matcher).toContain("apply_patch");
       expect(config.PreToolUse[0]?.matcher).toContain("Edit");
       expect(config.PreToolUse[0]?.matcher).toContain("Write");
-      expect(config.PreToolUse[0]?.matcher).toContain("mcp__.*__ctx_execute");
-      expect(config.PreToolUse[0]?.matcher).toContain("mcp__.*__ctx_batch_execute");
+      // #547 hotfix: matcher is now charset-clean (no `.*` regex syntax) so
+      // the bare `ctx_*` names cover context-mode's own MCP tools and the
+      // literal `mcp__` segment exists for parity with hooks/hooks.json.
+      expect(config.PreToolUse[0]?.matcher).toContain("ctx_execute");
+      expect(config.PreToolUse[0]?.matcher).toContain("ctx_batch_execute");
+      expect(config.PreToolUse[0]?.matcher).toMatch(/(^|\|)mcp__$/);
       expect(config.PreToolUse[0]?.matcher).not.toMatch(/(^|\|)Read(\||$)/);
       expect(config.PreToolUse[0]?.matcher).not.toContain("mcp__plugin_context-mode_context-mode__");
       expect(config.PreCompact[0]?.hooks[0]?.command).toBe("context-mode hook codex precompact");
@@ -325,7 +352,10 @@ describe("CodexAdapter", () => {
       expect(changes.some((change) => change.includes("Added PreToolUse hook"))).toBe(true);
       expect(changes.some((change) => change.includes("Wrote native Codex hooks"))).toBe(true);
       expect(changes.some((change) => change.includes("Enabled Codex hooks feature flag"))).toBe(true);
-      expect(written.hooks.PreToolUse[0]?.matcher).toContain("mcp__.*__ctx_execute");
+      // #547 hotfix: matcher is charset-clean — bare `ctx_execute` covers
+      // context-mode's own MCP tools (hook body filters by tool prefix).
+      expect(written.hooks.PreToolUse[0]?.matcher).toContain("ctx_execute");
+      expect(written.hooks.PreToolUse[0]?.matcher).toMatch(/(^|\|)mcp__$/);
       expect(written.hooks.PreToolUse[0]?.matcher).not.toMatch(/(^|\|)Read(\||$)/);
       expect(written.hooks.PreToolUse[0]?.matcher).not.toContain("mcp__plugin_context-mode_context-mode__");
       expect(written.hooks.PreCompact[0]?.hooks[0]?.command).toBe("context-mode hook codex precompact");
@@ -430,6 +460,100 @@ describe("CodexAdapter", () => {
       expect(readFileSync(`${hooksPath}.bak`, "utf-8")).toContain('"hooks"');
       expect(readFileSync(`${settingsPath}.bak`, "utf-8")).toContain("hooks = false");
     });
+
+    // ─────────────────────────────────────────────────────
+    // Duplicate dedup regression suite (#603)
+    //
+    // Reported by jowch + skbsasikumar-rgb: after a context-mode upgrade,
+    // ~/.codex/hooks.json carries TWO context-mode entries for the same
+    // hook event (e.g., a legacy `node /path/.../hooks/codex/pretooluse.mjs`
+    // alongside the new `context-mode hook codex pretooluse`). Codex then
+    // fires both, doubling work and historically saturating the MCP
+    // transport / inflating codex-tui.log. `configureAllHooks` must collapse
+    // these to exactly one canonical entry per event.
+    // ─────────────────────────────────────────────────────
+
+    it("dedups twin canonical context-mode entries to a single entry (#603)", () => {
+      writeFileSync(hooksPath, JSON.stringify({
+        hooks: {
+          PreToolUse: [
+            { matcher: "old-matcher-A", hooks: [{ type: "command", command: "context-mode hook codex pretooluse" }] },
+            { matcher: "old-matcher-B", hooks: [{ type: "command", command: "context-mode hook codex pretooluse" }] },
+          ],
+          SessionStart: [
+            { hooks: [{ type: "command", command: "context-mode hook codex sessionstart" }] },
+            { hooks: [{ type: "command", command: "context-mode hook codex sessionstart" }] },
+          ],
+        },
+      }, null, 2));
+
+      const changes = adapter.configureAllHooks("/ignored/plugin/root");
+
+      const written = JSON.parse(readFileSync(hooksPath, "utf-8")) as {
+        hooks: Record<string, Array<{ hooks: Array<{ command: string }> }>>;
+      };
+
+      expect(written.hooks.PreToolUse).toHaveLength(1);
+      expect(written.hooks.PreToolUse[0]?.hooks[0]?.command).toBe("context-mode hook codex pretooluse");
+      expect(written.hooks.SessionStart).toHaveLength(1);
+      expect(written.hooks.SessionStart[0]?.hooks[0]?.command).toBe("context-mode hook codex sessionstart");
+      expect(changes.some((c) => c.includes("Removed duplicate"))).toBe(true);
+    });
+
+    it("dedups legacy-direct-node entry coexisting with canonical entry (#603)", () => {
+      // Mirrors the exact user-reported pattern: old direct-node hook left
+      // behind by an earlier installer + new canonical entry from a later
+      // upgrade run.
+      writeFileSync(hooksPath, JSON.stringify({
+        hooks: {
+          PreToolUse: [
+            { matcher: "", hooks: [{ type: "command", command: "node /Users/foo/.nvm/versions/node/v20/lib/node_modules/context-mode/hooks/codex/pretooluse.mjs" }] },
+            { matcher: "", hooks: [{ type: "command", command: "context-mode hook codex pretooluse" }] },
+          ],
+          PostToolUse: [
+            { hooks: [{ type: "command", command: "/opt/homebrew/bin/node /opt/homebrew/lib/node_modules/context-mode/hooks/posttooluse.mjs" }] },
+            { hooks: [{ type: "command", command: "context-mode hook codex posttooluse" }] },
+          ],
+        },
+      }, null, 2));
+
+      adapter.configureAllHooks("/ignored/plugin/root");
+
+      const written = JSON.parse(readFileSync(hooksPath, "utf-8")) as {
+        hooks: Record<string, Array<{ hooks: Array<{ command: string }> }>>;
+      };
+
+      expect(written.hooks.PreToolUse).toHaveLength(1);
+      expect(written.hooks.PreToolUse[0]?.hooks[0]?.command).toBe("context-mode hook codex pretooluse");
+      expect(written.hooks.PostToolUse).toHaveLength(1);
+      expect(written.hooks.PostToolUse[0]?.hooks[0]?.command).toBe("context-mode hook codex posttooluse");
+    });
+
+    it("dedups plugin-cache legacy entry left by /ctx-upgrade with canonical entry (#603)", () => {
+      // Plugin-cache install layout: ~/.claude/plugins/cache/context-mode/<v>/hooks/codex/<event>.mjs
+      writeFileSync(hooksPath, JSON.stringify({
+        hooks: {
+          UserPromptSubmit: [
+            { hooks: [{ type: "command", command: "node /Users/foo/.claude/plugins/cache/context-mode/context-mode/1.0.124/hooks/codex/userpromptsubmit.mjs" }] },
+            { hooks: [{ type: "command", command: "context-mode hook codex userpromptsubmit" }] },
+          ],
+          Stop: [
+            { hooks: [{ type: "command", command: "/usr/bin/node /Users/foo/.claude/plugins/marketplaces/context-mode/hooks/codex/stop.mjs" }] },
+          ],
+        },
+      }, null, 2));
+
+      adapter.configureAllHooks("/ignored/plugin/root");
+
+      const written = JSON.parse(readFileSync(hooksPath, "utf-8")) as {
+        hooks: Record<string, Array<{ hooks: Array<{ command: string }> }>>;
+      };
+
+      expect(written.hooks.UserPromptSubmit).toHaveLength(1);
+      expect(written.hooks.UserPromptSubmit[0]?.hooks[0]?.command).toBe("context-mode hook codex userpromptsubmit");
+      expect(written.hooks.Stop).toHaveLength(1);
+      expect(written.hooks.Stop[0]?.hooks[0]?.command).toBe("context-mode hook codex stop");
+    });
   });
 
   describe("validateHooks", () => {
@@ -450,7 +574,15 @@ describe("CodexAdapter", () => {
     it("passes when all required Codex hooks are configured", () => {
       adapter.configureAllHooks("/ignored/plugin/root");
       const results = adapter.validateHooks("/ignored/plugin/root");
-      expect(results.every((result) => result.status === "pass")).toBe(true);
+      // The "Codex CLI binary" check is a runtime environment probe added
+      // by PR #686 — it shells out to `codex --version` and reports `warn`
+      // when the binary is absent (e.g. CI runners without Codex installed).
+      // That probe is orthogonal to the hook-config validation this test is
+      // pinning, so exclude it from the all-pass assertion. Probe-specific
+      // behaviour (pass/warn shape) is covered separately by the unit tests
+      // around probeCodexCliVersion() at L295-299.
+      const configChecks = results.filter((r) => r.check !== "Codex CLI binary");
+      expect(configChecks.every((result) => result.status === "pass")).toBe(true);
       expect(results.map((result) => result.check)).toContain("PreCompact hook");
       expect(results.map((result) => result.check)).toContain("UserPromptSubmit hook");
       expect(results.map((result) => result.check)).toContain("Stop hook");
@@ -474,6 +606,53 @@ describe("CodexAdapter", () => {
       const results = adapter.validateHooks("/ignored/plugin/root");
 
       expect(results.some((result) => result.status === "fail" && result.message.includes("not valid JSON"))).toBe(true);
+    });
+
+    it("warns when duplicate context-mode entries exist for the same hook event (#603)", () => {
+      // Mirrors the user-reported scenario: hooks.json carries two
+      // context-mode entries for the same event after a partial upgrade.
+      // Doctor should surface this so the user knows to run upgrade.
+      writeFileSync(hooksPath, JSON.stringify({
+        hooks: {
+          PreToolUse: [
+            { matcher: "", hooks: [{ type: "command", command: "context-mode hook codex pretooluse" }] },
+            { matcher: "", hooks: [{ type: "command", command: "node /Users/foo/.nvm/versions/node/v20/lib/node_modules/context-mode/hooks/codex/pretooluse.mjs" }] },
+          ],
+          PostToolUse: [
+            { hooks: [{ type: "command", command: "context-mode hook codex posttooluse" }] },
+            { hooks: [{ type: "command", command: "context-mode hook codex posttooluse" }] },
+          ],
+          SessionStart: [
+            { hooks: [{ type: "command", command: "context-mode hook codex sessionstart" }] },
+          ],
+          PreCompact: [
+            { hooks: [{ type: "command", command: "context-mode hook codex precompact" }] },
+          ],
+          UserPromptSubmit: [
+            { hooks: [{ type: "command", command: "context-mode hook codex userpromptsubmit" }] },
+          ],
+          Stop: [
+            { hooks: [{ type: "command", command: "context-mode hook codex stop" }] },
+          ],
+        },
+      }, null, 2), "utf-8");
+      writeFileSync(join(codexDir, "config.toml"), "[features]\nhooks = true\n", "utf-8");
+
+      const results = adapter.validateHooks("/ignored/plugin/root");
+
+      const preToolDup = results.find((r) => r.check === "PreToolUse duplicates");
+      expect(preToolDup?.status).toBe("warn");
+      expect(preToolDup?.message).toMatch(/2 context-mode entries/);
+      expect(preToolDup?.fix).toMatch(/context-mode upgrade/);
+
+      const postToolDup = results.find((r) => r.check === "PostToolUse duplicates");
+      expect(postToolDup?.status).toBe("warn");
+      expect(postToolDup?.message).toMatch(/2 context-mode entries/);
+
+      // Events with only one context-mode entry must NOT trigger the duplicate warning.
+      expect(results.some((r) => r.check === "SessionStart duplicates")).toBe(false);
+      expect(results.some((r) => r.check === "PreCompact duplicates")).toBe(false);
+      expect(results.some((r) => r.check === "Stop duplicates")).toBe(false);
     });
 
     it("fails with a read error message when hooks.json cannot be read", () => {
@@ -753,5 +932,62 @@ describe("Codex matcher parity + config integrity", () => {
       documented.push(m[1].replace(/\\\\/g, "\\"));
     }
     expect(documented).toContain(constant);
+  });
+});
+
+// #547: Codex CLI uses Rust's `regex` crate which does NOT support look-around
+// (?!...). v1.0.124 shipped matchers containing (?!.*context-mode) and
+// (?!plugin_context-mode_) — Codex rejects them at boot with
+// "look-around not supported", breaking ALL Codex users.
+//
+// Codex `is_exact_matcher` (refs/platforms/codex/codex-rs/hooks/src/events/common.rs:152)
+// short-circuits the regex engine when matcher chars are all
+// [A-Za-z0-9_|]. Pinning matchers to that charset avoids the crate's
+// limitations entirely. Drift-guard for future regressions.
+describe("Codex matcher #547 — is_exact_matcher charset compliance", () => {
+  const EXACT_MATCHER_CHARSET = /^[A-Za-z0-9_|]+$/;
+
+  it("EXTERNAL_MCP_MATCHER_PATTERN passes is_exact_matcher charset", async () => {
+    const { EXTERNAL_MCP_MATCHER_PATTERN } = await import(
+      "../../src/adapters/codex/hooks.js"
+    );
+    expect(EXTERNAL_MCP_MATCHER_PATTERN).toMatch(EXACT_MATCHER_CHARSET);
+  });
+
+  it("PRE_TOOL_USE_MATCHER_PATTERN (adapter source constant) passes is_exact_matcher charset", () => {
+    const path = resolve(__dirname, "..", "..", "src", "adapters", "codex", "index.ts");
+    const src = readFileSync(path, "utf8");
+    const m = src.match(/PRE_TOOL_USE_MATCHER_PATTERN\s*=\s*"([^"]+)"/);
+    if (!m) throw new Error("PRE_TOOL_USE_MATCHER_PATTERN constant not found");
+    // TS source uses \\ for a literal backslash. Convert to runtime form.
+    const runtimeMatcher = m[1].replace(/\\\\/g, "\\");
+    expect(runtimeMatcher).toMatch(EXACT_MATCHER_CHARSET);
+  });
+
+  it("configs/codex/hooks.json PreToolUse matcher passes is_exact_matcher charset", () => {
+    const path = resolve(__dirname, "..", "..", "configs", "codex", "hooks.json");
+    const parsed = JSON.parse(readFileSync(path, "utf8")) as {
+      hooks: { PreToolUse: Array<{ matcher: string }> };
+    };
+    const matcher = parsed.hooks.PreToolUse[0]?.matcher ?? "";
+    expect(matcher).toMatch(EXACT_MATCHER_CHARSET);
+  });
+
+  it("hooks/hooks.json (universal bundle) MCP catch-all matcher passes is_exact_matcher charset", () => {
+    // hooks/hooks.json is the universal bundled file Codex ALSO loads via
+    // the plugin cache. The MCP catch-all matcher must drop the lookahead so
+    // Codex's regex crate does not reject the file at boot. Claude Code
+    // continues to treat the literal `mcp__` as a substring matcher.
+    const path = resolve(__dirname, "..", "..", "hooks", "hooks.json");
+    const parsed = JSON.parse(readFileSync(path, "utf8")) as {
+      hooks: { PreToolUse: Array<{ matcher: string }> };
+    };
+    const matchers = (parsed.hooks.PreToolUse ?? []).map((e) => e.matcher);
+    // Whichever entry was the external-MCP catch-all must now be charset-clean.
+    const mcpCatchAll = matchers.find(
+      (m) => m && m.startsWith("mcp__") && !m.includes("ctx_"),
+    );
+    expect(mcpCatchAll, "expected an mcp__ catch-all matcher in hooks.json").toBeDefined();
+    expect(mcpCatchAll).toMatch(EXACT_MATCHER_CHARSET);
   });
 });

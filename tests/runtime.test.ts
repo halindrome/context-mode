@@ -21,9 +21,25 @@ describe("runtime version reporting", () => {
       throw new Error(`unexpected version probe: ${cmd} ${args.join(" ")}`);
     });
 
+    // PR #537 Windows path: getVersion() routes through execSync(cmdStr) on
+    // win32 (DEP0190 fix — no args array with shell:true). The mock must
+    // recognise the same probe shapes via the joined command string so the
+    // summary assertions below also exercise the Windows codepath, not just
+    // POSIX. Returning undefined here (the prior vi.fn() default) caused the
+    // Windows summary to render "(unknown)" and CI run 25741355786 went red.
+    const execSync = vi.fn((cmdStr: string) => {
+      if (cmdStr === "go version") {
+        return "go version go1.26.2 darwin/arm64\n";
+      }
+      if (cmdStr === "node --version") {
+        return "v25.9.0\n";
+      }
+      throw new Error(`unexpected execSync probe: ${cmdStr}`);
+    });
+
     vi.doMock("node:child_process", () => ({
       execFileSync,
-      execSync: vi.fn(),
+      execSync,
     }));
 
     const { getRuntimeSummary } = await import("../src/runtime.js");
@@ -39,6 +55,7 @@ describe("runtime version reporting", () => {
       perl: null,
       r: null,
       elixir: null,
+      csharp: null,
     };
 
     const summary = getRuntimeSummary(runtimes);
@@ -58,11 +75,18 @@ describe("runtime version reporting", () => {
       ["--version"],
       expect.anything(),
     );
-    expect(execFileSync).toHaveBeenCalledWith(
-      "node",
-      ["--version"],
-      expect.anything(),
-    );
+    // PR #537: on Windows getVersion() routes through `execSync(quotedCmdString)`
+    // rather than execFileSync, so the mocked execFileSync is never called for
+    // `node --version` on win32. L49 above already gates the `go version`
+    // assertion the same way — this matching gate was missed in PR #537's
+    // sweep and was caught by CI run 25740169321.
+    if (process.platform !== "win32") {
+      expect(execFileSync).toHaveBeenCalledWith(
+        "node",
+        ["--version"],
+        expect.anything(),
+      );
+    }
     expect(summary).toContain("Go:         go (go version go1.26.2 darwin/arm64)");
     expect(summary).not.toContain("Go:         go (unknown)");
   });
@@ -260,6 +284,7 @@ describe("runnableExists — Windows MS Store stub filter (#454)", () => {
         Rscript: "throw",
         r: "throw",
         elixir: "throw",
+        "dotnet-script": "throw",
       },
       versionExits: { python3: "ok" },
     });
@@ -302,6 +327,7 @@ describe("runnableExists — Windows MS Store stub filter (#454)", () => {
         Rscript: "throw",
         r: "throw",
         elixir: "throw",
+        "dotnet-script": "throw",
       },
       // Probes must NOT be reached because all hits are stubs and `where` short-circuits.
       versionExits: {},
@@ -343,6 +369,7 @@ describe("runnableExists — Windows MS Store stub filter (#454)", () => {
         Rscript: "throw",
         r: "throw",
         elixir: "throw",
+        "dotnet-script": "throw",
       },
       versionExits: { python3: { code: 9009 } },
     });
@@ -376,6 +403,7 @@ describe("runnableExists — Windows MS Store stub filter (#454)", () => {
         Rscript: "throw",
         r: "throw",
         elixir: "throw",
+        "dotnet-script": "throw",
       },
       versionExits: { py: "ok" },
     });
@@ -553,6 +581,7 @@ describe("buildCommand shell variants", () => {
       perl: null,
       r: null,
       elixir: null,
+      csharp: null,
     };
   }
 

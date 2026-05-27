@@ -14,6 +14,7 @@ import { existsSync, readdirSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, sep } from "node:path";
 import { loadDatabase as loadDatabaseImpl } from "../db-base.js";
+import { ensureSessionEventsSchema } from "./db.js";
 import { resolveClaudeConfigDir } from "../util/claude-config.js";
 
 function semverNewer(a: string, b: string): boolean {
@@ -1014,7 +1015,113 @@ export interface RealBytesStats {
   bytesAvoided: number;
   bytesReturned: number;
   snapshotBytes: number;
+  /**
+   * v1.0.133 Slice 3: bytes attributed to this session in the FTS5 content
+   * DB — `SUM(LENGTH(title) + LENGTH(content)) FROM chunks WHERE session_id = ?`.
+   *
+   * Read-only, render-time computation. Populated only when
+   * `getRealBytesStats` is called with both `sessionId` AND `contentDbPath`
+   * (i.e. the conversation tier from ctx_stats). Lifetime / project tiers
+   * leave this at 0 — aggregating across every adapter's content DB is a
+   * separate concern.
+   *
+   * Legacy chunks with empty `session_id` (pre-Slice-1) are NOT backfilled:
+   * the architect rejected the time-window join as unsafe. Old conversations
+   * stay low; new conversations populate honestly.
+   */
+  contentBytes: number;
   totalSavedTokens: number;
+}
+
+/**
+ * v1.0.133 Slice 3: Sum the bytes attributed to one session in the FTS5
+ * content DB.
+ *
+ * Returns `LENGTH(title) + LENGTH(content)` summed across every chunk
+ * whose `session_id` column matches `sessionId`. Best-effort — returns 0
+ * when the DB file is missing, the schema lacks the `session_id` column
+ * (pre-Slice-1 content DBs), or the query fails. Never throws.
+ *
+ * Render-time only. Does NOT mutate the content DB. Architect-approved
+ * because the read-only join carries no risk of cross-session attribution
+ * (the FK was set at chunk insert time by Slice 1).
+ */
+export function getContentBytesForSession(
+  sessionId: string,
+  contentDbPath: string,
+  opts?: { loadDatabase?: () => unknown },
+): number {
+  if (!sessionId || !contentDbPath) return 0;
+  if (!existsSync(contentDbPath)) return 0;
+
+  let DatabaseCtor: ReturnType<typeof loadDatabaseImpl> | null = null;
+  try {
+    DatabaseCtor = opts?.loadDatabase
+      ? (opts.loadDatabase() as ReturnType<typeof loadDatabaseImpl>)
+      : loadDatabaseImpl();
+  } catch { return 0; }
+  if (!DatabaseCtor) return 0;
+
+  try {
+    const db = new DatabaseCtor(contentDbPath, { readonly: true });
+    try {
+      const row = db.prepare(
+        `SELECT COALESCE(SUM(LENGTH(content) + LENGTH(title)), 0) AS bytes
+         FROM chunks WHERE session_id = ?`,
+      ).get(sessionId) as { bytes: number } | undefined;
+      return Number(row?.bytes ?? 0);
+    } finally {
+      db.close();
+    }
+  } catch {
+    return 0;
+  }
+}
+
+/**
+ * v1.0.134 SLICE C — lifetime tier all-chunks aggregate.
+ *
+ * Sibling of {@link getContentBytesForSession} that omits the session_id
+ * filter so the lifetime tier sees every chunk in the content store —
+ * including legacy unattributed rows (sessionId === '') and chunks
+ * attributed to other adapters' sessions. Without this, the lifetime
+ * "kept out" headline only counts session_events.bytes_avoided and
+ * misses the bulk of indexed payload.
+ *
+ * Best-effort: returns 0 when the DB file is missing, the schema lacks
+ * the `chunks` table, or the query fails. Never throws — same contract
+ * as the rest of the analytics module so a corrupt content DB cannot
+ * crash ctx_stats.
+ */
+export function getContentBytesAllSessions(
+  contentDbPath: string,
+  opts?: { loadDatabase?: () => unknown },
+): number {
+  if (!contentDbPath) return 0;
+  if (!existsSync(contentDbPath)) return 0;
+
+  let DatabaseCtor: ReturnType<typeof loadDatabaseImpl> | null = null;
+  try {
+    DatabaseCtor = opts?.loadDatabase
+      ? (opts.loadDatabase() as ReturnType<typeof loadDatabaseImpl>)
+      : loadDatabaseImpl();
+  } catch { return 0; }
+  if (!DatabaseCtor) return 0;
+
+  try {
+    const db = new DatabaseCtor(contentDbPath, { readonly: true });
+    try {
+      const row = db.prepare(
+        `SELECT COALESCE(SUM(LENGTH(content) + LENGTH(title)), 0) AS bytes
+         FROM chunks`,
+      ).get() as { bytes: number } | undefined;
+      return Number(row?.bytes ?? 0);
+    } finally {
+      db.close();
+    }
+  } catch {
+    return 0;
+  }
 }
 
 /**
@@ -1035,6 +1142,32 @@ export function getRealBytesStats(opts: {
   sessionId?: string;
   sessionsDir?: string;
   worktreeHash?: string;
+  /**
+   * v1.0.148 follow-up (Bug E+F): when set, the function aggregates across
+   * EVERY session whose `session_meta.project_dir` matches this value, not
+   * just one session_id. Resolves the per-conversation under-attribution:
+   * one Claude Code conversation typically spans many session_ids (resume
+   * cycles, /compact rebirths, PID sub-process sessions spawned by
+   * ctx_execute), so a single-session_id filter loses the sandbox-burst
+   * bytes_avoided that all live under the conversation's cwd.
+   *
+   * Uses a META subquery (`session_id IN (SELECT session_id FROM
+   * session_meta WHERE project_dir = ?)`), then sums ALL events for
+   * matching sessions regardless of their event-level project_dir
+   * (sandbox-burst events write `project_dir = ''` even when the
+   * META row carries the parent cwd — see Bug F).
+   *
+   * Mutually exclusive with `sessionId`. When both are set, `sessionId`
+   * wins for back-compat.
+   */
+  projectDir?: string;
+  /**
+   * v1.0.133 Slice 3: when set alongside `sessionId`, the function joins
+   * the FTS5 content DB at this path and folds chunk bytes into
+   * `bytesAvoided` + `totalSavedTokens` + `contentBytes`. Render-time
+   * only — no DB writes.
+   */
+  contentDbPath?: string;
   loadDatabase?: () => unknown;
 }): RealBytesStats {
   const empty: RealBytesStats = {
@@ -1042,6 +1175,7 @@ export function getRealBytesStats(opts: {
     bytesAvoided: 0,
     bytesReturned: 0,
     snapshotBytes: 0,
+    contentBytes: 0,
     totalSavedTokens: 0,
   };
 
@@ -1076,6 +1210,19 @@ export function getRealBytesStats(opts: {
   // don't need to type-narrow per row.
   for (const file of dbFiles) {
     const dbPath = join(sessionsDir, file);
+    // v1.0.148 hotfix: historical DBs were created with pre-v1.0.130
+    // schema (no bytes_avoided / bytes_returned / project_dir columns).
+    // The SELECT below references those columns, so without an in-place
+    // migration the prepare() throws and the surrounding catch silently
+    // skips the WHOLE DB — losing even the LENGTH(data) signal. Run the
+    // shared migration helper before opening readonly. Idempotent: a
+    // PRAGMA check inside the helper short-circuits when the DB is
+    // already current, so post-first-read calls are cheap.
+    ensureSessionEventsSchema(dbPath, DatabaseCtor as unknown as new (path: string, opts?: { readonly?: boolean }) => {
+      pragma: (q: string) => Array<{ name: string }>;
+      exec: (sql: string) => void;
+      close: () => void;
+    });
     try {
       const sdb = new DatabaseCtor(dbPath, { readonly: true });
       try {
@@ -1098,6 +1245,39 @@ export function getRealBytesStats(opts: {
             const snap = sdb.prepare(
               "SELECT COALESCE(SUM(LENGTH(snapshot)), 0) AS bytes FROM session_resume WHERE session_id = ?",
             ).get(opts.sessionId) as { bytes: number } | undefined;
+            if (snap?.bytes) snapshotBytes += Number(snap.bytes);
+          } catch { /* old schema */ }
+        } else if (opts.projectDir) {
+          // Bug E+F: META-scoped aggregation. Take every session_id whose
+          // session_meta.project_dir matches, then sum ALL of those
+          // sessions' events regardless of the events' own project_dir
+          // (sandbox-burst PID sessions write empty event-level project_dir
+          // even when their META carries the parent cwd).
+          const row = sdb.prepare(
+            `SELECT
+               COALESCE(SUM(LENGTH(data)), 0)   AS data_bytes,
+               COALESCE(SUM(bytes_avoided), 0)  AS bytes_avoided,
+               COALESCE(SUM(bytes_returned), 0) AS bytes_returned
+             FROM session_events
+             WHERE session_id IN (
+               SELECT session_id FROM session_meta WHERE project_dir = ?
+             )`,
+          ).get(opts.projectDir) as
+            | { data_bytes: number; bytes_avoided: number; bytes_returned: number }
+            | undefined;
+          if (row) {
+            eventDataBytes += Number(row.data_bytes ?? 0);
+            bytesAvoided   += Number(row.bytes_avoided ?? 0);
+            bytesReturned  += Number(row.bytes_returned ?? 0);
+          }
+          try {
+            const snap = sdb.prepare(
+              `SELECT COALESCE(SUM(LENGTH(snapshot)), 0) AS bytes
+               FROM session_resume
+               WHERE session_id IN (
+                 SELECT session_id FROM session_meta WHERE project_dir = ?
+               )`,
+            ).get(opts.projectDir) as { bytes: number } | undefined;
             if (snap?.bytes) snapshotBytes += Number(snap.bytes);
           } catch { /* old schema */ }
         } else {
@@ -1128,11 +1308,27 @@ export function getRealBytesStats(opts: {
     } catch { /* missing tables / corrupt — skip */ }
   }
 
+  // v1.0.133 Slice 3: fold content DB chunk bytes for this session into
+  // bytesAvoided. Skipped silently when caller didn't pass contentDbPath
+  // (lifetime / project tiers, or pre-Slice-3 callers). Treated as
+  // "avoided" because indexed chunks are bytes that would have been
+  // re-inflated into context on every search if the model had to
+  // re-read raw files.
+  let contentBytes = 0;
+  if (opts.sessionId && opts.contentDbPath) {
+    contentBytes = getContentBytesForSession(
+      opts.sessionId,
+      opts.contentDbPath,
+      { loadDatabase: opts.loadDatabase },
+    );
+    bytesAvoided += contentBytes;
+  }
+
   const totalSavedTokens = Math.floor(
     (eventDataBytes + bytesAvoided + snapshotBytes) / 4,
   );
 
-  return { eventDataBytes, bytesAvoided, bytesReturned, snapshotBytes, totalSavedTokens };
+  return { eventDataBytes, bytesAvoided, bytesReturned, snapshotBytes, contentBytes, totalSavedTokens };
 }
 
 // ─────────────────────────────────────────────────────────
@@ -1381,6 +1577,7 @@ export function getMultiAdapterRealBytesStats(opts?: {
     bytesAvoided: 0,
     bytesReturned: 0,
     snapshotBytes: 0,
+    contentBytes: 0,
     totalSavedTokens: 0,
   };
   const perAdapter: MultiAdapterRealBytesStats["perAdapter"] = [];
@@ -1393,6 +1590,21 @@ export function getMultiAdapterRealBytesStats(opts?: {
       worktreeHash: opts?.worktreeHash,
       loadDatabase: opts?.loadDatabase,
     });
+    // ARCH-REVIEW-V134-ABC SLICE C: aggregate this adapter's content DB
+    // bytes into the lifetime sum. `getRealBytesStats` operates on
+    // session events only and never touches the sibling content/ tree —
+    // without this step the lifetime tier in ctx_stats reports 0 for
+    // every adapter except whichever one happens to share the
+    // sessionsDir of the caller. Lifetime tier ignores sessionId so
+    // the all-sessions aggregator is the right helper here.
+    if (!opts?.sessionId) {
+      const contentDbPath = join(entry.contentDir, "content.db");
+      const adapterContentBytes = getContentBytesAllSessions(contentDbPath, {
+        loadDatabase: opts?.loadDatabase as (() => unknown) | undefined,
+      });
+      one.contentBytes += adapterContentBytes;
+      sum.contentBytes += adapterContentBytes;
+    }
     perAdapter.push({ name: entry.name, ...one });
     sum.eventDataBytes += one.eventDataBytes;
     sum.bytesAvoided   += one.bytesAvoided;
@@ -1514,9 +1726,42 @@ function formatDuration(uptimeMin: string): string {
  * Timezone always uses `Intl.DateTimeFormat().resolvedOptions().timeZone`
  * — that one's always available and correct regardless of platform.
  */
+/**
+ * Validate that a locale string is a usable BCP 47 tag.
+ *
+ * Ubuntu GHA runners default to `LANG=C.UTF-8`. The extractor below strips
+ * that to `"C"` — a valid POSIX locale identifier but NOT a BCP 47 tag.
+ * On macOS / Node 20, `new Intl.DateTimeFormat("C", …)` throws RangeError
+ * outright. CI run 25887250971 caught this via the v1.0.134 SLICE B test.
+ *
+ * Earlier fix attempt used a permissive `supportedLocalesOf || construction`
+ * OR check — that was wrong: on Linux + Node 22.5, `new Intl.DateTimeFormat
+ * ("POSIX")` does NOT throw, it silently falls back to the root locale and
+ * still emits garbage at format time. CI run 25904838577 surfaced that —
+ * "POSIX" round-tripped through the validator unchanged.
+ *
+ * Strict gate: `Intl.DateTimeFormat.supportedLocalesOf(tag)` returns `[]` for
+ * any tag that doesn't map to a real language (regardless of whether
+ * construction with that tag throws). That's the contract we want — "is this
+ * a BCP 47 tag the host actually has data for". Construction is an explicit
+ * sanity check; both must pass.
+ */
+function isUsableBcp47Locale(raw: string): boolean {
+  if (!raw) return false;
+  try {
+    if (Intl.DateTimeFormat.supportedLocalesOf(raw).length === 0) return false;
+    // Belt: confirm construction doesn't throw on this host either.
+    new Intl.DateTimeFormat(raw);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 export function detectLocaleAndTz(): { locale: string; tz: string } {
   const env = (process.env ?? {}) as Record<string, string | undefined>;
   let locale = env.CONTEXT_MODE_LOCALE ?? "";
+  if (locale && !isUsableBcp47Locale(locale)) locale = "";
   if (!locale) {
     if (process.platform === "darwin") {
       try {
@@ -1529,10 +1774,15 @@ export function detectLocaleAndTz(): { locale: string; tz: string } {
         }).trim();
         if (out) locale = out.replace(/_/g, "-");
       } catch { /* defaults missing or sandbox */ }
+      if (locale && !isUsableBcp47Locale(locale)) locale = "";
     }
     if (!locale && (env.LC_TIME || env.LANG)) {
       const raw = (env.LC_TIME || env.LANG || "").split(".")[0];
       if (raw) locale = raw.replace(/_/g, "-");
+      // POSIX locale identifiers (`C`, `POSIX`) survive the simple extraction
+      // above but blow up `new Intl.DateTimeFormat(locale, ...)`. Drop and
+      // fall through to the host-default branch below.
+      if (locale && !isUsableBcp47Locale(locale)) locale = "";
     }
     if (!locale) {
       try {
@@ -1547,7 +1797,12 @@ export function detectLocaleAndTz(): { locale: string; tz: string } {
       tz = new Intl.DateTimeFormat().resolvedOptions().timeZone;
     } catch { tz = "UTC"; }
   }
-  return { locale: locale || "en-US", tz: tz || "UTC" };
+  // Final belt-and-suspenders: if the locale we settled on is somehow still
+  // unusable (env mutation between detection and return, contributor adding
+  // a new extraction path that skips the validator), fall back to en-US so
+  // formatLocalDateTime / monthDay / weekdayCap never throw at render time.
+  if (!isUsableBcp47Locale(locale)) locale = "en-US";
+  return { locale, tz: tz || "UTC" };
 }
 
 /**
@@ -1691,7 +1946,16 @@ function renderNarrative5Section(args: {
   const lifetimeLegacyTokens = lifetimeEventsTokens + lifetimeRescueTokens;
   const lifetimeRealTokens   = realBytes?.lifetime?.totalSavedTokens ?? 0;
   const lifetimeTokensWithout = Math.max(lifetimeLegacyTokens, lifetimeRealTokens);
-  const lifetimeTokensWith    = Math.max(1, Math.round(lifetimeTokensWithout * 0.02));
+  // Lifetime "with" — measured when available, else legacy 0.02 fallback.
+  // Honest definition (matches conversation bar below):
+  //   "with"    = bytes_returned (what the model actually re-saw)
+  //   "without" = bytes_returned + bytes_avoided
+  // When the schema has measurement, derive `with` from `bytes_returned/4`.
+  const lifeRet = realBytes?.lifetime?.bytesReturned ?? 0;
+  const lifeAv  = realBytes?.lifetime?.bytesAvoided  ?? 0;
+  const lifetimeTokensWith = (lifeRet + lifeAv) > 0
+    ? Math.max(1, Math.floor(lifeRet / 4))
+    : Math.max(1, Math.round(lifetimeTokensWithout * 0.02));
 
   // Bytes from realBytes when present, else derive from tokens (×4 — same
   // ratio Phase 8 uses everywhere). All-work bytes drives the opener tally
@@ -1764,15 +2028,55 @@ function renderNarrative5Section(args: {
   }
   out.push("");
 
-  // Without/With bars — the screenshottable proof for THIS conversation.
-  const convTokensWith = Math.max(1, Math.round(conversationTokens * 0.02));
-  const withoutBar = dataBar(conversationTokens, conversationTokens, 32);
-  const withBar    = dataBar(convTokensWith,     conversationTokens, 32);
-  const convPct    = conversationTokens > 0 ? (1 - convTokensWith / conversationTokens) * 100 : 0;
-  out.push(`  Without context-mode  ${kb(convBytes).padStart(8)}  ${withoutBar}   ${fmtNum(conversationTokens).padStart(7)} tokens`);
-  out.push(`  With context-mode     ${kb(Math.max(1, Math.round(convBytes * 0.02))).padStart(8)}  ${withBar}   ${fmtNum(convTokensWith).padStart(7)} tokens`);
-  out.push(`                          ${convPct.toFixed(0)}% kept out of context · your AI ran ${Math.max(1, Math.round(conversationTokens / convTokensWith))}× longer before /compact fired`);
-  out.push("");
+  // Without/With bars — strict compression (v1.0.148, Bug G / ADR-0004).
+  //
+  // Honest definitions:
+  //   Without = bytes the model WOULD have re-seen if context-mode
+  //             had not diverted them
+  //           = bytesAvoided + bytesReturned
+  //   With    = bytes the model ACTUALLY re-saw after context-mode
+  //           = max(1, bytesReturned)
+  //
+  // Why eventDataBytes is excluded from this ratio:
+  //   `eventDataBytes` is the raw hook payload (tool args, prompt
+  //   body) we captured for the knowledge base. Those bytes are
+  //   analytics infrastructure — they NEVER enter the model context
+  //   window. Including them on either side (as v1.0.134 SLICE B did
+  //   to dodge a degenerate 100% bar) misrepresents context cost.
+  //   SLICE B was an incidental fix that crushed the displayed
+  //   percentage from ~95% (the true compression ratio) to ~56% on
+  //   live conversations. eventDataBytes is rendered in Section 2
+  //   (captures count), not in this Section 1 Without/With bar.
+  //
+  // Empty-state branch:
+  //   If neither bytesAvoided nor bytesReturned has been measured yet
+  //   (early in a session, schema-migration recovery in progress, or
+  //   tool-heavy work that hasn't re-hit the index), we do NOT draw
+  //   a degenerate 0% / 100% bar. We emit one honest hint line and
+  //   skip the bar — honesty over decoration.
+  const realConv = realBytes?.conversation;
+  const measuredAvoided  = realConv?.bytesAvoided   ?? 0;
+  const measuredReturned = realConv?.bytesReturned  ?? 0;
+
+  if (measuredAvoided + measuredReturned === 0) {
+    // No measurable redirect activity yet — captures may exist, but
+    // nothing has been diverted from the model context window.
+    out.push("  No measurable redirect activity captured yet — bars will appear once context-mode diverts its first payload.");
+    out.push("");
+  } else {
+    const convBytesWithout  = measuredAvoided + measuredReturned;
+    const convBytesWith     = Math.max(1, measuredReturned);
+    const convTokensWithout = Math.max(1, Math.floor(convBytesWithout / 4));
+    const convTokensWith    = Math.max(1, Math.floor(convBytesWith    / 4));
+    const withoutBar = dataBar(convTokensWithout, convTokensWithout, 32);
+    const withBar    = dataBar(convTokensWith,    convTokensWithout, 32);
+    const convPct    = (1 - convTokensWith / convTokensWithout) * 100;
+    const convMult   = Math.max(1, Math.round(convTokensWithout / convTokensWith));
+    out.push(`  Without context-mode  ${kb(convBytesWithout).padStart(8)}  ${withoutBar}   ${fmtNum(convTokensWithout).padStart(7)} tokens`);
+    out.push(`  With context-mode     ${kb(convBytesWith).padStart(8)}  ${withBar}   ${fmtNum(convTokensWith).padStart(7)} tokens`);
+    out.push(`                          ${convPct.toFixed(0)}% kept out of context · your AI ran ${convMult}× longer before /compact fired`);
+    out.push("");
+  }
 
   // Timeline — drop-in if conversation has byDay.
   if (conversation.byDay && conversation.byDay.length > 0) {

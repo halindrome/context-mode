@@ -182,7 +182,11 @@ describe("postinstall — non-global install (contributor `npm install`)", () =>
 // ─────────────────────────────────────────────────────────────────────────
 
 describe("postinstall — global install with poisoned registry", () => {
-  it("repairs entry.version + enabledPlugins and emits one stderr line", () => {
+  // 90s budget — see L163/L246/L465 for the same precedent. Section 3 of
+  // postinstall.mjs (heal-better-sqlite3) routinely takes 20-30s on cold
+  // macOS GHA runners, blowing past vitest's default 30s. CI run
+  // 25804274156 caught this gap.
+  it("repairs entry.version + enabledPlugins and emits one stderr line", { timeout: 90_000 }, () => {
     const fake = buildFakeHome({
       entryVersion: "1.0.99",         // poisoned
       cacheVersion: "1.0.113",        // truth
@@ -215,7 +219,10 @@ describe("postinstall — global install with poisoned registry", () => {
 // ─────────────────────────────────────────────────────────────────────────
 
 describe("postinstall — global install, user not on Claude Code", () => {
-  it("emits a single benign one-liner and never crashes", () => {
+  // 90s budget for the same reason as siblings (L163/L185/L246/L465) —
+  // heal-better-sqlite3 in section 3 of postinstall.mjs is the slow path
+  // and shares this whole-process budget on every spawn.
+  it("emits a single benign one-liner and never crashes", { timeout: 90_000 }, () => {
     const home = makeTmp("ctx-postinstall-home-bare-");
     const r = runPostinstall({ home, global: true });
     expect(r.status === 0 || r.status === null).toBe(true);
@@ -454,7 +461,15 @@ describe("normalize-hooks — /ctx-upgrade post-cpSync sequence (issue #528)", (
 // ─────────────────────────────────────────────────────────────────────────
 
 describe("postinstall — global install, registry already healthy", () => {
-  it("emits 'no heal needed' and leaves registry bytes unchanged", () => {
+  // The vitest default test timeout is 30s; this test path runs the real
+  // `heal-better-sqlite3.mjs` (section 3 of postinstall.mjs) which alone
+  // can take 20-30s on cold CI runners. Sibling tests in this file
+  // (L163, L246) already use 90_000 for the same reason. CI run
+  // 25803559016 caught this gap — Ubuntu ran the whole file in 126s but
+  // macOS hit the default 30s budget for this `it()` and killed the test
+  // before spawn could return. 90s matches the precedent the rest of the
+  // file established; widening just this `it()` is the minimum diff.
+  it("emits 'no heal needed' and leaves registry bytes unchanged", { timeout: 90_000 }, () => {
     const fake = buildFakeHome({
       entryVersion: "1.0.114",
       cacheVersion: "1.0.114",
@@ -469,5 +484,77 @@ describe("postinstall — global install, registry already healthy", () => {
     const ctxLines = r.stderr.split(/\r?\n/).filter((l) => /context-mode:/.test(l));
     expect(ctxLines.length).toBe(1);
     expect(ctxLines[0]).toMatch(/no heal needed/i);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────
+// Slice 9 — Issue #564 — Linux SIGSEGV class hard-fail
+//
+// Six prior fixes (#228, #331, #461, #540, #551, #556) silently assumed
+// Node >= 22.5 on Linux. Reporter #564 hit the SIGSEGV from V8's
+// madvise(MADV_DONTNEED) corrupting better-sqlite3 .got.plt on Linux + Node 20.
+//
+// Contract for v1.0.132:
+//   1. `package.json` declares `engines.node >= 22.5.0` (cosmetic in npm but
+//      load-bearing for pnpm/yarn and tooling).
+//   2. `scripts/postinstall.mjs` HARD-FAILS (process.exit(1)) on
+//      Linux + Node < 22.5 + no Bun. Architect rejected "warn nicely" — the
+//      contract IS Node >= 22.5 on Linux; make it real.
+//
+// Static-analysis tests (same pattern as cli.test.ts:289, :820) — spawning
+// a fake older Node is not portable, but asserting the gate exists in source
+// catches the regression at PR time.
+// ─────────────────────────────────────────────────────────────────────────
+
+describe("postinstall — Issue #564 Linux SIGSEGV hard-fail (engines.node + Node-version gate)", () => {
+  it("package.json declares engines.node >= 22.5.0", () => {
+    const pkg = JSON.parse(readFileSync(resolve(REPO_ROOT, "package.json"), "utf-8"));
+    // Field must exist
+    expect(pkg.engines).toBeDefined();
+    expect(typeof pkg.engines.node).toBe("string");
+    // Must enforce the 22.5 floor used by hasModernSqlite() in src/db-base.ts.
+    // Looser ranges (>=18, >=20) would bless the SIGSEGV-prone versions.
+    expect(pkg.engines.node).toMatch(/>=\s*22\.5/);
+    // Sanity: Node 20.x must NOT satisfy the declared range.
+    // We don't pull semver from npm; assert no `||` clause widens to 20.x.
+    expect(pkg.engines.node).not.toMatch(/>=\s*1[0-9]\b/);
+    expect(pkg.engines.node).not.toMatch(/>=\s*20\b/);
+    expect(pkg.engines.node).not.toMatch(/>=\s*21\b/);
+  });
+
+  it("postinstall.mjs hard-fails on Linux + Node < 22.5 + no Bun (process.exit(1))", () => {
+    const src = readFileSync(REPO_POSTINSTALL, "utf-8");
+    // The gate must reference Linux explicitly.
+    expect(src).toMatch(/process\.platform\s*===\s*["']linux["']/);
+    // The gate must reference the 22.5 Node-version floor (via either an
+    // inline major/minor compare or by importing hasModernSqlite).
+    const has225InlineGate =
+      /process\.versions\.node/.test(src) && /22(?:\.5|[^0-9])/.test(src);
+    const importsModernSqliteHelper =
+      /hasModernSqlite/.test(src);
+    expect(has225InlineGate || importsModernSqliteHelper).toBe(true);
+    // The gate must allow Bun through (Linux + Bun is fine because bun:sqlite
+    // sidesteps better-sqlite3 entirely).
+    expect(src).toMatch(/globalThis\.Bun|process\.versions\.bun|typeof\s+Bun/);
+    // The gate must HARD-FAIL — `process.exit(1)` is the architect contract.
+    // A bare `process.stderr.write` warning would be a soft-warn regression.
+    const sigsegvBlock = src.slice(
+      Math.max(
+        0,
+        Math.min(
+          ...["#564", "nodejs/node#62515", "SIGSEGV", "22.5"]
+            .map((needle) => {
+              const i = src.indexOf(needle);
+              return i === -1 ? Infinity : i;
+            }),
+        ) - 200,
+      ),
+      src.length,
+    );
+    expect(sigsegvBlock).toMatch(/process\.exit\(\s*1\s*\)/);
+    // Remediation must point users at Node 22.5+ OR Bun, and reference #564
+    // so the GitHub thread is discoverable.
+    expect(src).toMatch(/22\.5|22\.13/);
+    expect(src).toMatch(/#564|issues\/564/);
   });
 });

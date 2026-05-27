@@ -174,6 +174,110 @@ describe("resolveProjectDir", () => {
   });
 });
 
+// ─────────────────────────────────────────────────────────
+// Issue #545 — `strictPlatform` algorithmic mode.
+//
+// Under strict mode the candidate list is built from the platform's own
+// workspace env vars + UNIVERSAL escape hatch — foreign workspace vars
+// (e.g. CLAUDE_PROJECT_DIR leaked into Pi's MCP child env) cannot win,
+// regardless of cascade order. The resolver must contain ZERO hardcoded
+// platform names — the candidate set is derived from PLATFORM_ENV_VARS.
+// ─────────────────────────────────────────────────────────
+
+describe("resolveProjectDir — strictPlatform algorithmic mode (issue #545)", () => {
+  it("strictPlatform=pi prefers PI_PROJECT_DIR over leaked CLAUDE_PROJECT_DIR", () => {
+    const result = resolveProjectDir({
+      env: {
+        CLAUDE_PROJECT_DIR: "/leak/from/claude-host",
+        PI_PROJECT_DIR: "/Users/x/own-pi-project",
+      },
+      cwd: "/some/cwd",
+      pwd: undefined,
+      strictPlatform: "pi",
+    });
+    expect(result).toBe("/Users/x/own-pi-project");
+  });
+
+  it("strictPlatform=pi prefers PI_WORKSPACE_DIR over PI_PROJECT_DIR (registry order)", () => {
+    const result = resolveProjectDir({
+      env: {
+        PI_WORKSPACE_DIR: "/Users/x/freshest",
+        PI_PROJECT_DIR: "/Users/x/legacy",
+      },
+      cwd: "/some/cwd",
+      pwd: undefined,
+      strictPlatform: "pi",
+    });
+    expect(result).toBe("/Users/x/freshest");
+  });
+
+  it("strictPlatform=qwen-code prefers QWEN_PROJECT_DIR over leaked GEMINI_PROJECT_DIR", () => {
+    const result = resolveProjectDir({
+      env: {
+        GEMINI_PROJECT_DIR: "/leak/from/gemini-host",
+        QWEN_PROJECT_DIR: "/Users/x/own-qwen-project",
+      },
+      cwd: "/some/cwd",
+      pwd: undefined,
+      strictPlatform: "qwen-code",
+    });
+    expect(result).toBe("/Users/x/own-qwen-project");
+  });
+
+  it("strictPlatform=zed (no workspace var) falls through CONTEXT_MODE_PROJECT_DIR > pwd > cwd", () => {
+    const result = resolveProjectDir({
+      env: {
+        // Foreign workspace vars leaked everywhere — none must win.
+        CLAUDE_PROJECT_DIR: "/leak/cc",
+        GEMINI_PROJECT_DIR: "/leak/gemini",
+        VSCODE_CWD: "/leak/vscode",
+        IDEA_INITIAL_DIRECTORY: "/leak/idea",
+        PI_PROJECT_DIR: "/leak/pi",
+        OPENCODE_PROJECT_DIR: "/leak/opencode",
+        CURSOR_CWD: "/leak/cursor",
+        // Universal escape hatch.
+        CONTEXT_MODE_PROJECT_DIR: "/Users/x/escape",
+      },
+      cwd: "/some/cwd",
+      pwd: undefined,
+      strictPlatform: "zed",
+    });
+    expect(result).toBe("/Users/x/escape");
+  });
+
+  it("non-strict mode preserves the EXACT legacy candidate order (semver lock)", () => {
+    // Today's literal order from src/util/project-dir.ts:138-153:
+    //   CLAUDE_PROJECT_DIR > GEMINI_PROJECT_DIR > VSCODE_CWD > OPENCODE_PROJECT_DIR
+    //   > PI_PROJECT_DIR > IDEA_INITIAL_DIRECTORY > CURSOR_CWD > CONTEXT_MODE_PROJECT_DIR
+    const env = {
+      CLAUDE_PROJECT_DIR: "/p1",
+      GEMINI_PROJECT_DIR: "/p2",
+      VSCODE_CWD: "/p3",
+      OPENCODE_PROJECT_DIR: "/p4",
+      PI_PROJECT_DIR: "/p5",
+      IDEA_INITIAL_DIRECTORY: "/p6",
+      CURSOR_CWD: "/p7",
+      CONTEXT_MODE_PROJECT_DIR: "/p8",
+    };
+    // First wins.
+    expect(resolveProjectDir({ env, cwd: "/x", pwd: undefined })).toBe("/p1");
+    // Drop CLAUDE — GEMINI wins.
+    expect(resolveProjectDir({
+      env: { ...env, CLAUDE_PROJECT_DIR: undefined },
+      cwd: "/x", pwd: undefined,
+    })).toBe("/p2");
+    // Drop down to PI — PI_PROJECT_DIR wins (legacy slot 5).
+    expect(resolveProjectDir({
+      env: {
+        OPENCODE_PROJECT_DIR: undefined,
+        PI_PROJECT_DIR: "/p5",
+        IDEA_INITIAL_DIRECTORY: "/p6",
+      },
+      cwd: "/x", pwd: undefined,
+    })).toBe("/p5");
+  });
+});
+
 describe("resolveProjectDirFromTranscript", () => {
   it("returns cwd from the most-recently-modified Claude Code transcript", () => {
     const root = makeTranscriptsRoot();
@@ -187,6 +291,32 @@ describe("resolveProjectDirFromTranscript", () => {
   it("returns undefined when projects dir does not exist", () => {
     const result = resolveProjectDirFromTranscript({ projectsRoot: "/nonexistent/path" });
     expect(result).toBeUndefined();
+  });
+
+  it("returns undefined when the newest transcript is older than maxAgeMs", () => {
+    const root = makeTranscriptsRoot();
+    const now = Date.now();
+    writeTranscript(root, "-Users-x-stale", "stale-session", "/Users/x/stale-proj", new Date(now - 60_000));
+
+    const result = resolveProjectDirFromTranscript({
+      projectsRoot: root,
+      maxAgeMs: 30_000,
+      nowMs: now,
+    });
+    expect(result).toBeUndefined();
+  });
+
+  it("returns cwd when the newest transcript is within maxAgeMs", () => {
+    const root = makeTranscriptsRoot();
+    const now = Date.now();
+    writeTranscript(root, "-Users-x-fresh", "fresh-session", "/Users/x/fresh-proj", new Date(now - 10_000));
+
+    const result = resolveProjectDirFromTranscript({
+      projectsRoot: root,
+      maxAgeMs: 30_000,
+      nowMs: now,
+    });
+    expect(result).toBe("/Users/x/fresh-proj");
   });
 
   it("returns undefined when no jsonl files exist", () => {
@@ -230,6 +360,22 @@ describe("resolveProjectDirFromTranscript", () => {
       transcriptsRoot: "/nonexistent/transcripts",
     });
     expect(result).toBe("/Users/x/proj");
+  });
+
+  it("resolveProjectDir falls back to PWD when transcript is stale", () => {
+    const root = makeTranscriptsRoot();
+    const now = Date.now();
+    writeTranscript(root, "-Users-x-stale", "stale-session", "/Users/x/stale-proj", new Date(now - 60_000));
+
+    const result = resolveProjectDir({
+      env: {},
+      cwd: "/Users/x",
+      pwd: "/Users/x",
+      transcriptsRoot: root,
+      transcriptMaxAgeMs: 30_000,
+      nowMs: now,
+    });
+    expect(result).toBe("/Users/x");
   });
 
   it("compiled ESM resolver runs under Node without CommonJS require", () => {

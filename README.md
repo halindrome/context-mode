@@ -124,7 +124,7 @@ This gives you all 11 MCP tools without automatic routing. The model can still u
 <details>
 <summary><strong>Gemini CLI</strong> — one config file, hooks included</summary>
 
-**Prerequisites:** Node.js 18+, Gemini CLI installed.
+**Prerequisites:** Node.js >= 22.5 (or Bun), Gemini CLI installed.
 
 **Install:**
 
@@ -197,7 +197,7 @@ Full config reference: [`configs/gemini-cli/settings.json`](configs/gemini-cli/s
 <details>
 <summary><strong>VS Code Copilot</strong> — hooks with SessionStart</summary>
 
-**Prerequisites:** Node.js 18+, VS Code with Copilot Chat v0.32+.
+**Prerequisites:** Node.js >= 22.5 (or Bun), VS Code with Copilot Chat v0.32+.
 
 **Install:**
 
@@ -254,7 +254,7 @@ Full hook config including PreCompact: [`configs/vscode-copilot/hooks.json`](con
 <details>
 <summary><strong>JetBrains Copilot</strong> — hooks with SessionStart</summary>
 
-**Prerequisites:** Node.js 18+, JetBrains IDE with GitHub Copilot plugin v1.5.57+.
+**Prerequisites:** Node.js >= 22.5 (or Bun), JetBrains IDE with GitHub Copilot plugin v1.5.57+.
 
 **Install:**
 
@@ -305,7 +305,7 @@ Full setup guide: [`docs/jetbrains-copilot.md`](docs/jetbrains-copilot.md)
 <details>
 <summary><strong>Cursor</strong> — hooks with stop support</summary>
 
-**Prerequisites:** Node.js 18+, Cursor with agent mode.
+**Prerequisites:** Node.js >= 22.5 (or Bun), Cursor with agent mode.
 
 > **🚧 Work in progress** — the Marketplace plugin is **awaiting Cursor team review**. Until it's listed, install via the local-folder path described in Option A. Tracking in [#485](https://github.com/mksglu/context-mode/issues/485) / [#489](https://github.com/mksglu/context-mode/pull/489).
 
@@ -406,34 +406,22 @@ Full configs: [`configs/cursor/hooks.json`](configs/cursor/hooks.json) | [`confi
 <details>
 <summary><strong>OpenCode</strong> — TypeScript plugin with hooks</summary>
 
-**Prerequisites:** Node.js 18+, OpenCode installed.
+**Prerequisites:** Node.js >= 22.5 (or Bun), OpenCode installed.
 
 **Install:**
 
-1. Install context-mode globally:
-
-   ```bash
-   npm install -g context-mode
-   ```
-
-2. Add to `opencode.json` in your project root (or `~/.config/opencode/opencode.json` for global):
+1. Add to `opencode.json` in your project root (or `~/.config/opencode/opencode.json` for global):
 
    ```json
    {
      "$schema": "https://opencode.ai/config.json",
-     "mcp": {
-       "context-mode": {
-         "type": "local",
-         "command": ["context-mode"]
-       }
-     },
      "plugin": ["context-mode"]
    }
    ```
 
-   The `mcp` entry registers all 11 MCP tools. The `plugin` entry enables hooks — OpenCode calls the plugin's TypeScript functions directly before and after each tool execution, blocking dangerous commands and enforcing sandbox routing.
+   The `plugin` entry registers all 11 `ctx_*` tools natively and enables hooks — OpenCode calls context-mode's TypeScript plugin in-process, so there is no redundant stdio MCP child per session.
 
-3. *(Optional)* Copy the routing rules file. The model needs an `AGENTS.md` file for routing awareness:
+2. *(Optional)* Copy the routing rules file. The model needs an `AGENTS.md` file for routing awareness:
 
    ```bash
    cp node_modules/context-mode/configs/opencode/AGENTS.md AGENTS.md
@@ -441,9 +429,11 @@ Full configs: [`configs/cursor/hooks.json`](configs/cursor/hooks.json) | [`confi
 
    This tells the model which tools to use and which commands are blocked. Without it, hooks still enforce routing — but the model won't know *why* a command was denied.
 
-4. Restart OpenCode.
+3. Restart OpenCode.
 
 **Verify:** In the OpenCode session, type `ctx stats`. Context-mode tools should appear and respond.
+
+**Upgrade note:** If an existing config has BOTH `plugin: ["context-mode"]` AND `mcp.context-mode`, OpenCode will register zero `ctx_*` tools — the plugin path correctly suppresses MCP duplicates, but the legacy MCP entry confuses the loader. Run `context-mode upgrade` to remove the legacy `mcp.context-mode` entry; your other MCP servers are preserved. v1.0.140+ emits a stderr diagnostic with the same guidance when this happens.
 
 **Routing:** Hooks enforce routing programmatically via `tool.execute.before` and `tool.execute.after`. The optional [`AGENTS.md`](configs/opencode/AGENTS.md) file provides routing instructions for model awareness. The `experimental.session.compacting` hook builds resume snapshots when the conversation compacts. The `experimental.chat.system.transform` hook injects the routing block and prior-session snapshots at session start, enabling session continuity across restarts. The `chat.message` hook captures user prompts and decisions (UserPromptSubmit equivalent).
 
@@ -456,42 +446,32 @@ Full configs: [`configs/opencode/opencode.json`](configs/opencode/opencode.json)
 <details>
 <summary><strong>KiloCode</strong> — TypeScript plugin with hooks</summary>
 
-**Prerequisites:** Node.js 18+, KiloCode installed.
+**Prerequisites:** Node.js >= 22.5 (or Bun), KiloCode installed.
 
 **Install:**
 
-1. Install context-mode globally:
-
-   ```bash
-   npm install -g context-mode
-   ```
-
-2. Add to `kilo.json` in your project root (or `~/.config/kilo/kilo.json` for global):
+1. Add to `kilo.json` in your project root (or `~/.config/kilo/kilo.json` for global):
 
    ```json
    {
      "$schema": "https://app.kilo.ai/config.json",
-     "mcp": {
-       "context-mode": {
-         "type": "local",
-         "command": ["context-mode"]
-       }
-     },
      "plugin": ["context-mode"]
    }
    ```
 
-   The `mcp` entry registers all 11 MCP tools. The `plugin` entry enables hooks — KiloCode calls the plugin's TypeScript functions directly before and after each tool execution, blocking dangerous commands and enforcing sandbox routing.
+   The `plugin` entry registers all 11 `ctx_*` tools natively and enables hooks — KiloCode calls context-mode's TypeScript plugin in-process, so there is no redundant stdio MCP child per session.
 
-3. *(Optional)* Copy the routing rules file. KiloCode shares the OpenCode plugin architecture, so the model needs an `AGENTS.md` file for routing awareness:
+2. *(Optional)* Copy the routing rules file. KiloCode shares the OpenCode plugin architecture, so the model needs an `AGENTS.md` file for routing awareness:
 
    ```bash
    cp node_modules/context-mode/configs/opencode/AGENTS.md AGENTS.md
    ```
 
-4. Restart KiloCode.
+3. Restart KiloCode.
 
 **Verify:** In the KiloCode session, type `ctx stats`. Context-mode tools should appear and respond.
+
+**Upgrade note:** If an existing config has BOTH `plugin: ["context-mode"]` AND `mcp.context-mode`, KiloCode will register zero `ctx_*` tools — the plugin path correctly suppresses MCP duplicates, but the legacy MCP entry confuses the loader. Run `context-mode upgrade` to remove the legacy `mcp.context-mode` entry; your other MCP servers are preserved. v1.0.140+ emits a stderr diagnostic with the same guidance when this happens.
 
 **Routing:** Hooks enforce routing programmatically via `tool.execute.before` and `tool.execute.after`. The optional [`AGENTS.md`](configs/opencode/AGENTS.md) file provides routing instructions for model awareness. The `experimental.session.compacting` hook builds resume snapshots when the conversation compacts. The `experimental.chat.system.transform` hook injects the routing block and prior-session snapshots at session start, enabling session continuity across restarts. The `chat.message` hook captures user prompts and decisions (UserPromptSubmit equivalent).
 
@@ -541,9 +521,56 @@ Full documentation: [`docs/adapters/openclaw.md`](docs/adapters/openclaw.md)
 <details>
 <summary><strong>Codex CLI</strong> — MCP + hooks</summary>
 
-**Prerequisites:** Node.js 18+, Codex CLI installed.
+**Prerequisites:** Node.js >= 22.5 (or Bun), Codex CLI installed.
 
 **Install:**
+
+1. Add the context-mode marketplace and install the plugin from Codex's plugin UI:
+
+   ```bash
+   codex plugin marketplace add mksglu/context-mode
+   ```
+
+2. Enable plugin-provided hooks while the Codex feature is still gated:
+
+   ```toml
+   [features]
+   plugin_hooks = true
+   hooks = true
+   ```
+
+   > **Feature flag note:** Current Codex builds expose hooks under `[features].hooks`
+   > (or `codex --enable hooks`). Prefer `[features].hooks`; `[features].codex_hooks`
+   > remains accepted as a legacy alias in current Codex builds. Bundled plugin hooks
+   > additionally require `plugin_hooks` until Codex enables plugin hooks by default.
+
+   **Custom storage location:** if Codex cannot write the adapter default storage directory, set
+   `CONTEXT_MODE_DIR` to an absolute writable root in the environment that launches Codex. Sessions
+   and stats use `<root>/sessions`; indexed content uses `<root>/content`.
+
+   ```bash
+   CONTEXT_MODE_DIR="$HOME/.codex-context-mode" codex
+   ```
+
+3. Restart Codex CLI and verify MCP with `ctx stats`.
+
+   `ctx stats` proves the plugin MCP server is installed and reachable; it does
+   not prove hooks are trusted or running.
+
+4. Review and trust the context-mode plugin hooks if Codex prompts for hook
+   approval. Plugin hooks are only active after both feature flags are enabled
+   and Codex has accepted the hook commands.
+
+The Codex plugin manifest provides MCP via `.codex-plugin/mcp.json`, skills via
+`skills/`, and bundled hooks via `.codex-plugin/hooks.json`. No manual
+`[mcp_servers.context-mode]` block or `$CODEX_HOME/hooks.json` is needed when
+`plugin_hooks` is enabled and the plugin hooks are trusted.
+
+> **Node/PATH note:** context-mode still needs `node` visible to the Codex process.
+> The plugin removes manual Codex config, but it does not vendor Node or inherit
+> login-shell PATH fixes automatically.
+
+**Manual fallback for Codex builds without `plugin_hooks`:**
 
 1. Install context-mode globally:
 
@@ -561,16 +588,12 @@ Full documentation: [`docs/adapters/openclaw.md`](docs/adapters/openclaw.md)
    command = "context-mode"
    ```
 
-   > **Feature flag note:** Current Codex builds expose hooks under `[features].hooks`
-   > (or `codex --enable hooks`). Prefer `[features].hooks`; `[features].codex_hooks`
-   > remains accepted as a legacy alias in current Codex builds.
-
-3. Add hooks for routing enforcement and session tracking. Create `$CODEX_HOME/hooks.json` (or `~/.codex/hooks.json` when `CODEX_HOME` is unset):
+3. Create `$CODEX_HOME/hooks.json` (or `~/.codex/hooks.json` when `CODEX_HOME` is unset):
 
    ```json
    {
      "hooks": {
-      "PreToolUse": [{ "matcher": "local_shell|shell|shell_command|exec_command|container.exec|functions\\.exec_command|Bash|Shell|apply_patch|functions\\.apply_patch|Edit|Write|grep_files|ctx_execute|ctx_execute_file|ctx_batch_execute|ctx_fetch_and_index|ctx_search|ctx_index|mcp__.*__ctx_execute|mcp__.*__ctx_execute_file|mcp__.*__ctx_batch_execute|mcp__.*__ctx_fetch_and_index|mcp__.*__ctx_search|mcp__.*__ctx_index|mcp__(?!.*context-mode)", "hooks": [{ "type": "command", "command": "context-mode hook codex pretooluse" }] }],
+      "PreToolUse": [{ "matcher": "local_shell|shell|shell_command|exec_command|Bash|Shell|apply_patch|Edit|Write|grep_files|ctx_execute|ctx_execute_file|ctx_batch_execute|ctx_fetch_and_index|ctx_search|ctx_index|mcp__", "hooks": [{ "type": "command", "command": "context-mode hook codex pretooluse" }] }],
        "PostToolUse": [{ "hooks": [{ "type": "command", "command": "context-mode hook codex posttooluse" }] }],
        "SessionStart": [{ "hooks": [{ "type": "command", "command": "context-mode hook codex sessionstart" }] }],
        "PreCompact": [{ "hooks": [{ "type": "command", "command": "context-mode hook codex precompact" }] }],
@@ -597,16 +620,16 @@ Full documentation: [`docs/adapters/openclaw.md`](docs/adapters/openclaw.md)
 
 5. Restart Codex CLI.
 
-**Verify:** Start a session and type `ctx stats`. Context-mode tools should appear and respond.
+**Verify:** Start a session and type `ctx stats` to verify MCP. To verify hook routing, confirm Codex lists/trusts the context-mode plugin hooks, then run a command that matches the routing rules.
 
-**Routing:** MCP tools work. Hook-based routing is active when `$CODEX_HOME/hooks.json` or `~/.codex/hooks.json` is configured. The `AGENTS.md` file provides routing instructions for model awareness.
+**Routing:** MCP tools work after plugin install. Plugin hook routing is active only when `hooks` and `plugin_hooks` are enabled and Codex trusts the plugin hook commands. Manual hook routing is active when `$CODEX_HOME/hooks.json` or `~/.codex/hooks.json` is configured. The `AGENTS.md` file provides routing instructions for model awareness.
 
 </details>
 
 <details>
 <summary><strong>Qwen Code</strong> — MCP + hooks (identical wire protocol to Claude Code)</summary>
 
-**Prerequisites:** Node.js 18+, Qwen Code installed (`npm install -g @qwen-code/qwen-code`).
+**Prerequisites:** Node.js >= 22.5 (or Bun), Qwen Code installed (`npm install -g @qwen-code/qwen-code`).
 
 1. Install context-mode:
 
@@ -660,7 +683,7 @@ Full documentation: [`docs/adapters/openclaw.md`](docs/adapters/openclaw.md)
 <details>
 <summary><strong>Antigravity</strong> — MCP-only, no hooks</summary>
 
-**Prerequisites:** Node.js 18+, Antigravity installed.
+**Prerequisites:** Node.js >= 22.5 (or Bun), Antigravity installed.
 
 **Install:**
 
@@ -701,7 +724,7 @@ Full configs: [`configs/antigravity/mcp_config.json`](configs/antigravity/mcp_co
 <details>
 <summary><strong>Kiro</strong> — hooks with steering file</summary>
 
-**Prerequisites:** Node.js 18+, Kiro with MCP enabled (Settings > search "MCP").
+**Prerequisites:** Node.js >= 22.5 (or Bun), Kiro with MCP enabled (Settings > search "MCP").
 
 **Install:**
 
@@ -759,7 +782,7 @@ Full configs: [`configs/kiro/mcp.json`](configs/kiro/mcp.json) | [`configs/kiro/
 <details>
 <summary><strong>Zed</strong> — MCP-only, no hooks</summary>
 
-**Prerequisites:** Node.js 18+, Zed installed.
+**Prerequisites:** Node.js >= 22.5 (or Bun), Zed installed.
 
 **Install:**
 
@@ -802,7 +825,7 @@ Full configs: [`configs/kiro/mcp.json`](configs/kiro/mcp.json) | [`configs/kiro/
 <details>
 <summary><strong>Pi Coding Agent</strong> — extension with full hook support</summary>
 
-**Prerequisites:** Node.js 18+, Pi Coding Agent installed.
+**Prerequisites:** Node.js >= 22.5 (or Bun), Pi Coding Agent installed.
 
 **Install:**
 
@@ -849,7 +872,7 @@ Full configs: [`configs/kiro/mcp.json`](configs/kiro/mcp.json) | [`configs/kiro/
 <details>
 <summary><strong>OMP (Oh My Pi)</strong> — plugin with full hook support</summary>
 
-**Prerequisites:** Node.js 18+, Oh My Pi installed.
+**Prerequisites:** Node.js >= 22.5 (or Bun), Oh My Pi installed.
 
 **Install — plugin path (recommended):**
 
@@ -924,7 +947,7 @@ Full configs: [`configs/omp/mcp.json`](configs/omp/mcp.json) | [`configs/omp/SYS
 
 Context Mode uses [better-sqlite3](https://github.com/WiseLibs/better-sqlite3) on Node.js, which ships prebuilt native binaries for most platforms. On glibc >= 2.31 systems (Ubuntu 20.04+, Debian 11+, Fedora 34+, macOS, Windows), `npm install` works without any build tools.
 
-**Linux + Node.js >= 22.13:** Context Mode automatically uses the built-in `node:sqlite` module instead of `better-sqlite3`. This eliminates the native addon entirely, avoiding [sporadic SIGSEGV crashes](https://github.com/nodejs/node/issues/62515) caused by V8's `madvise(MADV_DONTNEED)` corrupting the addon's `.got.plt` section on Linux. No configuration needed — detection is automatic. Falls back to `better-sqlite3` on older Node.js versions.
+**Linux + Node.js >= 22.5:** Context Mode automatically uses the built-in `node:sqlite` module instead of `better-sqlite3`. This eliminates the native addon entirely, avoiding [sporadic SIGSEGV crashes](https://github.com/nodejs/node/issues/62515) caused by V8's `madvise(MADV_DONTNEED)` corrupting the addon's `.got.plt` section on Linux. No configuration needed — detection is automatic. **Linux + Node < 22.5 is unsupported** ([#564](https://github.com/mksglu/context-mode/issues/564)) — `npm install` will fail with remediation instructions.
 
 **Bun users:** No native compilation needed. Context Mode automatically detects Bun and uses the built-in `bun:sqlite` module via a compatibility adapter. `better-sqlite3` and all its build dependencies are skipped entirely.
 
@@ -964,11 +987,11 @@ npm install -g context-mode
 | Tool | What it does | Context saved |
 |---|---|---|
 | `ctx_batch_execute` | Run multiple commands + search multiple queries in ONE call. Opt-in `concurrency: 1-8` for I/O-bound batches. | 986 KB → 62 KB |
-| `ctx_execute` | Run code in 11 languages. Only stdout enters context. | 56 KB → 299 B |
+| `ctx_execute` | Run code in 12 languages. Only stdout enters context. | 56 KB → 299 B |
 | `ctx_execute_file` | Process files in sandbox. Raw content never leaves. | 45 KB → 155 B |
 | `ctx_index` | Chunk markdown into FTS5 with BM25 ranking. | 60 KB → 40 B |
 | `ctx_search` | Query indexed content with multiple queries in one call. | On-demand retrieval |
-| `ctx_fetch_and_index` | Fetch URL, chunk and index. 24h TTL cache — repeat calls skip network. `force: true` to bypass. Pass `requests: [{url, source}, ...]` + `concurrency: 1-8` for parallel multi-URL. | 60 KB → 40 B |
+| `ctx_fetch_and_index` | Fetch URL, chunk and index. Cache reuses content within TTL (default 24h, override per-call with `ttl: <ms>`). `ttl: 0` or `force: true` to bypass. Pass `requests: [{url, source}, ...]` + `concurrency: 1-8` for parallel multi-URL. | 60 KB → 40 B |
 | `ctx_stats` | Show context savings, call counts, and session statistics. | — |
 | `ctx_doctor` | Diagnose installation: runtimes, hooks, FTS5, versions. | — |
 | `ctx_upgrade` | Upgrade to latest version from GitHub, rebuild, reconfigure hooks. | — |
@@ -978,7 +1001,7 @@ npm install -g context-mode
 
 Each `ctx_execute` call spawns an isolated subprocess with its own process boundary. Scripts can't access each other's memory or state. The subprocess runs your code, captures stdout, and only that stdout enters the conversation context. The raw data — log files, API responses, snapshots — never leaves the sandbox.
 
-Eleven language runtimes are available: JavaScript, TypeScript, Python, Shell, Ruby, Go, Rust, PHP, Perl, R, and Elixir. Bun is auto-detected for 3-5x faster JS/TS execution.
+Twelve language runtimes are available: JavaScript, TypeScript, Python, Shell, Ruby, Go, Rust, PHP, Perl, R, Elixir, and C#. Bun is auto-detected for 3-5x faster JS/TS execution.
 
 Authenticated CLIs work through credential passthrough — `gh`, `aws`, `gcloud`, `kubectl`, `docker` inherit environment variables and config paths without exposing them to the conversation.
 
@@ -986,7 +1009,7 @@ When output exceeds 5 KB and an `intent` is provided, Context Mode switches to i
 
 ## How the Knowledge Base Works
 
-The `ctx_index` tool chunks markdown content by headings while keeping code blocks intact, then stores them in a **SQLite FTS5** (Full-Text Search 5) virtual table. The SQLite backend is selected automatically at runtime: `bun:sqlite` on Bun, `node:sqlite` on Linux + Node.js >= 22.13, and `better-sqlite3` everywhere else. Search uses **BM25 ranking** — a probabilistic relevance algorithm that scores documents based on term frequency, inverse document frequency, and document length normalization. **Porter stemming** is applied at index time so "running", "runs", and "ran" match the same stem. Titles and headings are weighted **5x** in BM25 scoring for precise navigational queries.
+The `ctx_index` tool chunks markdown content by headings while keeping code blocks intact, then stores them in a **SQLite FTS5** (Full-Text Search 5) virtual table. The SQLite backend is selected automatically at runtime: `bun:sqlite` on Bun, `node:sqlite` on Node.js >= 22.5, and `better-sqlite3` everywhere else. Search uses **BM25 ranking** — a probabilistic relevance algorithm that scores documents based on term frequency, inverse document frequency, and document length normalization. **Porter stemming** is applied at index time so "running", "runs", and "ran" match the same stem. Titles and headings are weighted **5x** in BM25 scoring for precise navigational queries.
 
 When you call `ctx_search`, it returns relevant content snippets focused around matching query terms — not full documents, not approximations, the actual indexed content with smart extraction around what you're looking for. `ctx_fetch_and_index` extends this to URLs: fetch, convert HTML to markdown, chunk, index. The raw page never enters context. Use the `contentType` parameter to filter results by type (e.g. `code` or `prose`).
 
@@ -1013,11 +1036,12 @@ Search results use intelligent extraction instead of truncation. Instead of retu
 
 ### TTL Cache
 
-Indexed content persists in a per-project SQLite database at `~/.context-mode/content/`. When `ctx_fetch_and_index` is called for a URL that was already indexed within the last 24 hours, the fetch is skipped entirely. The model searches the existing index directly.
+Indexed content persists in a per-project SQLite database at `~/.context-mode/content/`. When `ctx_fetch_and_index` is called for a URL that was already indexed within its TTL window, the fetch is skipped entirely and the model searches the existing index directly.
 
-- **Fresh (<24h):** Returns a cache hint (0.3KB) instead of re-fetching (48KB+). Model proceeds to `ctx_search`.
-- **Stale (>24h):** Re-fetches silently. No user action needed.
-- **`force: true`:** Bypasses cache and re-fetches regardless of TTL.
+- **Default TTL:** 24 hours. Override per-call with `ttl: <milliseconds>` (PR #666). Longer for stable specs, shorter for changelogs you want re-checked often.
+- **Cache hit (within TTL):** Returns a cache hint (~0.3KB) instead of re-fetching (48KB+). Model proceeds to `ctx_search`.
+- **Cache miss (TTL expired):** Re-fetches silently. No user action needed.
+- **`ttl: 0`** or **`force: true`:** Bypasses cache and re-fetches regardless of freshness.
 - **14-day cleanup:** Content databases and sources older than 14 days are removed on startup.
 
 This means `--continue` sessions preserve indexed docs across restarts. No re-fetching, no wasted context tokens.
@@ -1157,6 +1181,7 @@ Detailed event data is also indexed into FTS5 for on-demand retrieval via `ctx_s
 **Kiro** — Partial coverage. Native `preToolUse` and `postToolUse` hooks capture tool events and enforce sandbox routing. `agentSpawn` (the Kiro equivalent of SessionStart) is not yet implemented, so session restore after compaction is not available. Requires manually copying `KIRO.md` to your project root. Auto-detected via MCP protocol handshake (`clientInfo.name`).
 
 **Pi Coding Agent** — High coverage. The extension registers all key lifecycle events: `tool_call` (PreToolUse), `tool_result` (PostToolUse), `session_start` (SessionStart), and `session_before_compact` (PreCompact). File edits, git ops, errors, and tasks are fully tracked. Session restore after compaction works via the extension's event hooks.
+Tool call output can be collapsed/expanded with the default Pi's default keybinding (Ctrl+O)
 
 **OMP (Oh My Pi)** — High coverage. The plugin (installed via `omp plugin install context-mode`) registers all key lifecycle events: `tool_call` (PreToolUse), `tool_result` (PostToolUse), `session_start` (SessionStart), and `session_before_compact` (PreCompact). Storage roots cleanly under `~/.omp/context-mode/` so OMP and Pi installs never share state (issue [#473](https://github.com/mksglu/context-mode/issues/473)). Auto-detected via `PI_CODING_AGENT_DIR` env var or presence of `~/.omp/`.
 
@@ -1166,7 +1191,7 @@ Detailed event data is also indexed into FTS5 for on-demand retrieval via `ctx_s
 
 | Feature | Claude Code | Qwen Code | Gemini CLI | VS Code Copilot | JetBrains Copilot | Cursor | OpenCode | KiloCode | OpenClaw | Codex CLI | Antigravity | Kiro | Zed | Pi | OMP |
 |---|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
-| MCP Server | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
+| MCP Server / Native Tools | Yes | Yes | Yes | Yes | Yes | Yes | Native plugin | Native plugin | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
 | PreToolUse Hook | Yes | Yes | Yes | Yes | Yes | Yes | Plugin | Plugin | Plugin | Yes | -- | Yes | -- | Yes (extension) | Plugin |
 | PostToolUse Hook | Yes | Yes | Yes | Yes | Yes | Yes | Plugin | Plugin | Plugin | Yes | -- | Yes | -- | Yes (extension) | Plugin |
 | SessionStart Hook | Yes | Yes | Yes | Yes | Yes | -- | ✓ (via experimental.chat.system.transform) | ✓ (via experimental.chat.system.transform) | Plugin | Yes | -- | -- | -- | Yes (extension) | Plugin |
@@ -1359,7 +1384,19 @@ export CTX_FETCH_STRICT=1
 
 That blocks loopback + RFC1918 + ULA in addition to the always-blocked ranges. Useful when context-mode runs as a shared service, not on a developer's own machine.
 
-`tool_input` for any `mcp__*` tool call is also redacted before persistence — keys matching `authorization`, `token`, `secret`, `password`, `api_key`, `cookie`, `signature`, `private_key` get masked to `[REDACTED]` so credentials in MCP arguments don't end up in the session DB.
+`tool_input` for any `mcp__*` tool call is also redacted before persistence — the regex matcher in `hooks/posttooluse.mjs` masks `authorization`, `auth_token`, `access_token`, `refresh_token`, `bearer`, `token`, `secret`, `password`, `passwd`, `pwd`, `api_key` / `apikey` / `x_api_key`, `cookie` / `set-cookie`, `signature`, `private_key`, and `client_secret` (case-insensitive, hyphen/underscore-insensitive) to `[REDACTED]` so credentials in MCP arguments don't end up in the session DB.
+
+### Storage environment variables
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `CONTEXT_MODE_DIR` | Adapter default, for example `~/.codex/context-mode` or `~/.claude/context-mode` | Since v1.0.147. Absolute writable root for context-mode storage. Sessions and stats use `<root>/sessions`; indexed content uses `<root>/content`. Empty or whitespace-only values are treated as unset and shown by `ctx_doctor`; non-empty values must be absolute. `~` is not expanded. |
+
+### Routing-guidance environment variables
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `CONTEXT_MODE_EXTERNAL_MCP_NUDGE_EVERY` | `10` | Cadence (in tool calls) at which the PreToolUse hook re-injects the "wrap large external-MCP payloads in `ctx_execute`" guidance. The original implementation ([#529](https://github.com/mksglu/context-mode/pull/529)) fired only once per session, which got lost after context compaction in MCP-heavy sessions (e.g. 50+ Jira/Slack/Notion calls — see [#567](https://github.com/mksglu/context-mode/issues/567) follow-up). The default re-fires every 10th matching call, keeping the guidance in the model's recent window. Range `[1, 100]`; invalid values fall back to `10`. Set to `1` for "every call" (most aggressive — adds ~250 tokens/call) or to a larger value for less frequent reminders. |
 
 ## Contributing
 

@@ -15,6 +15,7 @@ import { readFileSync, readdirSync, unlinkSync, existsSync, statSync, openSync, 
 import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { walkDirectoryDetailed, type WalkOptions } from "./store-directory.js";
 
 // ─────────────────────────────────────────────────────────
 // Types
@@ -588,7 +589,7 @@ export class ContentStore {
         highlight(chunks, 1, char(2), char(3)) AS highlighted
       FROM chunks
       JOIN sources ON sources.id = chunks.source_id
-      WHERE chunks MATCH ? AND sources.label LIKE ?
+      WHERE chunks MATCH ? AND sources.label LIKE ? ESCAPE '\\'
       ORDER BY rank
       LIMIT ?
     `);
@@ -633,7 +634,7 @@ export class ContentStore {
         highlight(chunks_trigram, 1, char(2), char(3)) AS highlighted
       FROM chunks_trigram
       JOIN sources ON sources.id = chunks_trigram.source_id
-      WHERE chunks_trigram MATCH ? AND sources.label LIKE ?
+      WHERE chunks_trigram MATCH ? AND sources.label LIKE ? ESCAPE '\\'
       ORDER BY rank
       LIMIT ?
     `);
@@ -680,7 +681,7 @@ export class ContentStore {
         highlight(chunks, 1, char(2), char(3)) AS highlighted
       FROM chunks
       JOIN sources ON sources.id = chunks.source_id
-      WHERE chunks MATCH ? AND sources.label LIKE ? AND chunks.content_type = ?
+      WHERE chunks MATCH ? AND sources.label LIKE ? ESCAPE '\\' AND chunks.content_type = ?
       ORDER BY rank
       LIMIT ?
     `);
@@ -725,7 +726,7 @@ export class ContentStore {
         highlight(chunks_trigram, 1, char(2), char(3)) AS highlighted
       FROM chunks_trigram
       JOIN sources ON sources.id = chunks_trigram.source_id
-      WHERE chunks_trigram MATCH ? AND sources.label LIKE ? AND chunks_trigram.content_type = ?
+      WHERE chunks_trigram MATCH ? AND sources.label LIKE ? ESCAPE '\\' AND chunks_trigram.content_type = ?
       ORDER BY rank
       LIMIT ?
     `);
@@ -807,8 +808,14 @@ export class ContentStore {
     content?: string;
     path?: string;
     source?: string;
+    /**
+     * Optional FK metadata recorded on each indexed chunk so per-session
+     * honest-savings stats can join chunks → session_events. When omitted,
+     * chunks fall back to empty-string columns (legacy behaviour).
+     */
+    attribution?: { sessionId?: string; eventId?: string };
   }): IndexResult {
-    const { content, path, source } = options;
+    const { content, path, source, attribution } = options;
 
     // Treat empty string as "no content" so an empty `content` paired with a
     // valid `path` falls back to reading the file. Some MCP clients
@@ -851,7 +858,71 @@ export class ContentStore {
     const filePath = path ?? undefined;
     const contentHash = filePath ? createHash("sha256").update(text).digest("hex") : undefined;
 
-    return withRetry(() => this.#insertChunks(chunks, label, text, filePath, contentHash));
+    return withRetry(() => this.#insertChunks(chunks, label, text, filePath, contentHash, attribution));
+  }
+
+  // ── Index Directory (#687) ──
+
+  /**
+   * Index every file under a directory by walking it with `walkDirectory` and
+   * delegating each discovered file to `this.index({ path })`. The per-file
+   * `openSync + fstatSync.isFile()` security gate at line ~845 stays active
+   * for every file — directory support never bypasses the TOCTOU defense
+   * from #442 round-3.
+   *
+   * Reported by @matiasduartee in #687.
+   */
+  indexDirectory(opts: {
+    path: string;
+    source?: string;
+    attribution?: { sessionId?: string; eventId?: string };
+    /** Optional per-file deny check — runs INSIDE the walk loop so a denied
+     *  file does not even open a fd. Returns true to deny. */
+    perFileDeny?: (absPath: string) => boolean;
+  } & WalkOptions): {
+    filesIndexed: number;
+    totalChunks: number;
+    capped: boolean;
+    totalSeen: number;
+    denied: number;
+    failed: number;
+    label: string;
+  } {
+    const { path: rootPath, source, attribution, perFileDeny, ...walkOpts } = opts;
+    const walked = walkDirectoryDetailed(rootPath, walkOpts);
+
+    let filesIndexed = 0;
+    let totalChunks = 0;
+    let denied = 0;
+    let failed = 0;
+
+    for (const file of walked.files) {
+      if (perFileDeny && perFileDeny(file)) {
+        denied++;
+        continue;
+      }
+      try {
+        // Per-file source label so ctx_search(source: "<file>") still works.
+        const fileSource = source ? `${source}:${file}` : file;
+        const r = this.index({ path: file, source: fileSource, attribution });
+        filesIndexed++;
+        totalChunks += r.totalChunks;
+      } catch {
+        // Per-file failure (e.g. fd-bound fstat rejection of a non-regular
+        // file that races between walk and read) — count + continue.
+        failed++;
+      }
+    }
+
+    return {
+      filesIndexed,
+      totalChunks,
+      capped: walked.capped,
+      totalSeen: walked.totalSeen,
+      denied,
+      failed,
+      label: source ?? rootPath,
+    };
   }
 
   // ── Index Plain Text ──
@@ -865,9 +936,10 @@ export class ContentStore {
     content: string,
     source: string,
     linesPerChunk: number = 20,
+    attribution?: { sessionId?: string; eventId?: string },
   ): IndexResult {
     if (!content || content.trim().length === 0) {
-      return this.#insertChunks([], source, "");
+      return this.#insertChunks([], source, "", undefined, undefined, attribution);
     }
 
     const chunks = this.#chunkPlainText(content, linesPerChunk);
@@ -876,6 +948,9 @@ export class ContentStore {
       chunks.map((c) => ({ ...c, hasCode: false })),
       source,
       content,
+      undefined,
+      undefined,
+      attribution,
     ));
   }
 
@@ -892,26 +967,27 @@ export class ContentStore {
     content: string,
     source: string,
     maxChunkBytes: number = MAX_CHUNK_BYTES,
+    attribution?: { sessionId?: string; eventId?: string },
   ): IndexResult {
     if (!content || content.trim().length === 0) {
-      return this.indexPlainText("", source);
+      return this.indexPlainText("", source, undefined, attribution);
     }
 
     let parsed: unknown;
     try {
       parsed = JSON.parse(content);
     } catch {
-      return this.indexPlainText(content, source);
+      return this.indexPlainText(content, source, undefined, attribution);
     }
 
     const chunks: Chunk[] = [];
     this.#walkJSON(parsed, [], chunks, maxChunkBytes);
 
     if (chunks.length === 0) {
-      return this.indexPlainText(content, source);
+      return this.indexPlainText(content, source, undefined, attribution);
     }
 
-    return withRetry(() => this.#insertChunks(chunks, source, content));
+    return withRetry(() => this.#insertChunks(chunks, source, content, undefined, undefined, attribution));
   }
 
   // ── Shared DB Insertion ──
@@ -921,8 +997,19 @@ export class ContentStore {
    * into both FTS5 tables within a transaction and extracts vocabulary.
    * Uses cached prepared statements from #prepareStatements().
    */
-  #insertChunks(chunks: Chunk[], label: string, text: string, filePath?: string, contentHash?: string): IndexResult {
+  #insertChunks(
+    chunks: Chunk[],
+    label: string,
+    text: string,
+    filePath?: string,
+    contentHash?: string,
+    attribution?: { sessionId?: string; eventId?: string },
+  ): IndexResult {
     const codeChunks = chunks.filter((c) => c.hasCode).length;
+    // FK columns on chunks. Empty-string fallback preserves the FTS5-friendly
+    // "not-null but unattributed" sentinel used by legacy rows.
+    const sessionIdCol = attribution?.sessionId ?? "";
+    const eventIdCol = attribution?.eventId ?? "";
 
     // Atomic dedup + insert: delete previous source with same label,
     // then insert new content — all within a single transaction.
@@ -943,8 +1030,8 @@ export class ContentStore {
       const now = new Date().toISOString();
       for (const chunk of chunks) {
         const ct = chunk.hasCode ? "code" : "prose";
-        this.#stmtInsertChunk.run(chunk.title, chunk.content, sourceId, ct, null, null, null, now);
-        this.#stmtInsertChunkTrigram.run(chunk.title, chunk.content, sourceId, ct, null, null, null, now);
+        this.#stmtInsertChunk.run(chunk.title, chunk.content, sourceId, ct, null, sessionIdCol, eventIdCol, now);
+        this.#stmtInsertChunkTrigram.run(chunk.title, chunk.content, sourceId, ct, null, sessionIdCol, eventIdCol, now);
       }
 
       return sourceId;
@@ -985,7 +1072,18 @@ export class ContentStore {
   }
 
   #sourceFilterParam(source: string, sourceMatchMode: SourceMatchMode): string {
-    return sourceMatchMode === "exact" ? source : `%${source}%`;
+    if (sourceMatchMode === "exact") return source;
+    // Escape SQLite LIKE metacharacters so user-supplied source labels
+    // containing `_`, `%`, or `\` are matched literally rather than as
+    // wildcards. Backslash must be replaced first (otherwise subsequent
+    // escapes would themselves be re-escaped). Paired with `ESCAPE '\'`
+    // in the four prepared LIKE statements (#stmtSearchPorter*,
+    // #stmtSearchTrigram*). Regression: #646.
+    const escaped = source
+      .replace(/\\/g, "\\\\")
+      .replace(/%/g, "\\%")
+      .replace(/_/g, "\\_");
+    return `%${escaped}%`;
   }
 
   search(

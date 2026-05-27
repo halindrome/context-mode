@@ -17,7 +17,7 @@
  * @see https://github.com/anthropics/claude-code/issues/46915
  */
 
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync, readdirSync, unlinkSync, statSync } from "node:fs";
 import { resolve, sep } from "node:path";
 
 /**
@@ -393,4 +393,185 @@ export function healMcpJsonArgs({ pluginRoot, pluginCacheRoot, pluginKey }) {
   }
 
   return { healed };
+}
+
+/**
+ * Heal user-level ~/.claude.json MCP server registrations that point to an
+ * old context-mode version dir in the plugin cache.
+ *
+ * Users who work around the Claude Code plugin MCP tool-exposure bug
+ * (anthropics/claude-code#59310) by running `claude mcp add --scope user`
+ * end up with an absolute path to a specific version dir in ~/.claude.json.
+ * After /ctx-upgrade that path is stale — this heal detects and updates it.
+ *
+ * @param {{
+ *   dotClaudeJsonPath: string,
+ *   pluginCacheParent: string,
+ *   newPluginRoot: string,
+ * }} opts
+ * @returns {HealResult}
+ */
+export function healClaudeJsonMcpArgs({ dotClaudeJsonPath, pluginCacheParent, newPluginRoot }) {
+  if (!dotClaudeJsonPath || !existsSync(dotClaudeJsonPath)) {
+    return { healed: [], skipped: "no-claude-json" };
+  }
+
+  let raw;
+  try { raw = readFileSync(dotClaudeJsonPath, "utf-8"); }
+  catch (err) { return { healed: [], error: `read-failed: ${(err && err.message) || err}` }; }
+
+  let config;
+  try { config = JSON.parse(raw); }
+  catch (err) { return { healed: [], error: `parse-failed: ${(err && err.message) || err}` }; }
+
+  const servers = config && config.mcpServers;
+  if (!servers || typeof servers !== "object") {
+    return { healed: [], skipped: "no-mcp-servers" };
+  }
+
+  const cacheParentFwd = pluginCacheParent.replace(/\\/g, "/");
+
+  let mutated = false;
+  for (const srv of Object.values(servers)) {
+    if (!srv || typeof srv !== "object" || !Array.isArray(srv.args)) continue;
+    for (let i = 0; i < srv.args.length; i++) {
+      const arg = srv.args[i];
+      if (typeof arg !== "string") continue;
+      const argFwd = arg.replace(/\\/g, "/");
+      if (!argFwd.startsWith(cacheParentFwd + "/")) continue;
+      const rel = argFwd.slice(cacheParentFwd.length + 1);
+      const slashIdx = rel.indexOf("/");
+      if (slashIdx < 0) continue;
+      const suffix = rel.slice(slashIdx + 1);
+      const newArg = resolve(newPluginRoot, suffix);
+      if (newArg !== arg) {
+        srv.args[i] = newArg;
+        mutated = true;
+      }
+    }
+  }
+
+  if (!mutated) return { healed: [] };
+
+  try {
+    writeFileSync(dotClaudeJsonPath, JSON.stringify(config, null, 2), "utf-8");
+  } catch (err) {
+    return { healed: [], error: `write-failed: ${(err && err.message) || err}` };
+  }
+
+  return { healed: ["claude-json-mcp-args"] };
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Issue #609 — sweepStaleMcpJson: remove cache-baked `.mcp.json` files.
+//
+// Background (per ISSUE-609-VERDICT, ISSUE-604-VERDICT):
+//   cli.ts upgrade() wrote `.mcp.json` into every per-version plugin-cache
+//   dir starting with #411. PR #531 (commit 9261377) removed `.mcp.json`
+//   from `package.json files[]` so the npm tarball no longer ships it,
+//   but the cli-side write persisted. Every `/ctx-upgrade` re-baked a
+//   per-version copy. When Claude Code's native plugin manager auto-update
+//   later copies a previous version's `.mcp.json` forward into a fresh
+//   version dir, the stale start.mjs absolute path goes with it →
+//   MODULE_NOT_FOUND on every MCP boot, and `ctx-doctor` stays green
+//   because nothing validates that path against current pluginRoot.
+//
+// The architectural fix is to STOP writing `.mcp.json` from the cache layer
+// entirely. `.claude-plugin/plugin.json.mcpServers` is the canonical source
+// (refs/platforms/claude-code/src/utils/plugins/mcpPluginIntegration.ts:131-212
+// — Claude Code reads it first). This sweep removes any pre-existing
+// `.mcp.json` from every per-version cache dir so the previous-version-
+// carry vector cannot replay across upgrades.
+//
+// Single source of truth shared by:
+//   - `start.mjs` HEAL 5c (every MCP boot)
+//   - `scripts/postinstall.mjs` (every `npm install -g context-mode`)
+//   - `src/cli.ts` upgrade() (post-bump)
+//
+// Safety contracts:
+//   - Path-traversal guard: refuses to walk outside `pluginCacheRoot`.
+//   - Best-effort: NEVER throws; missing files / unreadable dirs are
+//     skipped silently and reported in the result.
+//   - Scope: deletes ONLY files named exactly `.mcp.json`; never touches
+//     sibling files in the same dir.
+// ─────────────────────────────────────────────────────────────────────────
+
+/**
+ * @typedef {Object} SweepResult
+ * @property {string[]} removed - absolute paths of removed `.mcp.json` files
+ * @property {string} [skipped] - reason if no work performed (e.g. "no-cache-root")
+ */
+
+/**
+ * Remove every `.mcp.json` from per-version directories under
+ * `<pluginCacheRoot>/<owner>/<plugin>/<X.Y.Z>/`.
+ *
+ * @param {{ pluginCacheRoot: string, pluginKey: string }} opts
+ *   pluginKey is the "<owner>@<plugin>" form (e.g. "context-mode@context-mode").
+ * @returns {SweepResult}
+ */
+export function sweepStaleMcpJson({ pluginCacheRoot, pluginKey }) {
+  /** @type {string[]} */
+  const removed = [];
+
+  if (!pluginCacheRoot || !pluginKey) {
+    return { removed, skipped: "missing-args" };
+  }
+
+  const resolvedCacheRoot = resolve(pluginCacheRoot);
+  if (!existsSync(resolvedCacheRoot)) {
+    return { removed, skipped: "no-cache-root" };
+  }
+
+  // pluginKey shape: "<owner>@<plugin>"
+  const [ownerSegment, pluginSegment] = pluginKey.split("@");
+  if (!ownerSegment || !pluginSegment) {
+    return { removed, skipped: "bad-plugin-key" };
+  }
+
+  // Path-traversal guard: refuse to walk outside the declared cache root,
+  // even if pluginKey contains `..` segments. Per Mert's standing Windows
+  // safety rule, resolve normalizes both `/` and `\` so the guard fires
+  // on either separator.
+  const ownerDir = resolve(resolvedCacheRoot, ownerSegment, pluginSegment);
+  const cacheRootWithSep = resolvedCacheRoot + sep;
+  if (!ownerDir.startsWith(cacheRootWithSep)) {
+    return { removed, skipped: "outside-cache-root" };
+  }
+
+  if (!existsSync(ownerDir)) {
+    return { removed, skipped: "no-plugin-dir" };
+  }
+
+  /** @type {string[]} */
+  let versionEntries = [];
+  try {
+    versionEntries = readdirSync(ownerDir);
+  } catch {
+    return { removed, skipped: "readdir-failed" };
+  }
+
+  for (const versionEntry of versionEntries) {
+    const versionDir = resolve(ownerDir, versionEntry);
+    // Per-version guard: only enter directories whose resolved path stays
+    // under the owner dir. Belt-and-braces against weird FS entries.
+    if (!versionDir.startsWith(ownerDir + sep)) continue;
+    try {
+      const stat = statSync(versionDir);
+      if (!stat.isDirectory()) continue;
+    } catch {
+      continue;
+    }
+    const mcpJsonPath = resolve(versionDir, ".mcp.json");
+    if (!existsSync(mcpJsonPath)) continue;
+    try {
+      unlinkSync(mcpJsonPath);
+      removed.push(mcpJsonPath);
+    } catch {
+      // best-effort: file may have been removed by a concurrent process
+      // between existsSync and unlinkSync. Silent skip.
+    }
+  }
+
+  return { removed };
 }

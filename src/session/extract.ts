@@ -18,6 +18,13 @@ export interface SessionEvent {
   data: string;
   /** 1=critical (rules, files, tasks) … 5=low */
   priority: number;
+  /**
+   * Optional — bytes context-mode prevented from entering the model context
+   * window for this event. Currently populated by external_ref when a
+   * ctx_fetch_and_index tool_response carries the
+   * `Fetched and indexed N sections (XKB)` preamble.
+   */
+  bytes_avoided?: number;
 }
 
 export interface ToolCall {
@@ -55,6 +62,24 @@ function safeStringAny(value: unknown): string {
 
 function isToolError(input: HookInput): boolean {
   const response = String(input.tool_response ?? "");
+  // PreToolUse rewrites curl/wget/inline-HTTP/WebFetch commands into
+  //   echo "context-mode: <guidance text including 'retry', 'fails', 'error'>"
+  // The user-facing copy legitimately mentions failure modes ("retry if it
+  // fails with a transient DNS error"), but those words must NOT classify
+  // our OWN guidance message as a tool error or it gets captured into
+  // session_resume and surfaces as a fake error in the next chat.
+  // We check BOTH sides because:
+  //   - real shell run → response starts with `context-mode:` (echo stdout)
+  //   - test/captured-output path → response is the raw command itself
+  //     (`echo "context-mode: …"`), so we also match the command shape
+  const command = String(input.tool_input?.command ?? "");
+  if (
+    response.startsWith("context-mode:") ||
+    command.startsWith('echo "context-mode:') ||
+    command.startsWith("echo 'context-mode:")
+  ) {
+    return false;
+  }
   const isErrorFlag = input.tool_output?.isError === true || input.tool_output?.is_error === true;
   const isBashError =
     input.tool_name === "Bash" &&
@@ -706,7 +731,44 @@ function extractDecision(input: HookInput): SessionEvent[] {
     ? String((questions[0] as Record<string, unknown>)["question"] ?? "")
     : "";
 
-  const answer = safeString(String(input.tool_response ?? ""));
+  // tool_response is a JSON string that echoes the full request payload
+  // alongside the answers map: {"questions":[...],"answers":{"<q>":"<label>"}}.
+  // Stringifying the raw blob leaks the echoed questions/options into the
+  // event row and surfaces as "Unhandled case: [object Object]" downstream.
+  const rawResponse = String(input.tool_response ?? "");
+  let answerText = "";
+  try {
+    const parsed = JSON.parse(rawResponse) as { answers?: Record<string, unknown> };
+    const answers = parsed?.answers;
+    if (answers && typeof answers === "object") {
+      // multiSelect: true answers arrive as string[]; single-select arrive as
+      // string. Normalize both into a `" | "`-joined string so neither shape
+      // silently produces an empty answer.
+      const toAnswerText = (value: unknown): string => {
+        if (typeof value === "string") return value;
+        if (Array.isArray(value)) {
+          return value.filter((v): v is string => typeof v === "string").join(" | ");
+        }
+        return "";
+      };
+
+      const matched = questionText ? toAnswerText(answers[questionText]) : "";
+      if (matched) {
+        answerText = matched;
+      } else {
+        const values = Object.values(answers)
+          .map(toAnswerText)
+          .filter((v) => v.length > 0);
+        answerText = values.join(" | ");
+      }
+    }
+  } catch {
+    // Non-JSON tool_response — fail safe with empty answer rather than
+    // leaking the raw text (which would re-introduce the original bug
+    // for any future caller that sends a non-JSON payload).
+  }
+
+  const answer = safeString(answerText);
   const summary = questionText
     ? `Q: ${safeString(questionText)} → A: ${answer}`
     : `answer: ${answer}`;
@@ -778,12 +840,30 @@ function extractExternalRef(input: HookInput): SessionEvent[] {
 
   if (refs.size === 0) return [];
 
-  return [{
+  // ctx_fetch_and_index returns a preamble like
+  //   "Fetched and indexed **5 sections** (47.50KB) from: <label>"
+  // Parse the size to credit bytes_avoided on the event so per-session
+  // honest-savings stats reflect what was kept out of the context window.
+  // KB literal in the preamble is decimal (KB = 1024 bytes per the formatter).
+  let bytesAvoided: number | undefined;
+  const preambleMatch = safeString(input.tool_response).match(
+    /Fetched and indexed[^\(]*\(([\d.]+)\s*KB\)/i,
+  );
+  if (preambleMatch) {
+    const kb = Number(preambleMatch[1]);
+    if (Number.isFinite(kb) && kb > 0) {
+      bytesAvoided = Math.round(kb * 1024);
+    }
+  }
+
+  const event: SessionEvent = {
     type: "external_ref",
     category: "external-ref",
     data: safeString(Array.from(refs).join(", ")),
     priority: 3,
-  }];
+  };
+  if (bytesAvoided !== undefined) event.bytes_avoided = bytesAvoided;
+  return [event];
 }
 
 /**

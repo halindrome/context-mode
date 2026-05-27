@@ -14,10 +14,68 @@ import { dirname, resolve, join, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { homedir } from "node:os";
 import { healBetterSqlite3Binding } from "./heal-better-sqlite3.mjs";
-import { healInstalledPlugins, healSettingsEnabledPlugins, healPluginJsonMcpServers, healMcpJsonArgs } from "./heal-installed-plugins.mjs";
+import { healInstalledPlugins, healSettingsEnabledPlugins, healPluginJsonMcpServers, sweepStaleMcpJson } from "./heal-installed-plugins.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const pkgRoot = resolve(__dirname, "..");
+
+// ── -2. Issue #564 — Linux SIGSEGV class hard-fail (v1.0.132) ────────
+// On Linux + Node < 22.5 + no Bun, better-sqlite3's native addon is
+// vulnerable to V8 calling `madvise(MADV_DONTNEED)` on memory ranges
+// that overlap the addon's `.got.plt` section, corrupting resolved
+// symbol addresses and causing sporadic SIGSEGV (1-4/hour) — see
+// https://github.com/nodejs/node/issues/62515 and our internal #564.
+//
+// node:sqlite (built-in, no native addon, no .got.plt to corrupt) ships
+// from Node 22.5 onward — that is the contract `hasModernSqlite()` in
+// src/db-base.ts encodes. Six prior fixes (#228, #331, #461, #540,
+// #551, #556) silently assumed users had Node >= 22.5 on Linux; #564
+// is the second confirmed report (after #556) of the same SIGSEGV
+// class on Node 20.
+//
+// The architect mandate for v1.0.132 is HARD-FAIL, not warn-then-
+// degrade. `engines.node >= 22.5.0` in package.json is cosmetic under
+// the default npm `engine-strict=false`, so the contract has to be
+// enforced HERE — preinstall/postinstall is the only place that can
+// `process.exit(1)` across npm/pnpm/yarn.
+//
+// Linux + Bun is allowed through (bun:sqlite sidesteps better-sqlite3
+// entirely). Non-Linux platforms are unaffected by the madvise bug
+// and pass through unchanged.
+{
+  const isLinux = process.platform === "linux";
+  const hasBun =
+    typeof globalThis.Bun !== "undefined" ||
+    typeof process.versions.bun === "string";
+  const [majStr, minStr] = (process.versions.node ?? "0.0.0").split(".");
+  const major = Number(majStr);
+  const minor = Number(minStr);
+  const hasModernNode =
+    Number.isFinite(major) &&
+    Number.isFinite(minor) &&
+    (major > 22 || (major === 22 && minor >= 5));
+  if (isLinux && !hasBun && !hasModernNode) {
+    process.stderr.write(
+      "\n" +
+      "context-mode: install aborted\n" +
+      "  Linux + Node " + (process.versions.node ?? "?") + " is unsupported.\n" +
+      "  context-mode requires Node.js >= 22.5 (or Bun) on Linux to avoid the\n" +
+      "  V8 madvise(MADV_DONTNEED) SIGSEGV affecting better-sqlite3 (1-4/hour).\n" +
+      "  Tracking: https://github.com/nodejs/node/issues/62515\n" +
+      "           https://github.com/mksglu/context-mode/issues/564\n" +
+      "\n" +
+      "  Fix: upgrade Node (recommended)\n" +
+      "    nvm install 22.5 && nvm use 22.5\n" +
+      "    npm install -g context-mode\n" +
+      "\n" +
+      "  Or: run under Bun\n" +
+      "    curl -fsSL https://bun.sh/install | bash\n" +
+      "    bun add -g context-mode\n" +
+      "\n",
+    );
+    process.exit(1);
+  }
+}
 
 /**
  * True when running as a real `npm install -g context-mode`. We use this
@@ -123,26 +181,24 @@ if (isGlobalInstall()) {
               healedAny = true;
             }
           } catch { /* per-entry best effort */ }
-          // v1.0.122 — Issue #531 — Layer 6: asymmetric-heal sibling for
-          // .mcp.json. The #253/aea633c regression shipped a bare `./start.mjs`
-          // arg that Claude Code resolves against session CWD (not pluginRoot)
-          // → MODULE_NOT_FOUND on every ctx_* tool. When MCP is dead, the
-          // only escape hatch is `npm install -g context-mode` whose
-          // postinstall MUST run this heal too.
-          try {
-            const r = healMcpJsonArgs({
-              pluginRoot: installPath,
-              pluginCacheRoot: cacheRoot,
-              pluginKey: "context-mode@context-mode",
-            });
-            if (r && Array.isArray(r.healed) && r.healed.length > 0) {
-              healedAny = true;
-            }
-          } catch { /* per-entry best effort */ }
         }
       }
+      // Issue #609 — Layer 6: sweep stale `.mcp.json` files from every
+      // per-version cache dir. Replaces the previous per-entry healMcpJsonArgs
+      // loop (v1.0.122) — `.mcp.json` is no longer written from cli.ts so
+      // remaining files in the cache are stale carry-forwards that block
+      // future auto-updates from working cleanly. Single sweep per install.
+      try {
+        const sweepResult = sweepStaleMcpJson({
+          pluginCacheRoot: cacheRoot,
+          pluginKey: "context-mode@context-mode",
+        });
+        if (sweepResult && Array.isArray(sweepResult.removed) && sweepResult.removed.length > 0) {
+          process.stderr.write(`context-mode: swept ${sweepResult.removed.length} stale .mcp.json file(s) (Issue #609)\n`);
+        }
+      } catch { /* never block install */ }
       if (healedAny) {
-        process.stderr.write("context-mode: healed mcpServers args (Issues #523 + #531)\n");
+        process.stderr.write("context-mode: healed mcpServers args (Issue #523)\n");
       }
     }
   } catch { /* never block install */ }
@@ -288,15 +344,25 @@ try { healBetterSqlite3Binding(pkgRoot); } catch { /* best effort — don't bloc
 // here too closes the gap for the very first hook fire after a fresh install
 // (before any MCP server has run).
 //
-// Guard: /ctx-upgrade clones the repo to `<tmpdir>/context-mode-upgrade-<epoch>/`
+// Guard 1: only run on REAL `npm install -g context-mode`. A contributor's
+// `npm install` from a git clone (or CI checkout) must NOT mutate the
+// source-tracked `.claude-plugin/plugin.json` — doing so substitutes the
+// literal `${CLAUDE_PLUGIN_ROOT}` with an absolute path and trips
+// `scripts/assert-asymmetric-drift.mjs` (Issue #531) in the build chain.
+// Reuses `isGlobalInstall()` (section -1 already gates that way); the
+// `.git` walk inside it is what keeps contributor / CI installs untouched.
+//
+// Guard 2: /ctx-upgrade clones the repo to `<tmpdir>/context-mode-upgrade-<epoch>/`
 // and runs `npm install` there before `cpSync`-ing files into the real pluginRoot
-// (src/cli.ts). If we normalize here, pkgRoot is the tmpdir → hooks.json gets
-// the tmpdir's absolute paths baked in → cpSync copies that poisoned hooks.json
-// into the real plugin dir → tmpdir is later cleaned → every hook fires with
-// `MODULE_NOT_FOUND`. Detect the upgrade staging path and skip; start.mjs will
-// normalize correctly on the next MCP boot from the real pluginRoot.
+// (src/cli.ts). The tmpdir has no `.git`, so `isGlobalInstall()` returns
+// true there — we need this second check to skip the staging dir. Without
+// it, pkgRoot is the tmpdir → hooks.json gets the tmpdir's absolute paths
+// baked in → cpSync copies that poisoned hooks.json into the real plugin
+// dir → tmpdir is later cleaned → every hook fires with MODULE_NOT_FOUND.
+// start.mjs normalizes correctly on the next MCP boot from the real
+// pluginRoot anyway.
 const TMPDIR_UPGRADE_RE = /[/\\]context-mode-upgrade-\d+[/\\]?$/;
-if (!TMPDIR_UPGRADE_RE.test(pkgRoot)) {
+if (isGlobalInstall() && !TMPDIR_UPGRADE_RE.test(pkgRoot)) {
   try {
     const { normalizeHooksOnStartup } = await import("../hooks/normalize-hooks.mjs");
     normalizeHooksOnStartup({

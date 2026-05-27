@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { execSync } from "node:child_process";
+import { execSync, spawn } from "node:child_process";
 import { existsSync, chmodSync, readFileSync, writeFileSync, readdirSync, symlinkSync, mkdirSync, lstatSync, unlinkSync } from "node:fs";
 import { dirname, resolve, join, sep } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -8,6 +8,24 @@ import { homedir } from "node:os";
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const originalCwd = process.cwd();
 process.chdir(__dirname);
+
+// Resolve the Claude Code config dir, honoring $CLAUDE_CONFIG_DIR (incl. leading ~).
+// Mirrors hooks/session-helpers.mjs::resolveConfigDir and hooks/run-hook.mjs (#453).
+// Inlined here because start.mjs runs before any other module loads — we cannot
+// dynamic-import session-helpers without circularity through the bundle path.
+// Fix for #577: cache-heal layer below was hardcoding ~/.claude regardless of
+// the env var, silently no-op'ing for users with a non-default config dir AND
+// creating an unwanted ~/.claude/ directory on disk.
+function resolveClaudeConfigDir() {
+  const envVal = process.env.CLAUDE_CONFIG_DIR;
+  if (envVal && envVal.trim() !== "") {
+    if (envVal.startsWith("~")) {
+      return resolve(homedir(), envVal.replace(/^~[/\\]?/, ""));
+    }
+    return resolve(envVal);
+  }
+  return resolve(homedir(), ".claude");
+}
 
 // Plugin-install-path guard (mirror of src/util/project-dir.ts isPluginInstallPath
 // — duplicated here because start.mjs ships as raw JS and cannot import TS).
@@ -41,6 +59,39 @@ if (!process.env.CONTEXT_MODE_PROJECT_DIR && safeOriginalCwd) {
 //   - Non-hook platforms: server.ts writeRoutingInstructions() on MCP connect
 //   - Future: explicit `context-mode init` command
 
+// ── Linux: re-exec with Bun to avoid better-sqlite3 SIGSEGV (#564) ──
+// server.bundle.mjs has two SQLite paths: bun:sqlite (safe) or better-sqlite3
+// (SIGSEGV on Linux under Node's V8). When invoked via node on Linux, detect
+// a Bun installation and re-exec this file under Bun so the bundle takes the
+// safe path. No-op when already running under Bun or on non-Linux platforms.
+if (typeof globalThis.Bun === "undefined" && process.platform === "linux") {
+  const bunCandidates = [
+    process.env.BUN_INSTALL ? join(process.env.BUN_INSTALL, "bin", "bun") : null,
+    join(homedir(), ".bun", "bin", "bun"),
+    "/usr/local/bin/bun",
+    "/usr/bin/bun",
+  ].filter(Boolean);
+  const bunBin = bunCandidates.find((p) => existsSync(p));
+  if (bunBin) {
+    const child = spawn(bunBin, [fileURLToPath(import.meta.url)], {
+      stdio: ["pipe", "inherit", "inherit"],
+      env: process.env,
+    });
+    process.stdin.on("data", (chunk) => {
+      if (!child.stdin.destroyed) child.stdin.write(chunk);
+    });
+    process.stdin.on("end", () => {});
+    const _keepAlive = setInterval(() => {}, 2147483647);
+    child.on("exit", (code) => {
+      clearInterval(_keepAlive);
+      process.exit(code ?? 0);
+    });
+    // Prevent rest of start.mjs from running — child owns the MCP session.
+    process.stdin.resume();
+    await new Promise(() => {}); // park this process forever
+  }
+}
+
 // ── Self-heal Layer 1: Fix registry → symlink mismatches (anthropics/claude-code#46915) ──
 // Claude Code auto-update can leave installed_plugins.json pointing to a non-existent
 // directory. We detect this and create symlinks so hooks find the right path.
@@ -51,7 +102,8 @@ if (cacheMatch) {
   try {
     const cacheParent = cacheMatch[1];
     const myVersion = cacheMatch[2];
-    const ipPath = resolve(homedir(), ".claude", "plugins", "installed_plugins.json");
+    const claudeConfigDir = resolveClaudeConfigDir();
+    const ipPath = resolve(claudeConfigDir, "plugins", "installed_plugins.json");
 
     // Forward heal: if a newer version dir exists, update registry
     const dirs = readdirSync(cacheParent).filter((d) =>
@@ -83,7 +135,7 @@ if (cacheMatch) {
     }
 
     // Reverse heal: if registry points to non-existent dir, create symlink to us
-    const cacheRoot = resolve(homedir(), ".claude", "plugins", "cache");
+    const cacheRoot = resolve(claudeConfigDir, "plugins", "cache");
     if (existsSync(ipPath)) {
       const ip = JSON.parse(readFileSync(ipPath, "utf-8"));
       for (const [key, entries] of Object.entries(ip.plugins || {})) {
@@ -122,12 +174,13 @@ if (cacheMatch) {
 // truth) so users who fix themselves via `npm install -g context-mode`
 // follow the exact same code path. Best-effort, never blocks MCP boot.
 try {
-  const { healInstalledPlugins, healSettingsEnabledPlugins, healPluginJsonMcpServers, healMcpJsonArgs } =
+  const { healInstalledPlugins, healSettingsEnabledPlugins, healPluginJsonMcpServers, sweepStaleMcpJson } =
     await import("./scripts/heal-installed-plugins.mjs");
   const pluginKey = "context-mode@context-mode";
-  const registryPath = resolve(homedir(), ".claude", "plugins", "installed_plugins.json");
-  const pluginCacheRoot = resolve(homedir(), ".claude", "plugins", "cache");
-  const settingsPath = resolve(homedir(), ".claude", "settings.json");
+  const claudeConfigDir = resolveClaudeConfigDir();
+  const registryPath = resolve(claudeConfigDir, "plugins", "installed_plugins.json");
+  const pluginCacheRoot = resolve(claudeConfigDir, "plugins", "cache");
+  const settingsPath = resolve(claudeConfigDir, "settings.json");
   try { healInstalledPlugins({ registryPath, pluginCacheRoot, pluginKey }); }
   catch { /* best effort */ }
   // v1.0.116: Claude Code's plugin loader reads settings.json.enabledPlugins
@@ -140,12 +193,6 @@ try {
   // path baked in. Iterates EVERY installed cache entry's installPath so
   // multi-version installs all self-recover. Each call is independently wrapped
   // because one poisoned entry must not block heals on the others. Best effort.
-  //
-  // v1.0.122 — Layer 5b extended (Issue #531): asymmetric-heal sibling for the
-  // `.mcp.json` file Claude Code reads at plugin load. Same per-entry loop, same
-  // defensive wrap. Covers both the #253/aea633c bare `./start.mjs` fresh-install
-  // regression AND the /ctx-upgrade tmpdir leak class. Both heals must run on
-  // every boot so users self-recover regardless of which drift shape hit them.
   try {
     if (existsSync(registryPath)) {
       const ip = JSON.parse(readFileSync(registryPath, "utf-8"));
@@ -161,16 +208,19 @@ try {
               pluginKey,
             });
           } catch { /* best effort — per-entry */ }
-          try {
-            healMcpJsonArgs({
-              pluginRoot: installPath,
-              pluginCacheRoot,
-              pluginKey,
-            });
-          } catch { /* best effort — per-entry */ }
         }
       }
     }
+  } catch { /* best effort */ }
+  // Issue #609 — Layer 5c (replaces v1.0.122 healMcpJsonArgs per-entry loop):
+  // sweep stale `.mcp.json` files from every per-version cache dir. cli.ts
+  // no longer writes `.mcp.json` (PR fix for #609), so the only `.mcp.json`
+  // files in the cache are stale carry-forwards from earlier installs or
+  // Claude Code's plugin manager copying them between version dirs. Removing
+  // them blocks the previous-version-carry replay vector at MCP boot.
+  // One sweep per boot — bounded, idempotent, best-effort.
+  try {
+    sweepStaleMcpJson({ pluginCacheRoot, pluginKey });
   } catch { /* best effort */ }
 } catch { /* best effort — never block MCP boot */ }
 
@@ -191,7 +241,12 @@ try {
   const { buildHookCommand, selfHealCacheHealHook, ensureShebangAndExecBit } =
     await import("./hooks/cache-heal-utils.mjs");
 
-  const globalHooksDir = resolve(homedir(), ".claude", "hooks");
+  // #577: honor $CLAUDE_CONFIG_DIR — without this, Claude Code spawns hooks
+  // from $CLAUDE_CONFIG_DIR/settings.json but we deploy them to ~/.claude/hooks/
+  // and register them in ~/.claude/settings.json. The mismatch silently
+  // disables the heal AND creates an unwanted ~/.claude directory.
+  const claudeConfigDir = resolveClaudeConfigDir();
+  const globalHooksDir = resolve(claudeConfigDir, "hooks");
   const healHookPath = resolve(globalHooksDir, "context-mode-cache-heal.mjs");
   // Clean up old bash version if it exists
   const oldBashHook = resolve(globalHooksDir, "context-mode-cache-heal.sh");
@@ -203,14 +258,17 @@ try {
     const healScript = `#!/usr/bin/env node
 // context-mode plugin cache self-heal (auto-deployed)
 // Fixes anthropics/claude-code#46915: auto-update breaks CLAUDE_PLUGIN_ROOT
+// Honors CLAUDE_CONFIG_DIR (#577) — checked at this script's runtime so users
+// who set CLAUDE_CONFIG_DIR after install still get healed correctly.
 // Pure Node.js — no bash/shell dependency.
 import{existsSync,readdirSync,statSync,symlinkSync,lstatSync,unlinkSync,readFileSync}from"node:fs";
 import{dirname,join,resolve,sep}from"node:path";
 import{homedir}from"node:os";
+function cfgDir(){const e=process.env.CLAUDE_CONFIG_DIR;if(e&&e.trim()!==""){return e.startsWith("~")?resolve(homedir(),e.replace(/^~[/\\\\]?/,"")):resolve(e)}return resolve(homedir(),".claude")}
 try{
-  const f=resolve(homedir(),".claude","plugins","installed_plugins.json");
+  const f=resolve(cfgDir(),"plugins","installed_plugins.json");
   if(!existsSync(f))process.exit(0);
-  const cacheRoot=resolve(homedir(),".claude","plugins","cache");
+  const cacheRoot=resolve(cfgDir(),"plugins","cache");
   const ip=JSON.parse(readFileSync(f,"utf-8"));
   for(const[k,es]of Object.entries(ip.plugins||{})){
     if(k!=="context-mode@context-mode")continue;
@@ -238,8 +296,9 @@ try{
     try { ensureShebangAndExecBit(healHookPath); } catch { /* best effort */ }
   }
 
-  // Register the hook in ~/.claude/settings.json (Claude Code doesn't auto-discover hook files)
-  const settingsPath = resolve(homedir(), ".claude", "settings.json");
+  // Register the hook in $CLAUDE_CONFIG_DIR/settings.json (Claude Code doesn't auto-discover hook files).
+  // #577: must follow the same dir resolution as globalHooksDir above.
+  const settingsPath = resolve(claudeConfigDir, "settings.json");
   if (existsSync(settingsPath)) {
     const settings = JSON.parse(readFileSync(settingsPath, "utf-8"));
     const hooks = settings.hooks ?? {};
@@ -305,16 +364,47 @@ if (!process.env.VITEST) {
 // Ensure native dependencies + ABI compatibility (shared with hooks via ensure-deps.mjs)
 // ensure-deps handles better-sqlite3 install + ABI cache/rebuild automatically (#148, #203)
 import "./hooks/ensure-deps.mjs";
-// Also install pure-JS deps used by server
-for (const pkg of ["turndown", "turndown-plugin-gfm", "@mixmark-io/domino"]) {
-  if (!existsSync(resolve(__dirname, "node_modules", pkg))) {
+// Pure-JS runtime deps used only by `ctx_fetch_and_index` (HTML → Markdown
+// pipeline runs in a sandboxed subprocess that `require.resolve()`s these at
+// call time). Plugin distributions that bypass `npm install` — most notably
+// codex's marketplace, which git-clones into `~/.codex/plugins/cache/<pkg>/`
+// without installing dependencies — land here with no `node_modules/`.
+//
+// Before #634: synchronous `execSync("npm install …")` per package
+// (turndown + turndown-plugin-gfm + @mixmark-io/domino) blocked MCP boot
+// for ~15–25s cold. Codex's per-MCP `startup_timeout_sec` is 30s, so on
+// any host where its prewarm + DNS already eats a few seconds the timer
+// fires before context-mode replies to `initialize` and the MCP child is
+// dropped with "MCP client for `context-mode` timed out after 30 seconds".
+//
+// Fix: spawn each `npm install` detached + unref'd so it runs in the
+// background while the MCP server proceeds with its handshake. The deps
+// land asynchronously, well before any LLM-driven `ctx_fetch_and_index`
+// call can plausibly fire. If a user invokes that tool faster than the
+// install completes, the subprocess's own `require.resolve("turndown")`
+// failure surfaces a typed error to the caller — same posture as any
+// other missing-runtime-dep situation in that code path.
+{
+  const NPM_INSTALL_BG_PKGS = ["turndown", "turndown-plugin-gfm", "@mixmark-io/domino"];
+  const IS_WIN32 = process.platform === "win32";
+  const NPM_BIN = IS_WIN32 ? "npm.cmd" : "npm";
+  for (const pkg of NPM_INSTALL_BG_PKGS) {
+    if (existsSync(resolve(__dirname, "node_modules", pkg))) continue;
     try {
-      execSync(`npm install ${pkg} --no-package-lock --no-save --silent`, {
-        cwd: __dirname,
-        stdio: "pipe",
-        timeout: 120000,
-      });
-    } catch { /* best effort */ }
+      const child = spawn(
+        NPM_BIN,
+        ["install", pkg, "--no-package-lock", "--no-save", "--silent", "--no-audit", "--no-fund"],
+        {
+          cwd: __dirname,
+          stdio: "ignore",
+          detached: true,
+          // npm on Windows ships as a `.cmd` shim — must go through cmd.exe.
+          shell: IS_WIN32,
+        },
+      );
+      child.on("error", () => { /* best effort — npm missing, broken cache, etc. */ });
+      child.unref();
+    } catch { /* best effort — never block MCP boot */ }
   }
 }
 
@@ -323,6 +413,43 @@ if (!existsSync(resolve(__dirname, "cli.bundle.mjs")) && existsSync(resolve(__di
   const shimPath = resolve(__dirname, "cli.bundle.mjs");
   writeFileSync(shimPath, '#!/usr/bin/env node\nawait import("./build/cli.js");\n');
   if (process.platform !== "win32") chmodSync(shimPath, 0o755);
+}
+
+// ── Algo-D4: plugin cache integrity check ──
+// Verify boot-critical siblings exist BEFORE importing server.bundle.mjs.
+// Without this, a partial install (#550) gives an opaque downstream
+// stack trace from `import("./server.bundle.mjs")`. With it, we emit a
+// structured CONTEXT_MODE_PARTIAL_INSTALL stderr block + exit 2 so
+// external monitoring grep + the user both see the actionable signal.
+//
+// Runs AFTER the heal layers above so missing files they can fix
+// (cli.bundle.mjs shim, dangling symlinks) get a chance first. Helper
+// is shared with `ctx doctor` (Algo-D5) — single source of truth so
+// boot + diagnostic agree byte-for-byte. Skipped under VITEST so the
+// repo's own test invocations against in-tree start.mjs don't fail
+// when running before `npm run build` produces the bundles.
+if (!process.env.VITEST) {
+  try {
+    const { assertPluginCacheIntegrity, formatPartialInstallReport } =
+      await import("./scripts/plugin-cache-integrity.mjs");
+    const integrity = assertPluginCacheIntegrity({ pluginRoot: __dirname });
+    if (!integrity.ok) {
+      process.stderr.write(
+        formatPartialInstallReport({
+          pluginRoot: __dirname,
+          missing: integrity.missing,
+        }),
+      );
+      process.exit(2);
+    }
+  } catch (err) {
+    // The helper itself failing is unexpected — keep boot moving rather
+    // than blocking on a check infrastructure bug. The downstream
+    // import will still surface the actual missing-bundle error.
+    if (process.env.CONTEXT_MODE_DEBUG) {
+      process.stderr.write(`[start.mjs] integrity check skipped: ${err}\n`);
+    }
+  }
 }
 
 // Bundle exists (CI-built) — start instantly

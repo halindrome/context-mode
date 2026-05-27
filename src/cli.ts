@@ -7,6 +7,8 @@
  *   context-mode doctor                       → Diagnose runtime issues, hooks, FTS5, version
  *   context-mode upgrade                      → Fix hooks, permissions, and settings
  *   context-mode hook <platform> <event>      → Dispatch a hook script (used by platform hook configs)
+ *   CONTEXT_MODE_DIR=/abs/path context-mode   → Override sessions/content storage root
+ *     Empty/whitespace is ignored; non-empty values must be absolute.
  *
  * Platform auto-detection: CLI detects which platform is running
  * (Claude Code, Gemini CLI, OpenCode, etc.) and uses the appropriate adapter.
@@ -28,10 +30,23 @@ import {
 } from "./runtime.js";
 import { getHookScriptPaths } from "./util/hook-config.js";
 import { resolveClaudeConfigDir } from "./util/claude-config.js";
+import {
+  ensureWritableStorageDir,
+  formatStorageDirectoryError,
+  resolveContentStorageDir,
+  resolveSessionStorageDir,
+  resolveStatsStorageDir,
+  StorageDirectoryError,
+  type ResolvedStorageDir,
+} from "./session/db.js";
+// v1.0.128 — Issue #559 sibling MCP kill helpers (see PR-559-560-FIX-DESIGN.md).
+import { discoverSiblingMcpPids, killSiblingMcpServers } from "./util/sibling-mcp.js";
 // v1.0.119 — Issue #523 Layer 5 heal: post-bump assertion on .claude-plugin/plugin.json
 // mcpServers args. Single source of truth shared with start.mjs HEAL block + postinstall.
 // @ts-expect-error — JS module, no TS declarations
-import { healPluginJsonMcpServers, healMcpJsonArgs } from "../scripts/heal-installed-plugins.mjs";
+import { healPluginJsonMcpServers, sweepStaleMcpJson } from "../scripts/heal-installed-plugins.mjs";
+// @ts-expect-error — JS module, no TS declarations
+import { detectWindowsVsYear } from "../scripts/heal-better-sqlite3.mjs";
 // Private 16-LOC copy of browserOpenArgv. Canonical version lives in src/server.ts;
 // duplicated here so the cli bundle does not pull server.ts top-level boot side effects.
 // Keep in sync — pure data, no I/O.
@@ -65,6 +80,7 @@ const HOOK_MAP: Record<string, Record<string, string>> = {
     userpromptsubmit: "hooks/userpromptsubmit.mjs",
   },
   "gemini-cli": {
+    beforeagent: "hooks/gemini-cli/beforeagent.mjs",
     beforetool: "hooks/gemini-cli/beforetool.mjs",
     aftertool: "hooks/gemini-cli/aftertool.mjs",
     precompress: "hooks/gemini-cli/precompress.mjs",
@@ -134,12 +150,41 @@ async function hookDispatch(platform: string, event: string): Promise<void> {
  * Entry point
  * ------------------------------------------------------- */
 
+const IN_PROCESS_PLUGIN_PLATFORMS = new Set(["opencode", "kilo"]);
+const isInProcessPluginPlatform = (p: string | undefined) =>
+  p ? IN_PROCESS_PLUGIN_PLATFORMS.has(p) : false;
 const args = process.argv.slice(2);
 
-if (args[0] === "doctor") {
+function printHelp(): void {
+  console.log([
+    "Usage:",
+    "  context-mode                         Start MCP server (stdio)",
+    "  context-mode doctor                  Diagnose runtime issues, hooks, FTS5, version",
+    "  context-mode upgrade                 Fix hooks, permissions, and settings",
+    "  context-mode hook <platform> <event> Dispatch a configured hook script",
+    "  context-mode statusline              Print Claude Code status line",
+    "",
+    "Environment:",
+    "  CONTEXT_MODE_DIR=/absolute/path      Override sessions/content storage root; empty is ignored, non-empty must be absolute",
+  ].join("\n"));
+}
+
+if (args[0] === "--help" || args[0] === "-h" || args[0] === "help") {
+  printHelp();
+} else if (args[0] === "doctor") {
   doctor().then((code) => process.exit(code));
 } else if (args[0] === "upgrade") {
-  upgrade().catch((err: unknown) => {
+  // Issue #542 — accept --platform <id> from the ctx_upgrade MCP handler,
+  // which forwards the live MCP clientInfo's resolved PlatformId. The flag
+  // wins over upgrade()'s own detectPlatform() heuristic chain so an
+  // ambiguous config-dir collision (e.g. ~/.cursor + ~/.pi both present)
+  // can never misroute the upgrade.
+  const platformFlagIdx = args.indexOf("--platform");
+  const platformArg =
+    platformFlagIdx >= 0 && args[platformFlagIdx + 1]
+      ? args[platformFlagIdx + 1]
+      : undefined;
+  upgrade(platformArg ? { platform: platformArg } : undefined).catch((err: unknown) => {
     const message = err instanceof Error ? err.message : String(err);
     p.log.error(color.red(message));
     process.exit(1);
@@ -263,7 +308,7 @@ function cachePluginRoot(platform: string): string {
 
 function getPluginRoot(): string {
   const platform = detectPlatform().platform;
-  if (platform === 'opencode' || platform === 'kilo') {
+  if (isInProcessPluginPlatform(platform)) {
     return cachePluginRoot(platform);
   }
   return defaultPluginRoot();
@@ -309,6 +354,30 @@ async function fetchLatestVersion(): Promise<string> {
  * Doctor — adapter-aware diagnostics
  * ------------------------------------------------------- */
 
+function describeStorageSource(dir: ResolvedStorageDir): string {
+  return dir.envVar ? dir.envVar : "adapter default";
+}
+
+function logStorageDir(dir: ResolvedStorageDir): number {
+  try {
+    ensureWritableStorageDir(dir);
+    p.log.success(
+      color.green(`Storage ${dir.kind}: PASS`) +
+        color.dim(` — ${dir.path} (${describeStorageSource(dir)})`),
+    );
+    return 0;
+  } catch (err) {
+    if (err instanceof StorageDirectoryError) {
+      p.log.error(
+        color.red(`Storage ${dir.kind}: FAIL`) +
+          color.dim(` — ${formatStorageDirectoryError(err)}`),
+      );
+      return 1;
+    }
+    throw err;
+  }
+}
+
 async function doctor(): Promise<number> {
   if (process.stdout.isTTY) console.clear();
 
@@ -323,6 +392,34 @@ async function doctor(): Promise<number> {
   );
 
   let criticalFails = 0;
+
+  try {
+    const sessionDir = resolveSessionStorageDir(() => adapter.getSessionDir());
+    const contentDir = resolveContentStorageDir(() => sessionDir.path);
+    const statsDir = resolveStatsStorageDir(() => sessionDir.path);
+
+    p.note(
+      [
+        `sessions: ${sessionDir.path} (${describeStorageSource(sessionDir)})`,
+        `content:  ${contentDir.path} (${describeStorageSource(contentDir)})`,
+        `stats:    ${statsDir.path} (${describeStorageSource(statsDir)})`,
+      ].join("\n"),
+      "Storage paths",
+    );
+    criticalFails += logStorageDir(sessionDir);
+    criticalFails += logStorageDir(contentDir);
+    criticalFails += logStorageDir(statsDir);
+  } catch (err) {
+    if (err instanceof StorageDirectoryError) {
+      criticalFails++;
+      p.log.error(
+        color.red(`Storage ${err.kind}: FAIL`) +
+          color.dim(` — ${formatStorageDirectoryError(err)}`),
+      );
+    } else {
+      throw err;
+    }
+  }
 
   const s = p.spinner();
   s.start("Running diagnostics");
@@ -343,6 +440,41 @@ async function doctor(): Promise<number> {
 
   // Runtime check
   p.note(getRuntimeSummary(runtimes), "Runtimes");
+
+  // ── Issue #564 — Linux + Node < 22.5 + no Bun is unsafe ────────────
+  // V8's madvise(MADV_DONTNEED) can corrupt better-sqlite3's native addon
+  // `.got.plt` on Linux, causing sporadic SIGSEGV (1-4/hour). The 22.5
+  // gate (`hasModernSqlite()` in src/db-base.ts:226-244) is the contract:
+  // at or above it we use node:sqlite (built-in, no native addon, no
+  // .got.plt to corrupt); below it we fall through to better-sqlite3
+  // which WILL crash. engines.node + a hard-fail postinstall guard this
+  // at install time, but doctor() surfaces it for already-installed users
+  // (and for adapters whose MCP host swallows stderr during install).
+  // Refs:
+  //   - https://github.com/nodejs/node/issues/62515
+  //   - https://github.com/mksglu/context-mode/issues/564
+  {
+    const { hasModernSqlite } = await import("./db-base.js");
+    if (
+      process.platform === "linux" &&
+      !hasModernSqlite() &&
+      !hasBunRuntime()
+    ) {
+      criticalFails++;
+      p.log.error(
+        color.red("Node version: FAIL") +
+          ` — Linux + Node ${process.versions.node} is unsafe (SIGSEGV)` +
+          color.dim(
+            "\n  context-mode requires Node.js >= 22.5 (or Bun) on Linux to avoid the" +
+            "\n  V8 madvise(MADV_DONTNEED) SIGSEGV in better-sqlite3 (1-4/hour)." +
+            "\n  Refs: https://github.com/nodejs/node/issues/62515" +
+            "\n        https://github.com/mksglu/context-mode/issues/564" +
+            "\n  Fix:  nvm install 22.5 && nvm use 22.5 && npm install -g context-mode" +
+            "\n  Or:   curl -fsSL https://bun.sh/install | bash && bun add -g context-mode",
+          ),
+      );
+    }
+  }
 
   // Speed tier
   if (hasBunRuntime()) {
@@ -426,22 +558,49 @@ async function doctor(): Promise<number> {
     }
   }
 
-  // Hook scripts exist
+  // Hook scripts exist — Algo-D1 protocol path takes precedence.
+  // Adapters that override `getHealthChecks` (claude-code today) get a
+  // direct `existsSync(join(pluginRoot, "hooks", scriptName))` per
+  // HOOK_SCRIPTS entry — no regex round-trip on a hook command, so the
+  // #548 doubled-path FAIL class can't surface. Adapters that don't
+  // override fall through to the legacy `getHookScriptPaths` flow which
+  // generates the hook config and parses each command via
+  // `extractHookScriptPath`. Post-D3 every adapter emits buildNodeCommand-
+  // shape, so the legacy flow is also safe — but the direct existsSync
+  // path is strictly preferable when the adapter offers it.
   p.log.step("Checking hook scripts...");
-  const hookScriptPaths = getHookScriptPaths(adapter, pluginRoot);
-  if (hookScriptPaths.length === 0) {
-    p.log.success(color.green("Hook scripts: PASS") + color.dim(" — no direct .mjs script paths to verify"));
-  } else {
-    for (const scriptPath of hookScriptPaths) {
-      const absolutePath = resolve(pluginRoot, scriptPath);
-      try {
-        accessSync(absolutePath, constants.R_OK);
-        p.log.success(color.green("Hook script exists: PASS") + color.dim(` — ${absolutePath}`));
-      } catch {
-        p.log.error(
-          color.red("Hook script exists: FAIL") +
-            color.dim(` — not found at ${absolutePath}`),
+  const adapterHealthChecks = adapter.getHealthChecks?.(pluginRoot) ?? [];
+  if (adapterHealthChecks.length > 0) {
+    for (const hc of adapterHealthChecks) {
+      const result = hc.check();
+      if (result.status === "OK") {
+        p.log.success(
+          color.green(`${hc.name}: PASS`) +
+            (result.detail ? color.dim(` — ${result.detail}`) : ""),
         );
+      } else {
+        p.log.error(
+          color.red(`${hc.name}: FAIL`) +
+            (result.detail ? color.dim(` — ${result.detail}`) : ""),
+        );
+      }
+    }
+  } else {
+    const hookScriptPaths = getHookScriptPaths(adapter, pluginRoot);
+    if (hookScriptPaths.length === 0) {
+      p.log.success(color.green("Hook scripts: PASS") + color.dim(" — no direct .mjs script paths to verify"));
+    } else {
+      for (const scriptPath of hookScriptPaths) {
+        const absolutePath = resolve(pluginRoot, scriptPath);
+        try {
+          accessSync(absolutePath, constants.R_OK);
+          p.log.success(color.green("Hook script exists: PASS") + color.dim(` — ${absolutePath}`));
+        } catch {
+          p.log.error(
+            color.red("Hook script exists: FAIL") +
+              color.dim(` — not found at ${absolutePath}`),
+          );
+        }
       }
     }
   }
@@ -456,6 +615,184 @@ async function doctor(): Promise<number> {
       color.yellow("Plugin enabled: WARN") +
         ` — ${pluginCheck.message}`,
     );
+  }
+
+  // ── Issue #613 — proactive Tier C absolute-path detection ───────────
+  // PR #620 fixed `buildHookCommand` for vscode-copilot + jetbrains-copilot
+  // so future writes are CLI-dispatcher-shape. But users who ran
+  // /ctx-upgrade on v1.0.136 or earlier are still carrying poisoned
+  // committable files in their workspace:
+  //   - `.github/hooks/context-mode.json`      (vscode-copilot, team-shared)
+  //   - `.jetbrains/copilot/hooks.json`        (jetbrains-copilot, team-shared)
+  //   - `.cursor/hooks.json`                   (cursor, team-shared)
+  // Per ISSUE-613-VERDICT §6.1 these are Tier C — workspace-committed
+  // cross-machine config. Doctor scans them for absolute paths and
+  // fnm_multishells shims; if found, FAIL with `ctx_upgrade` remediation.
+  // Per ISSUE-604-VERDICT §11 ("silent-green doctor while hooks are dead
+  // is itself a P0 trust bug") — surface poison BEFORE the user hits a
+  // runtime failure.
+  p.log.step("Checking team-shared hook configs in your workspace...");
+  {
+    const projectDir = process.cwd();
+    const tierCFiles = [
+      ".github/hooks/context-mode.json",
+      ".cursor/hooks.json",
+      ".jetbrains/copilot/hooks.json",
+    ];
+    let tierCFails = 0;
+    let tierCChecked = 0;
+
+    // Detect absolute-path patterns that should never appear in a
+    // workspace-committed config. Per Mert's standing Windows-safety rule:
+    // handle both `/` and `\\` separators.
+    function isAbsoluteOrShimPath(s: string): boolean {
+      // unix absolute
+      if (s.startsWith("/")) return true;
+      // Windows drive-letter absolute (e.g. C:/, C:\)
+      if (/^[A-Za-z]:[/\\]/.test(s)) return true;
+      // Windows UNC or escaped-backslash absolute fragments
+      if (s.includes("\\\\")) return true;
+      // fnm shim hint — issue #613 reporter's exact stderr shape
+      if (s.includes("fnm_multishells")) return true;
+      // process.execPath literal baked into JSON
+      if (s.includes("process.execPath")) return true;
+      return false;
+    }
+
+    function recurseStrings(node: unknown, hit: (s: string) => void): void {
+      if (typeof node === "string") {
+        hit(node);
+      } else if (Array.isArray(node)) {
+        for (const item of node) recurseStrings(item, hit);
+      } else if (node && typeof node === "object") {
+        for (const v of Object.values(node)) recurseStrings(v, hit);
+      }
+    }
+
+    for (const rel of tierCFiles) {
+      const abs = resolve(projectDir, rel);
+      if (!existsSync(abs)) continue; // missing config → SKIP, no false fail
+      tierCChecked++;
+      try {
+        const parsed = JSON.parse(readFileSync(abs, "utf-8"));
+        const offenders: string[] = [];
+        recurseStrings(parsed, (s) => {
+          if (isAbsoluteOrShimPath(s)) offenders.push(s);
+        });
+        if (offenders.length > 0) {
+          criticalFails++;
+          tierCFails++;
+          // Truncate to one example to keep output readable; show count.
+          const example = offenders[0].length > 100
+            ? offenders[0].slice(0, 97) + "..."
+            : offenders[0];
+          p.log.error(
+            color.red(`Hook config: FAIL`) +
+              ` — ${rel} has your machine's local paths baked in` +
+              color.dim(
+                "\n  This file is committed to git, so teammates and CI will get your path and the hooks will break for them." +
+                `\n  Found ${offenders.length} hard-coded path(s), e.g.: ${example}` +
+                "\n  Fix: run /context-mode:ctx-upgrade — it rewrites the file to a portable form that works on every machine." +
+                "\n  Details: https://github.com/mksglu/context-mode/issues/613",
+              ),
+          );
+        } else {
+          p.log.success(
+            color.green("Hook config: PASS") +
+              color.dim(` — ${rel} is portable (no hard-coded paths)`),
+          );
+        }
+      } catch (err: unknown) {
+        // Malformed JSON should not crash doctor; warn and move on.
+        const msg = err instanceof Error ? err.message : String(err);
+        p.log.warn(
+          color.yellow(`Hook config: WARN`) +
+            ` — ${rel} is not valid JSON` +
+            color.dim(
+              "\n  Doctor cannot scan it for portability issues until the file parses." +
+              "\n  Fix: open the file and check it in a JSON validator, or delete it and run /context-mode:ctx-upgrade to regenerate." +
+              `\n  Parser said: ${msg.slice(0, 160)}`,
+            ),
+        );
+      }
+    }
+    if (tierCChecked === 0) {
+      p.log.info(
+        color.dim("Hook config: SKIP — no team-shared hook configs found in this workspace"),
+      );
+    } else if (tierCFails === 0) {
+      // already individual PASS messages above; no need for a summary
+    }
+  }
+
+  // ── Issue #609 — proactive stale `.mcp.json` detection ──────────────
+  // PR #620 deleted the per-version cache `.mcp.json` write from cli.ts
+  // and shipped `sweepStaleMcpJson` to clean up any pre-existing copies.
+  // But users on the field may still have stale `.mcp.json` files left
+  // by /ctx-upgrade flows that ran before PR #620 (or by Claude Code's
+  // native auto-update copying a poisoned file forward). Surface those
+  // as WARN (recoverable — next ctx_upgrade sweeps them) so the user
+  // knows what to do instead of being told everything is green while
+  // the file lingers on disk.
+  // Per ISSUE-604-VERDICT §11 same trust contract as Tier C check above.
+  p.log.step("Checking for leftover .mcp.json files from older versions...");
+  {
+    const cacheRoot = join(
+      homedir(),
+      ".claude",
+      "plugins",
+      "cache",
+      "context-mode",
+      "context-mode",
+    );
+    if (!existsSync(cacheRoot)) {
+      p.log.info(
+        color.dim("Leftover .mcp.json check: SKIP — no plugin cache exists yet (Claude Code has not installed context-mode here)"),
+      );
+    } else {
+      let staleCount = 0;
+      const staleVersions: string[] = [];
+      try {
+        const versionDirs = readdirSync(cacheRoot);
+        for (const v of versionDirs) {
+          const candidate = join(cacheRoot, v, ".mcp.json");
+          if (existsSync(candidate)) {
+            staleCount++;
+            if (staleVersions.length < 5) staleVersions.push(v);
+          }
+        }
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : String(err);
+        p.log.warn(
+          color.yellow("Leftover .mcp.json check: WARN") +
+            ` — could not read the plugin cache directory` +
+            color.dim(
+              `\n  Path: ${cacheRoot}` +
+              `\n  Reason: ${msg.slice(0, 160)}` +
+              "\n  Fix: check that the directory is readable, then re-run doctor. If the issue persists, run /context-mode:ctx-upgrade.",
+            ),
+        );
+        staleCount = 0;
+      }
+      if (staleCount === 0) {
+        p.log.success(
+          color.green("Leftover .mcp.json check: PASS") +
+            color.dim(" — no old .mcp.json files in the plugin cache"),
+        );
+      } else {
+        // WARN, not FAIL — per architect spec this is recoverable.
+        p.log.warn(
+          color.yellow("Leftover .mcp.json check: WARN") +
+            ` — found ${staleCount} old .mcp.json file(s) left over from previous context-mode versions` +
+            color.dim(
+              "\n  These are harmless but should be cleaned up so they cannot confuse Claude Code after an auto-update." +
+              `\n  Versions affected: ${staleVersions.join(", ")}${staleCount > staleVersions.length ? ", ..." : ""}` +
+              "\n  Fix: run /context-mode:ctx-upgrade — it sweeps these files automatically on the next run." +
+              "\n  Details: https://github.com/mksglu/context-mode/issues/609",
+            ),
+        );
+      }
+    }
   }
 
   // FTS5 / SQLite
@@ -557,7 +894,12 @@ async function doctor(): Promise<number> {
     );
   }
 
-  if (installedVersion === "not installed") {
+  if (installedVersion === "standalone") {
+    p.log.info(
+      color.dim(`${adapter.name}: standalone MCP mode`) +
+        " — no platform plugin version to compare",
+    );
+  } else if (installedVersion === "not installed") {
     p.log.info(
       color.dim(`${adapter.name}: not installed`) +
         " — using standalone MCP mode",
@@ -609,8 +951,8 @@ async function insight(port: number) {
   // Detect platform + adapter for correct session/content paths
   const detection = detectPlatform();
   const adapter = await getAdapter(detection.platform);
-  const sessDir = adapter.getSessionDir();
-  const contentDir = join(dirname(sessDir), "content");
+  const sessDir = ensureWritableStorageDir(resolveSessionStorageDir(() => adapter.getSessionDir()));
+  const contentDir = ensureWritableStorageDir(resolveContentStorageDir(() => sessDir));
   const cacheDir = join(dirname(sessDir), "insight-cache");
 
   if (!existsSync(join(insightSource, "server.mjs"))) {
@@ -706,11 +1048,18 @@ async function insight(port: number) {
  * Upgrade — adapter-aware hook configuration
  * ------------------------------------------------------- */
 
-async function upgrade() {
+async function upgrade(opts?: { platform?: string }) {
   if (process.stdout.isTTY) console.clear();
 
-  // Detect platform
-  const detection = detectPlatform();
+  // Issue #542 — when the MCP ctx_upgrade handler threads through an
+  // explicit --platform <id> (resolved from live clientInfo), trust it
+  // over the local heuristic chain. detectPlatform() with no args cannot
+  // see the MCP handshake and falls through to the config-dir tier,
+  // which misdetects Pi/OMP installs as Cursor on systems where both
+  // ~/.cursor/ and ~/.pi/ exist.
+  const detection = opts?.platform
+    ? { platform: opts.platform as Parameters<typeof getAdapter>[0], confidence: "high" as const, reason: `--platform ${opts.platform} from ctx_upgrade handler` }
+    : detectPlatform();
   const adapter = await getAdapter(detection.platform);
 
   p.intro(color.bgCyan(color.black(" context-mode upgrade ")));
@@ -791,12 +1140,48 @@ async function upgrade() {
       p.log.info(
         `Update available: ${color.yellow("v" + localVersion)} → ${color.green("v" + newVersion)}`,
       );
+
+      // v1.0.128 — Issue #559: terminate sibling MCP servers BEFORE installing
+      // new files. Historically /ctx-upgrade rsynced new code over the old
+      // tree but never signalled the running MCP server, so the previous
+      // version stayed alive holding stdio + DB handles. Across enough
+      // upgrades users observed 5+ context-mode start.mjs processes pinned
+      // to RAM. Discovery + kill must happen before npm install to avoid
+      // racing against the EXCLUSIVE lock the new server claims on first
+      // ctx_search (see #560 fix). Wrapped in try/catch so a missing pgrep
+      // (stripped Linux distro) or unavailable PowerShell (weird Windows)
+      // can never block the upgrade itself.
+      try {
+        const siblingPids = discoverSiblingMcpPids({
+          ownPid: process.pid,
+          ownPpid: process.ppid,
+        });
+        if (siblingPids.length > 0) {
+          const killReport = await killSiblingMcpServers({ pids: siblingPids });
+          if (killReport.totalKilled > 0) {
+            // Concise summary only — no PIDs in the user-facing log to keep
+            // the line readable. Plural-aware so "1 sibling MCP server" reads
+            // naturally alongside "3 sibling MCP servers".
+            const noun = killReport.totalKilled === 1
+              ? "sibling MCP server"
+              : "sibling MCP servers";
+            p.log.info(
+              color.dim(
+                `Stopped ${killReport.totalKilled} ${noun} (SIGTERM: ${killReport.terminatedBySigterm}, SIGKILL: ${killReport.terminatedBySigkill})`,
+              ),
+            );
+          }
+        }
+      } catch { /* never block upgrade on discovery/kill failure */ }
+
       // Step 2: Install dependencies + build
       s.start("Installing dependencies & building");
+      const vsYear = detectWindowsVsYear();
       npmExecFile(["install", "--no-audit", "--no-fund"], {
         cwd: srcDir,
         stdio: "pipe",
         timeout: 120000,
+        ...(vsYear ? { env: { ...process.env, npm_config_msvs_version: vsYear } } : {}),
       });
       npmExecFile(["run", "build"], {
         cwd: srcDir,
@@ -826,23 +1211,24 @@ async function upgrade() {
         } catch { /* some files may not exist in source */ }
       }
 
-      // Write .mcp.json with CLAUDE_PLUGIN_ROOT placeholder (fixes #411).
-      // Absolute paths bake-in the current pluginRoot dir, which sessionstart.mjs
-      // (#181) deletes after upgrade — breaking MCP server resolution. The literal
-      // ${CLAUDE_PLUGIN_ROOT} placeholder is resolved by Claude at load-time and
-      // stays valid across version cleanups. Matches .claude-plugin/plugin.json.
-      const mcpConfig = {
-        mcpServers: {
-          "context-mode": {
-            command: "node",
-            args: ["${CLAUDE_PLUGIN_ROOT}/start.mjs"],
-          },
-        },
-      };
-      writeFileSync(
-        resolve(pluginRoot, ".mcp.json"),
-        JSON.stringify(mcpConfig, null, 2) + "\n",
-      );
+      // Issue #609 — DO NOT write `.mcp.json` into the plugin cache dir.
+      //
+      // Historical context: #411 fixed an absolute-path bake by writing the
+      // ${CLAUDE_PLUGIN_ROOT} placeholder form here. #531 (commit 9261377)
+      // removed `.mcp.json` from `package.json files[]` so the npm tarball
+      // stopped shipping it. But the cli-side write persisted, so every
+      // /ctx-upgrade re-baked one. When Claude Code's native plugin manager
+      // auto-update later carries a previous version's `.mcp.json` forward
+      // into a fresh version dir, the stale start.mjs absolute path goes
+      // with it → MODULE_NOT_FOUND on every MCP boot.
+      //
+      // Architectural fix: Claude Code reads `.claude-plugin/plugin.json`
+      // .mcpServers as the canonical source (upstream:
+      // refs/platforms/claude-code/src/utils/plugins/mcpPluginIntegration.ts:131-212).
+      // `.mcp.json` is a redundant per-version artifact whose only role
+      // historically was to be a write-time poison vector. Don't write it.
+      // The post-bump cache-sweep below removes any pre-existing copies so
+      // the previous-version-carry vector cannot replay.
 
       // Normalize hooks.json + plugin.json against the REAL pluginRoot now that
       // files have been copied. Two reasons:
@@ -946,31 +1332,50 @@ async function upgrade() {
         throw new Error(`plugin.json drift check failed: ${message}`);
       }
 
-      // v1.0.122 — Issue #531 — Layer 6 heal: assert .mcp.json's
-      // mcpServers["context-mode"].args[0] is the literal ${CLAUDE_PLUGIN_ROOT}/start.mjs
-      // placeholder. Asymmetric-heal sibling of the plugin.json assertion above.
-      // cli.ts writes .mcp.json at ~line 829-845 with the placeholder, but never
-      // asserted the on-disk shape afterwards — if a future regression dropped
-      // the placeholder write or a parallel normalize baked in an absolute path,
-      // upgrade() would declare success on a poisoned tree. Belt-and-braces:
-      // first call cleans any drift; second call MUST return healed:[] or throw.
-      // Single source of truth shared with start.mjs HEAL block + postinstall.
+      // Issue #609 — Layer 6 replacement: sweep stale `.mcp.json` files from
+      // every per-version cache dir. Supersedes the previous healMcpJsonArgs
+      // drift-check block (v1.0.122) — that block existed because cli.ts
+      // itself wrote `.mcp.json`. With the write gone (above), the only
+      // remaining `.mcp.json` files are stale carry-forwards from earlier
+      // versions. Sweep them so Claude Code's auto-update can't replay them
+      // into a fresh version dir.
+      //
+      // Belt-and-braces: a second sweep call MUST report removed:[] or we
+      // throw — same architectural-lock pattern as the plugin.json drift
+      // check above. Single source of truth shared with start.mjs HEAL
+      // block + postinstall.
       try {
         const pluginCacheRoot = resolve(resolveClaudeConfigDir(), "plugins", "cache");
         const pluginKey = "context-mode@context-mode";
-        const firstPass = healMcpJsonArgs({ pluginRoot, pluginCacheRoot, pluginKey });
-        if (firstPass && firstPass.error) {
-          throw new Error(firstPass.error);
+        const firstSweep = sweepStaleMcpJson({ pluginCacheRoot, pluginKey });
+        if (firstSweep && firstSweep.removed && firstSweep.removed.length > 0) {
+          p.log.info(color.dim(`  Swept ${firstSweep.removed.length} stale .mcp.json file(s) from cache`));
         }
-        const secondPass = healMcpJsonArgs({ pluginRoot, pluginCacheRoot, pluginKey });
-        if (secondPass && Array.isArray(secondPass.healed) && secondPass.healed.length > 0) {
+        const secondSweep = sweepStaleMcpJson({ pluginCacheRoot, pluginKey });
+        if (secondSweep && Array.isArray(secondSweep.removed) && secondSweep.removed.length > 0) {
           throw new Error(
-            `.mcp.json drift: mcpServers.args still poisoned after first heal pass (healed=${secondPass.healed.join(",")})`,
+            `.mcp.json sweep drift: ${secondSweep.removed.length} file(s) still present after first pass`,
           );
         }
       } catch (err: unknown) {
         const message = err instanceof Error ? err.message : String(err);
-        throw new Error(`.mcp.json drift check failed: ${message}`);
+        throw new Error(`.mcp.json sweep check failed: ${message}`);
+      }
+
+      // v1.0.X — Layer 7 heal: update user-level ~/.claude.json MCP server
+      // registrations that point to old context-mode version dirs.
+      // (anthropics/claude-code#59310 workaround — see heal-installed-plugins.mjs)
+      try {
+        // @ts-expect-error — JS module, no TS declarations
+        const { healClaudeJsonMcpArgs } = await import("../scripts/heal-installed-plugins.mjs");
+        const dotClaudeJson = resolve(homedir(), ".claude.json");
+        const pluginCacheParent = resolve(resolveClaudeConfigDir(), "plugins", "cache", "context-mode", "context-mode");
+        const result = healClaudeJsonMcpArgs({ dotClaudeJsonPath: dotClaudeJson, pluginCacheParent, newPluginRoot: pluginRoot });
+        if (result.healed && result.healed.length > 0) {
+          p.log.info(color.dim("  ~/.claude.json user MCP registrations updated → " + newVersion));
+        }
+      } catch {
+        /* best effort — never block upgrade */
       }
 
       // v1.0.114 hotfix — marketplace post-pull assertion: clone (if
@@ -1002,7 +1407,7 @@ async function upgrade() {
       });
       s.stop("Dependencies ready");
 
-      if (detection.platform !== 'opencode' && detection.platform !== 'kilo') {
+      if (!isInProcessPluginPlatform(detection.platform)) {
         // Verify native addons through the same bootstrap start.mjs imports.
         // On modern Node, the ABI-specific cache file is the compatibility marker;
         // the active binding alone may be stale from a previous Node ABI.
@@ -1084,20 +1489,20 @@ async function upgrade() {
               color.dim("\n  Try (fallback): /context-mode:ctx-doctor"),
           );
         }
-      }
-
-      // Update global npm
-      s.start("Updating npm global package");
-      try {
-        npmExecFile(["install", "-g", pluginRoot, "--no-audit", "--no-fund"], {
-          stdio: "pipe",
-          timeout: 30000,
-        });
-        s.stop(color.green("npm global updated"));
-        changes.push("Updated npm global package");
-      } catch {
-        s.stop(color.yellow("npm global update skipped"));
-        p.log.info(color.dim("  Could not update global npm — may need sudo or standalone install"));
+        
+        // Update global npm
+        s.start("Updating npm global package");
+        try {
+          npmExecFile(["install", "-g", pluginRoot, "--no-audit", "--no-fund"], {
+            stdio: "pipe",
+            timeout: 30000,
+          });
+          s.stop(color.green("npm global updated"));
+          changes.push("Updated npm global package");
+        } catch {
+          s.stop(color.yellow("npm global update skipped"));
+          p.log.info(color.dim("  Could not update global npm — may need sudo or standalone install"));
+        }
       }
 
       // Cleanup
@@ -1137,7 +1542,33 @@ async function upgrade() {
     const message = err instanceof Error ? err.message : String(err);
     s.stop(color.red("Update failed"));
     p.log.error(color.red("GitHub pull failed") + ` — ${message}`);
-    p.log.info(color.dim("Continuing with hooks/settings fix..."));
+
+    // Issue #628 — Windows `spawnSync cmd.exe ETIMEDOUT` (and any
+    // other Step 1/2 throw — network, npm, manifest mismatch) used
+    // to fall through to Steps 3-7 (backup, hooks, perms, doctor),
+    // all of which succeed against the OLD on-disk install. The
+    // process then exited 0 and the upgrade-checklist renderer
+    // marked `[x] Built and installed vNEW` while in-place files,
+    // installed_plugins.json registry, and per-version cache dirs
+    // stayed at vOLD. Worse: the marketplace clone synced earlier
+    // in this same run is now AHEAD of cache+registry — Claude
+    // Code's plugin manager keeps offering the same upgrade
+    // forever (drift trap; reporter had to hand-edit
+    // installed_plugins.json to escape).
+    //
+    // Algo defense: mark the process for non-zero exit and surface
+    // an actionable recovery hint. Steps 3-7 still run because the
+    // user's hooks may be broken regardless — but the overall
+    // upgrade no longer reports success.
+    process.exitCode = 1;
+    p.log.warn(
+      color.yellow("In-place files were NOT updated") +
+        color.dim(" — old version is still on disk; hooks/settings will still be refreshed."),
+    );
+    p.log.info(
+      color.dim("  Recovery: re-run /ctx-upgrade once network is stable, or run /context-mode:ctx-doctor for a full health check."),
+    );
+
     try { rmSync(tmpDir, { recursive: true, force: true }); } catch { /* ignore */ }
   }
 
@@ -1226,6 +1657,7 @@ async function upgrade() {
       stdio: "inherit",
       timeout: 30000,
       cwd: pluginRoot,
+      env: { ...process.env, CONTEXT_MODE_PLATFORM: detection.platform },
     });
   } catch {
     p.log.warn(
