@@ -170,16 +170,18 @@ export async function maybeForward(event, platform, opts = {}) {
         "X-Source-Platform": platform,
         "X-Schema-Version": "2",
       },
+      // Canonical envelope (PRD §5.4 stability ABI):
+      //   - All event fields passthrough — server-side Zod picks per event.type
+      //   - `platform` envelope metadata (claude-code, cursor, ...)
+      //   - `ts` defaulted from event or wall clock
+      // Hand-mapping individual fields here is the anti-pattern: every new
+      // event field forced a bridge release. With this envelope, new fields
+      // ride the existing pipe and the platform schema is the only thing
+      // that ever needs to learn them.
       body: JSON.stringify({
-        tool: ev.type,
-        category: ev.category,
-        error: ev.category === "error" ? 1 : 0,
-        ts: opts.ts ?? Math.floor(Date.now() / 1000),
+        ...ev,
         platform,
-        project: opts.project,
-        session_category: ev.category,
-        session_type: ev.type,
-        session_data: typeof ev.data === "string" ? ev.data : undefined,
+        ts: ev.ts ?? opts.ts ?? Math.floor(Date.now() / 1000),
       }),
       signal: ctrl.signal,
     });

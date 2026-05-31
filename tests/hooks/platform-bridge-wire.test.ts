@@ -210,4 +210,108 @@ describe("platform-bridge wire — session-loaders forwards events", () => {
     expect(fetchSpy).toHaveBeenCalledTimes(3);
     expect(db.bulkInsertEvents).toHaveBeenCalledTimes(1);
   });
+
+  test("project attribution: attributions[i].projectDir flows into POST body (sanitized)", async () => {
+    mkdirSync(join(fakeHome, ".context-mode"), { recursive: true });
+    writeFileSync(
+      join(fakeHome, ".context-mode", "platform.json"),
+      JSON.stringify({
+        api_key: "ctxm_proj_test",
+        platform_url: "https://example.test/api/v1",
+      }),
+    );
+
+    const { loaders } = await importFresh();
+    const db = makeMockDb();
+
+    // Real resolveProjectAttributions returns objects with camelCase `projectDir`
+    // (see src/session/project-attribution.ts:55). The wire must surface that
+    // into the POST body so the platform can group events per project.
+    const resolveWithProjectDir = (evs: { type: string }[]) =>
+      evs.map(() => ({ projectDir: "/Users/realuser/myproj" }));
+
+    loaders.attributeAndInsertEvents(
+      db,
+      "session-proj",
+      makeEvents(1),
+      { workspace_roots: ["/Users/realuser/myproj"] },
+      "/Users/realuser/myproj",
+      "PostToolUse",
+      resolveWithProjectDir,
+    );
+
+    await new Promise((r) => setTimeout(r, 50));
+
+    expect(fetchSpy).toHaveBeenCalled();
+    const body = JSON.parse(fetchSpy.mock.calls[0][1].body as string);
+    // Project field MUST be populated (not undefined / null / empty)
+    expect(body.project).toBeTruthy();
+    // Privacy: username MUST be normalized away
+    expect(body.project).not.toContain("realuser");
+    // Identity: project basename MUST survive
+    expect(body.project).toContain("myproj");
+  });
+
+  test("envelope ABI: unknown event fields passthrough to body unchanged", async () => {
+    mkdirSync(join(fakeHome, ".context-mode"), { recursive: true });
+    writeFileSync(
+      join(fakeHome, ".context-mode", "platform.json"),
+      JSON.stringify({
+        api_key: "ctxm_envelope_test",
+        platform_url: "https://example.test/api/v1",
+      }),
+    );
+
+    const { loaders } = await importFresh();
+    const db = makeMockDb();
+
+    // Simulate a FUTURE event type that ships brand-new fields the bridge has
+    // never seen. The envelope MUST pass them straight through to the platform
+    // so adding new fields never requires a bridge release (PRD §5.4 ABI).
+    const futureEvent = {
+      type: "future_event_type",
+      category: "future_cat",
+      data: "payload",
+      brand_new_field: "should-passthrough",
+      nested: { deep: "value" },
+      array_field: [1, 2, 3],
+    };
+
+    loaders.attributeAndInsertEvents(
+      db,
+      "sid",
+      [futureEvent],
+      { workspace_roots: ["/tmp/p"] },
+      "/tmp/p",
+      "PostToolUse",
+      (evs: { type: string }[]) => evs.map(() => ({ projectDir: "/tmp/p" })),
+    );
+
+    await new Promise((r) => setTimeout(r, 50));
+
+    expect(fetchSpy).toHaveBeenCalled();
+    const body = JSON.parse(fetchSpy.mock.calls[0][1].body as string);
+
+    // Envelope metadata
+    expect(body.platform).toBe("claude-code");
+    expect(typeof body.ts).toBe("number");
+
+    // Canonical event fields
+    expect(body.type).toBe("future_event_type");
+    expect(body.category).toBe("future_cat");
+    expect(body.session_id).toBe("sid");
+
+    // Future passthrough — this is the load-bearing invariant.
+    expect(body.brand_new_field).toBe("should-passthrough");
+    expect(body.nested).toEqual({ deep: "value" });
+    expect(body.array_field).toEqual([1, 2, 3]);
+
+    // Anti-regression: legacy hand-mapped fields MUST NOT reappear
+    // (server reads canonical names now; hand-mapping was the smell).
+    expect(body).not.toHaveProperty("tool");
+    expect(body).not.toHaveProperty("session_type");
+    expect(body).not.toHaveProperty("session_category");
+    expect(body).not.toHaveProperty("session_data");
+    expect(body).not.toHaveProperty("error");
+  });
 });
