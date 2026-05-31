@@ -3,7 +3,7 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { join, resolve, sep } from "node:path";
 import { KimiAdapter, probeKimiCliVersion } from "../../src/adapters/kimi/index.js";
 import { resolveSessionDbPath, SessionDB } from "../../src/session/db.js";
 
@@ -426,9 +426,13 @@ command = "context-mode hook kimi posttooluse"
 
     it("getConfigDir honours KIMI_CODE_HOME", () => {
       const saved = process.env.KIMI_CODE_HOME;
-      process.env.KIMI_CODE_HOME = "/custom/kimi";
+      // Use a POSIX-style path on POSIX, a drive-rooted path on Windows.
+      // Hardcoding "/custom/kimi" makes the assertion fail on Windows
+      // because node:path resolves drive-relative paths against cwd.
+      const customDir = process.platform === "win32" ? "C:\\custom\\kimi" : "/custom/kimi";
+      process.env.KIMI_CODE_HOME = customDir;
       try {
-        expect(adapter.getConfigDir()).toBe("/custom/kimi");
+        expect(adapter.getConfigDir()).toBe(customDir);
       } finally {
         if (saved === undefined) delete process.env.KIMI_CODE_HOME;
         else process.env.KIMI_CODE_HOME = saved;
@@ -445,7 +449,10 @@ command = "context-mode hook kimi posttooluse"
 
     it("session dir is under ~/.kimi-code/context-mode/sessions", () => {
       const dir = adapter.getSessionDir();
-      expect(dir).toContain(`.kimi-code${resolve("/")}context-mode${resolve("/")}sessions`);
+      // Use path.sep — `resolve("/")` returns the cwd's drive root on Windows
+      // (e.g. "D:\\"), producing a nonsense expected string like
+      // ".kimi-codeD:\\context-modeD:\\sessions".
+      expect(dir).toContain(`.kimi-code${sep}context-mode${sep}sessions`);
     });
   });
 

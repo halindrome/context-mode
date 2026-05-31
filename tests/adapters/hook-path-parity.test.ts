@@ -92,12 +92,17 @@ describe("hook path parity across adapters (issue #712)", () => {
             ? `hooks/${adapter.subdir}/${scriptName}`
             : `hooks/${scriptName}`;
           const expectedAbs = resolve(repoRoot, expectedRel);
+          // buildHookRuntimeCommand emits forward-slash paths on every OS
+          // (MSYS / Git Bash on Windows uses forward slashes; node accepts
+          // both). path.resolve on Windows returns backslashes, so we
+          // normalize before substring-matching the emitted command.
+          const expectedAbsForwardSlash = expectedAbs.replace(/\\/g, "/");
           // The command must literally contain the absolute path the
           // doctor will probe; existsSync must succeed against that path.
           expect(
             cmd,
-            `${adapter.platform}/${hookType}: command does not embed ${expectedAbs}`,
-          ).toContain(expectedAbs);
+            `${adapter.platform}/${hookType}: command does not embed ${expectedAbsForwardSlash}`,
+          ).toContain(expectedAbsForwardSlash);
           expect(
             existsSync(expectedAbs),
             `${adapter.platform}/${hookType}: ${expectedAbs} missing on disk`,
