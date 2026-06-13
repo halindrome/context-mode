@@ -25,7 +25,7 @@ import { ClaudeCodeBaseAdapter, type ClaudeCodeWireInput } from "../claude-code-
 import { EXTERNAL_MCP_MATCHER_PATTERN } from "./hooks.js";
 
 import {
-  buildNodeCommand,
+  buildHookRuntimeCommand,
   type HookAdapter,
   type HookParadigm,
   type PlatformCapabilities,
@@ -88,7 +88,7 @@ export class QwenCodeAdapter extends ClaudeCodeBaseAdapter implements HookAdapte
         {
           matcher: preToolUseMatcher,
           hooks: [
-            { type: "command", command: buildNodeCommand(`${pluginRoot}/hooks/pretooluse.mjs`) },
+            { type: "command", command: buildHookRuntimeCommand(`${pluginRoot}/hooks/pretooluse.mjs`) },
           ],
         },
       ],
@@ -96,7 +96,7 @@ export class QwenCodeAdapter extends ClaudeCodeBaseAdapter implements HookAdapte
         {
           matcher: "run_shell_command|read_file|write_file|edit|glob|grep_search|todo_write|agent|ask_user_question|mcp__",
           hooks: [
-            { type: "command", command: buildNodeCommand(`${pluginRoot}/hooks/posttooluse.mjs`) },
+            { type: "command", command: buildHookRuntimeCommand(`${pluginRoot}/hooks/posttooluse.mjs`) },
           ],
         },
       ],
@@ -104,7 +104,7 @@ export class QwenCodeAdapter extends ClaudeCodeBaseAdapter implements HookAdapte
         {
           matcher: "",
           hooks: [
-            { type: "command", command: buildNodeCommand(`${pluginRoot}/hooks/sessionstart.mjs`) },
+            { type: "command", command: buildHookRuntimeCommand(`${pluginRoot}/hooks/sessionstart.mjs`) },
           ],
         },
       ],
@@ -112,7 +112,7 @@ export class QwenCodeAdapter extends ClaudeCodeBaseAdapter implements HookAdapte
         {
           matcher: "",
           hooks: [
-            { type: "command", command: buildNodeCommand(`${pluginRoot}/hooks/precompact.mjs`) },
+            { type: "command", command: buildHookRuntimeCommand(`${pluginRoot}/hooks/precompact.mjs`) },
           ],
         },
       ],
@@ -120,7 +120,7 @@ export class QwenCodeAdapter extends ClaudeCodeBaseAdapter implements HookAdapte
         {
           matcher: "",
           hooks: [
-            { type: "command", command: buildNodeCommand(`${pluginRoot}/hooks/userpromptsubmit.mjs`) },
+            { type: "command", command: buildHookRuntimeCommand(`${pluginRoot}/hooks/userpromptsubmit.mjs`) },
           ],
         },
       ],
@@ -323,7 +323,7 @@ export class QwenCodeAdapter extends ClaudeCodeBaseAdapter implements HookAdapte
     for (const { name, script, matcher } of hookTypes) {
       const entry = {
         matcher,
-        hooks: [{ type: "command", command: buildNodeCommand(`${pluginRoot}/hooks/${script}`) }],
+        hooks: [{ type: "command", command: buildHookRuntimeCommand(`${pluginRoot}/hooks/${script}`) }],
       };
 
       const existing = hooks[name] as Array<Record<string, unknown>> | undefined;
