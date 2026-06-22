@@ -3,7 +3,11 @@ import "./platform.mjs";
 import "../suppress-stderr.mjs";
 import "../ensure-deps.mjs";
 /**
- * Codex CLI Stop hook — record turn/session end state for continuity.
+ * Codex CLI Stop hook — record turn-end state for continuity.
+ *
+ * Stop fires at the end of an assistant turn, not at true session shutdown.
+ * Store a turn_end marker so session_end remains reserved for actual terminal
+ * lifecycle events on platforms that expose one.
  */
 
 import { readStdin, parseStdin, getSessionId, getSessionDBPath, getInputProjectDir, CODEX_OPTS } from "../session-helpers.mjs";
@@ -26,13 +30,17 @@ try {
   const sessionId = getSessionId(input, OPTS);
 
   db.ensureSession(sessionId, projectDir);
-  db.insertEvent(sessionId, {
-    type: "session_end",
-    status: "completed",
+  const payload = {
     stop_hook_active: input.stop_hook_active ?? false,
     last_assistant_message: typeof input.last_assistant_message === "string"
       ? input.last_assistant_message.slice(0, 2000)
       : null,
+  };
+  db.insertEvent(sessionId, {
+    type: "turn_end",
+    category: "session",
+    data: JSON.stringify(payload),
+    priority: 1,
   }, "Stop");
 
   db.close();
