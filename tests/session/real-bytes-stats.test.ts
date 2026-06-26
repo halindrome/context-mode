@@ -130,12 +130,13 @@ describe("getRealBytesStats (Phase 8 renderer source-of-truth)", () => {
     expect(r.totalSavedTokens).toBeGreaterThan(9_000); // ≈ 9_500
   });
 
-  test("8.1b conversation tier: folds tool_calls.bytes_returned (MCP returns) into bytesReturned", () => {
-    // Production reality: ctx_execute / ctx_search return bytes to context via
-    // the tool_calls counter (incrementToolCall / persistToolCallCounter), NOT
-    // session_events.bytes_returned. A session with real MCP returns but no
-    // snapshot replay reported bytesReturned=0 before this fix, rendering the
-    // Section 1 bar as "With context-mode: 1 B / 100% kept out" — false.
+  test("8.1b conversation tier: 'With context-mode' folds ONLY retrieval tool returns, not sandbox work-output", () => {
+    // "With context-mode" = the bytes the model paid to ACCESS kept-out content
+    // (ctx_search / ctx_fetch_and_index), via the tool_calls counter — NOT
+    // session_events.bytes_returned (snapshot-replay only, ~0). Sandbox compute
+    // (ctx_execute) is work-output the model would see regardless, so it is
+    // EXCLUDED. Before this fix bytesReturned was 0 ("1 B / 100%"); an earlier
+    // over-broad fold counted ctx_execute too, crushing the bar to a false ~43%.
     const dir = mkSessionsDir();
     const sid = `sess-${randomUUID()}`;
     const dbPath = dbPathFor(dir, "cafebabecafebabe");
@@ -144,13 +145,18 @@ describe("getRealBytesStats (Phase 8 renderer source-of-truth)", () => {
       sid,
       [{ type: "tool_use", category: "file", data: "src/app.ts", bytesAvoided: 90_000, bytesReturned: 0 }],
       undefined,
-      [{ tool: "ctx_execute", bytesReturned: 8_000 }, { tool: "ctx_search", bytesReturned: 2_000 }],
+      [
+        { tool: "ctx_execute", bytesReturned: 800_000 },        // work-output → EXCLUDED
+        { tool: "ctx_search", bytesReturned: 2_000 },           // retrieval → INCLUDED
+        { tool: "ctx_fetch_and_index", bytesReturned: 1_500 },  // retrieval → INCLUDED
+      ],
     );
 
     const r = getRealBytesStats({ sessionId: sid, sessionsDir: dir });
 
-    // 8_000 + 2_000 from tool_calls — the bytes that actually entered context.
-    expect(r.bytesReturned).toBe(10_000);
+    // Only the two retrieval tools (2_000 + 1_500); the 800 KB ctx_execute
+    // work-output is NOT redirect savings and must not enter "With context-mode".
+    expect(r.bytesReturned).toBe(3_500);
     expect(r.bytesAvoided).toBe(90_000);
   });
 

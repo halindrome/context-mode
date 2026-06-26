@@ -1275,13 +1275,14 @@ export function getRealBytesStats(opts: {
             if (snap?.bytes) snapshotBytes += Number(snap.bytes);
           } catch { /* old schema */ }
           try {
-            // MCP tool returns (ctx_execute/ctx_search stdout, redirect stubs)
-            // land in tool_calls.bytes_returned via incrementToolCall, NOT in
-            // session_events.bytes_returned (which carries snapshot-replay only).
-            // Folding them here is what the "With context-mode" bar measures;
-            // without it a tool-heavy session rendered a false "1 B / 100%".
+            // "With context-mode" = the bytes the model paid to ACCESS the
+            // kept-out content: ctx_search (query the index) + ctx_fetch_and_index
+            // (fetch + index a URL). Sandbox compute (ctx_execute/batch/file) is
+            // work-output the model would see regardless — NOT redirect savings —
+            // so it is excluded; folding it crushed the bar to a false ~43%.
             const tc = sdb.prepare(
-              "SELECT COALESCE(SUM(bytes_returned), 0) AS bytes FROM tool_calls WHERE session_id = ?",
+              `SELECT COALESCE(SUM(bytes_returned), 0) AS bytes FROM tool_calls
+               WHERE session_id = ? AND tool IN ('ctx_search', 'ctx_fetch_and_index')`,
             ).get(opts.sessionId) as { bytes: number } | undefined;
             if (tc?.bytes) bytesReturned += Number(tc.bytes);
           } catch { /* old schema: no tool_calls table */ }
@@ -1324,7 +1325,8 @@ export function getRealBytesStats(opts: {
                FROM tool_calls
                WHERE session_id IN (
                  SELECT session_id FROM session_meta WHERE project_dir = ?
-               )`,
+               )
+               AND tool IN ('ctx_search', 'ctx_fetch_and_index')`,
             ).get(opts.projectDir) as { bytes: number } | undefined;
             if (tc?.bytes) bytesReturned += Number(tc.bytes);
           } catch { /* old schema: no tool_calls table */ }
@@ -1351,7 +1353,8 @@ export function getRealBytesStats(opts: {
           } catch { /* old schema */ }
           try {
             const tc = sdb.prepare(
-              "SELECT COALESCE(SUM(bytes_returned), 0) AS bytes FROM tool_calls",
+              `SELECT COALESCE(SUM(bytes_returned), 0) AS bytes FROM tool_calls
+               WHERE tool IN ('ctx_search', 'ctx_fetch_and_index')`,
             ).get() as { bytes: number } | undefined;
             if (tc?.bytes) bytesReturned += Number(tc.bytes);
           } catch { /* old schema: no tool_calls table */ }
