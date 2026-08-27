@@ -972,15 +972,15 @@ Full configs: [`configs/kiro/mcp.json`](configs/kiro/mcp.json) | [`configs/kiro/
    {
      "context_servers": {
        "context-mode": {
-         "command": {
-           "path": "context-mode"
-         }
+         "command": "context-mode",
+         "args": [],
+         "env": {}
        }
      }
    }
    ```
 
-   Note: Zed uses `"context_servers"` and `"command": { "path": "..." }` syntax, not `"mcpServers"` or `"command": "..."` like other platforms.
+   Note: Zed uses `"context_servers"` instead of `"mcpServers"`. `args` and `env` are optional for context-mode, but are shown here to match Zed's custom MCP server shape.
 
 3. Copy routing instructions (Zed has no hook support):
 
@@ -1066,6 +1066,8 @@ Full configs: [`configs/kiro/mcp.json`](configs/kiro/mcp.json) | [`configs/kiro/
    ```
 
    Both should show `context-mode` as `enabled`.
+
+   > The plugin self-registers its MCP server in `~/.omp/agent/mcp.json` on first load (spawned as `node <plugin>/server.bundle.mjs`, since the plugin-install package directory is not on `PATH`), so the 11 `ctx_*` tools become reachable after the restart in step 2 — no manual `mcp.json` edit needed ([#677](https://github.com/mksglu/context-mode/issues/677)). An existing `context-mode` entry is never overwritten; remove it if you want the plugin to re-register the bundled path.
 
 **Install — manual plugin path (if `omp plugin install` is unavailable):**
 
